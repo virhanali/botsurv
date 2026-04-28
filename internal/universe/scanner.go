@@ -17,7 +17,7 @@ import (
 
 // MarketDataReadonly is the subset of MarketDataService needed by the scanner.
 type MarketDataReadonly interface {
-	GetOrderBookSummary(ctx context.Context, symbol string) (*domain.OrderBookSummary, error)
+	GetOrderBookSummary(ctx context.Context, symbol string, targetNotional float64, side string) (domain.OrderBookSummary, error)
 	GetCandles(ctx context.Context, symbol, timeframe string, limit int) ([]domain.Candle, error)
 	GetLatestPrice(ctx context.Context, symbol string) (float64, error)
 }
@@ -201,12 +201,12 @@ func (s *Scanner) FilterQuality(ctx context.Context, symbols []domain.UniverseSy
 			break
 		}
 
-		ob, err := s.md.GetOrderBookSummary(ctx, sym.Symbol)
+		ob, err := s.md.GetOrderBookSummary(ctx, sym.Symbol, 0, "")
 		if err != nil {
 			s.log.Debug("skip symbol: no orderbook", map[string]any{"symbol": sym.Symbol, "error": err.Error()})
 			continue
 		}
-		if ob == nil || ob.Stale {
+		if ob.Stale {
 			continue
 		}
 
@@ -241,14 +241,14 @@ func (s *Scanner) FilterQuality(ctx context.Context, symbols []domain.UniverseSy
 		}
 
 		// Compute scores
-		liq, exec, vol := computeScores(*ob, atr, price)
+		liq, exec, vol := computeScores(ob, atr, price)
 		setup := 50.0 // placeholder until Phase 8 Setup Engine
 		candScore := candidateScore(liq, exec, setup, vol)
 
 		// Placeholder values until Phase 8
-		rr := 2.5                // placeholder
-		expectedMove := atr * 2  // placeholder
-		estCost := price * 0.001 // placeholder: 10bps
+		rr := 2.5
+		expectedMove := atr * 2
+		estCost := price * 0.001
 
 		cand := domain.Candidate{
 			ProposedTrade: domain.ProposedTrade{
@@ -265,7 +265,7 @@ func (s *Scanner) FilterQuality(ctx context.Context, symbols []domain.UniverseSy
 		}
 
 		// Evaluate LLM eligibility
-		cand = evaluateLLMEligibility(cand, *ob, s.cfg.Filters, s.llmRoute, s.strategy)
+		cand = evaluateLLMEligibility(cand, ob, s.cfg.Filters, s.llmRoute, s.strategy)
 
 		candidates = append(candidates, cand)
 	}

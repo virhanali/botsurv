@@ -15,7 +15,7 @@ import (
 // MarketDataProvider is the interface needed by the screener.
 type MarketDataProvider interface {
 	universe.MarketDataReadonly
-	GetTradeFlow(ctx context.Context, symbol string) (*domain.TradeFlow, error)
+	GetTradeFlow(ctx context.Context, symbol string) ([]domain.TradeFlow, error)
 }
 
 // CandidateContext is the compact JSON context sent to LLM for veto.
@@ -209,13 +209,13 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	}
 
 	// Get orderbook for scoring
-	ob, _ := s.md.GetOrderBookSummary(ctx, sym.Symbol)
+	ob, obErr := s.md.GetOrderBookSummary(ctx, sym.Symbol, 0, "")
 	price, _ := s.md.GetLatestPrice(ctx, sym.Symbol)
 
 	// Compute scores
 	liq, exec, vol := 50.0, 50.0, 50.0
-	if ob != nil {
-		liq, exec, vol = computeScoresFromOB(*ob, atr, price)
+	if obErr == nil {
+		liq, exec, vol = computeScoresFromOB(ob, atr, price)
 	}
 	candScore := liq*0.25 + exec*0.25 + setup.SetupScore*0.35 + vol*0.15
 
@@ -249,8 +249,8 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	}
 
 	// Evaluate LLM eligibility
-	if ob != nil {
-		cand = evaluateLLMEligibility(cand, *ob, s.cfg.Universe.Filters, s.cfg.LLMRouting, s.cfg.Strategy)
+	if obErr == nil {
+		cand = evaluateLLMEligibility(cand, ob, s.cfg.Universe.Filters, s.cfg.LLMRouting, s.cfg.Strategy)
 	} else {
 		cand.LLMRoutingReasonCodes = []string{"no_orderbook"}
 	}
@@ -259,7 +259,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 }
 
 func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (string, error) {
-	ob, _ := s.md.GetOrderBookSummary(ctx, cand.Symbol)
+	ob, _ := s.md.GetOrderBookSummary(ctx, cand.Symbol, 0, "")
 	tf, _ := s.md.GetTradeFlow(ctx, cand.Symbol)
 	price, _ := s.md.GetLatestPrice(ctx, cand.Symbol)
 
@@ -282,7 +282,7 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 		ExpectedMove:  cand.ExpectedMove,
 	}
 
-	if ob != nil {
+	if ob.BestBid > 0 || ob.BestAsk > 0 {
 		ctxObj.OrderBook = &OrderBookSummary{
 			SpreadBps:   ob.SpreadBps,
 			BidDepth:    ob.BidDepth,
@@ -291,10 +291,11 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 		}
 	}
 
-	if tf != nil {
+	if len(tf) > 0 {
+		t := tf[0]
 		ctxObj.TradeFlow = &TradeFlowSummary{
-			BuySellRatio: tf.BuySellRatio,
-			TradeCount:   tf.TradeCount,
+			BuySellRatio: t.BuySellRatio,
+			TradeCount:   t.TradeCount,
 		}
 	}
 

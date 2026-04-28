@@ -24,6 +24,7 @@ type Scheduler struct {
 	riskEng   *risk.Engine
 	executor  *executor.Executor
 	monitor   *monitor.Monitor
+	md        screener.MarketDataProvider
 	log       *logger.Logger
 
 	mu       sync.Mutex
@@ -39,6 +40,7 @@ func NewScheduler(
 	riskEng *risk.Engine,
 	executor *executor.Executor,
 	monitor *monitor.Monitor,
+	md screener.MarketDataProvider,
 	log *logger.Logger,
 ) *Scheduler {
 	return &Scheduler{
@@ -48,6 +50,7 @@ func NewScheduler(
 		riskEng:   riskEng,
 		executor:  executor,
 		monitor:   monitor,
+		md:        md,
 		log:       log,
 	}
 }
@@ -154,19 +157,23 @@ func (s *Scheduler) RunOnce(ctx context.Context) (*CycleResult, error) {
 			continue
 		}
 
-		// Risk validation
+		// Risk validation with real market data
 		monitorStatus := s.monitor.Status(ctx)
+		ob, _ := s.md.GetOrderBookSummary(ctx, cand.Symbol, 0, "")
+		marketPrice, _ := s.md.GetLatestPrice(ctx, cand.Symbol)
+
 		riskInput := risk.ValidateInput{
 			ProposedTrade: cand.ProposedTrade,
 			LLMDecision:   llmDecision,
 			AccountState:  monitorStatus.AccountState,
 			MarketState: risk.MarketState{
 				Symbol:      cand.Symbol,
-				Price:       cand.ProposedEntry,
-				SpreadBps:   10, // placeholder
-				SlippageBps: 5,
-				DepthRatio:  0.5,
+				Price:       marketPrice,
+				SpreadBps:   ob.SpreadBps,
+				SlippageBps: ob.EstimatedSlippageBps,
+				DepthRatio:  ob.DepthToPositionSizeRatio,
 				LastUpdate:  time.Now(),
+				Stale:       ob.Stale,
 			},
 			Portfolio: risk.PortfolioState{
 				OpenPositions:         monitorStatus.OpenPositions,
@@ -251,8 +258,11 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) isHalted() bool {
-	// Check if bot should be halted (e.g., from config or state)
-	return false
+	if s == nil {
+		return true
+	}
+	status := s.monitor.Status(context.Background())
+	return status.AccountState.Equity <= 0
 }
 
 func (s *Scheduler) refreshUniverseIfNeeded(ctx context.Context) error {

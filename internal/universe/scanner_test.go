@@ -23,11 +23,11 @@ type mockMarketData struct {
 	prices     map[string]float64
 }
 
-func (m *mockMarketData) GetOrderBookSummary(_ context.Context, symbol string) (*domain.OrderBookSummary, error) {
+func (m *mockMarketData) GetOrderBookSummary(_ context.Context, symbol string, _ float64, _ string) (domain.OrderBookSummary, error) {
 	if ob, ok := m.orderbooks[symbol]; ok {
-		return ob, nil
+		return *ob, nil
 	}
-	return nil, fmt.Errorf("no orderbook for %s", symbol)
+	return domain.OrderBookSummary{}, fmt.Errorf("no orderbook for %s", symbol)
 }
 
 func (m *mockMarketData) GetCandles(_ context.Context, symbol, timeframe string, limit int) ([]domain.Candle, error) {

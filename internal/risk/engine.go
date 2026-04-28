@@ -65,6 +65,20 @@ type ValidateOutput struct {
 func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 	var reasons []string
 
+	// 0. LLM decision validation (Risk Engine is final authority)
+	if !isValidLLMDecision(input.LLMDecision) {
+		reasons = append(reasons, "INVALID_LLM_DECISION")
+	}
+	if input.LLMDecision.Confidence > 0 && input.LLMDecision.Confidence < 0.6 {
+		reasons = append(reasons, "LLM_LOW_CONFIDENCE")
+	}
+	if input.LLMDecision.Decision == "REDUCE_SIZE" {
+		validMultipliers := map[float64]bool{1.0: true, 0.75: true, 0.5: true, 0.25: true, 0.0: true}
+		if !validMultipliers[input.LLMDecision.SizeMultiplier] {
+			reasons = append(reasons, "INVALID_SIZE_MULTIPLIER")
+		}
+	}
+
 	// 1. Bot state checks
 	if input.BotState.Halted {
 		reasons = append(reasons, "BOT_HALTED")
@@ -345,6 +359,14 @@ func (e *Engine) stopLossPercent(pt domain.ProposedTrade) float64 {
 		return math.Abs(pt.ProposedEntry-pt.ProposedStopLoss) / pt.ProposedEntry * 100
 	}
 	return 0
+}
+
+func isValidLLMDecision(d domain.LLMDecision) bool {
+	valid := map[string]bool{
+		"ALLOW_MARKET": true, "ALLOW_LIMIT_RETEST": true,
+		"REDUCE_SIZE": true, "BLOCK": true,
+	}
+	return valid[d.Decision]
 }
 
 // GetRejectionReason returns a human-readable rejection reason for a code.

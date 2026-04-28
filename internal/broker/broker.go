@@ -15,6 +15,10 @@ type OrderRequest struct {
 	Price      *float64 // for LIMIT orders
 	StopPrice  *float64 // for STOP_MARKET / TAKE_PROFIT_MARKET
 	ReduceOnly bool
+	// If set, protective SL/TP are created atomically with the position.
+	// Broker must guarantee no position exists without SL.
+	StopLoss   float64
+	TakeProfit float64
 }
 
 // Broker abstracts order placement, position queries, and account state.
@@ -26,4 +30,6 @@ type Broker interface {
 	CancelOrder(ctx context.Context, orderID string) error
 	ClosePosition(ctx context.Context, symbol string) error
 	EmergencyCloseAll(ctx context.Context) error
+	IsHalted() bool
+	SetHalted(reason string)
 }

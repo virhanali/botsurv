@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/virhan/botsurv/internal/app"
@@ -15,6 +17,7 @@ import (
 	"github.com/virhan/botsurv/internal/executor"
 	"github.com/virhan/botsurv/internal/llm"
 	"github.com/virhan/botsurv/internal/logger"
+	"github.com/virhan/botsurv/internal/marketdata"
 	"github.com/virhan/botsurv/internal/monitor"
 	"github.com/virhan/botsurv/internal/risk"
 	"github.com/virhan/botsurv/internal/scheduler"
@@ -27,7 +30,7 @@ func newRunOnceCmd() *cobra.Command {
 		Use:   "run-once",
 		Short: "Run a single trading cycle",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCycle(cmd.Context(), configPath, true)
+			return runCycle(cmd.Context(), configPath)
 		},
 	}
 }
@@ -51,7 +54,6 @@ func newRunCmd() *cobra.Command {
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 
-			// Handle graceful shutdown
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			go func() {
@@ -65,7 +67,7 @@ func newRunCmd() *cobra.Command {
 	}
 }
 
-func runCycle(ctx context.Context, configPath string, once bool) error {
+func runCycle(ctx context.Context, configPath string) error {
 	cfg, err := app.LoadConfig(configPath)
 	if err != nil {
 		return err
@@ -109,13 +111,17 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 
 	pb := broker.NewPaperBroker(cfg.Broker.Paper, log)
 
+	// Create Bybit WS market data service
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	mdSvc := marketdata.NewBybitWSMarketDataService(cfg.MarketData, repos.CandleRepository, httpClient, log)
+
 	universeScanner := universe.NewScanner(
 		cfg.Universe, cfg.Strategy, cfg.LLMRouting,
-		cfg.MarketData.RESTURL, nil,
+		cfg.MarketData.RESTURL, mdSvc,
 		repos.UniverseRepository, repos.CandleRepository, log,
 	)
 
-	screenerSvc := screener.NewScreener(*cfg, universeScanner, nil, log)
+	screenerSvc := screener.NewScreener(*cfg, universeScanner, mdSvc, log)
 
 	llmClient := llm.NewMockClient(domain.LLMDecision{
 		Decision:       "ALLOW_MARKET",
@@ -127,11 +133,14 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 
 	exec := executor.NewExecutor(pb, log)
 
-	mon := monitor.NewMonitor(pb, nil, cfg.PortfolioRisk, log)
+	mon := monitor.NewMonitor(pb, mdSvc, cfg.PortfolioRisk, log)
 
-	sched := scheduler.NewScheduler(*cfg, screenerSvc, llmClient, riskEng, exec, mon, log)
+	sched := scheduler.NewScheduler(*cfg, screenerSvc, llmClient, riskEng, exec, mon, mdSvc, log)
 
-	cleanup := func() { database.Close() }
+	cleanup := func() {
+		mdSvc.Stop(context.Background())
+		database.Close()
+	}
 
 	return &components{scheduler: sched}, cleanup, nil
 }

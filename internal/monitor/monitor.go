@@ -45,7 +45,7 @@ func (m *Monitor) ProcessCandle(candle domain.Candle) {
 	m.broker.ProcessCandle(candle)
 }
 
-// checkKillSwitch checks if daily loss has been breached.
+// checkKillSwitch checks if daily loss has been breached (uses realized + unrealized).
 func (m *Monitor) checkKillSwitch(ctx context.Context) {
 	state, err := m.broker.GetAccountState(ctx)
 	if err != nil {
@@ -57,13 +57,24 @@ func (m *Monitor) checkKillSwitch(ctx context.Context) {
 		return
 	}
 
+	// Daily loss = realized PnL losses accumulated + current unrealized loss
+	totalDailyLoss := state.DailyLoss
+	if state.UnrealizedPnL < 0 {
+		totalDailyLoss += -state.UnrealizedPnL
+	}
+
 	maxDailyLoss := state.Equity * maxDailyLossPct / 100
-	if state.DailyLoss >= maxDailyLoss {
+	if totalDailyLoss >= maxDailyLoss {
 		m.log.Error("KILL SWITCH TRIGGERED — Daily loss limit breached", map[string]any{
-			"daily_loss":     state.DailyLoss,
-			"max_daily_loss": maxDailyLoss,
-			"equity":         state.Equity,
+			"daily_loss":      totalDailyLoss,
+			"max_daily_loss":  maxDailyLoss,
+			"realized_loss":   state.DailyLoss,
+			"unrealized_loss": -state.UnrealizedPnL,
+			"equity":          state.Equity,
 		})
+
+		// Halt future entries
+		m.broker.SetHalted("daily_loss_kill_switch")
 
 		// Emergency close all
 		if err := m.broker.EmergencyCloseAll(ctx); err != nil {

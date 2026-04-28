@@ -41,6 +41,10 @@ type PaperBroker struct {
 
 	// Latest prices for unrealized PnL
 	prices map[string]float64
+
+	// Halted state
+	halted     bool
+	haltReason string
 }
 
 // NewPaperBroker creates a new PaperBroker.
@@ -103,6 +107,22 @@ func (pb *PaperBroker) GetOpenOrders(_ context.Context) ([]domain.Order, error) 
 	return orders, nil
 }
 
+// IsHalted returns whether the broker is halted.
+func (pb *PaperBroker) IsHalted() bool {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	return pb.halted
+}
+
+// SetHalted halts the broker (prevents new entries).
+func (pb *PaperBroker) SetHalted(reason string) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.halted = true
+	pb.haltReason = reason
+	pb.log.Error("broker halted", map[string]any{"reason": reason})
+}
+
 // PlaceOrder places a new order.
 func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.Order, error) {
 	pb.mu.Lock()
@@ -113,6 +133,11 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 	}
 	if req.Symbol == "" {
 		return domain.Order{}, fmt.Errorf("symbol is required")
+	}
+
+	// Halted: block new entries
+	if pb.halted && req.Qty > 0 && (req.OrderType == domain.OrderTypeMarket || req.OrderType == domain.OrderTypeLimit) && req.StopPrice == nil {
+		return domain.Order{}, fmt.Errorf("broker halted: %s", pb.haltReason)
 	}
 
 	order := domain.Order{
@@ -196,6 +221,11 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 			pb.balance -= fee
 			pb.totalFees += fee
 			pb.totalSlippage += slippageAmt * req.Qty
+
+			// Atomic protective orders: no position without SL
+			if req.StopLoss > 0 || req.TakeProfit > 0 {
+				pb.createProtectiveOrdersForPosition(pos, req.StopLoss, req.TakeProfit)
+			}
 		}
 
 		order.Status = domain.OrderStatusFilled
@@ -363,6 +393,75 @@ func (pb *PaperBroker) GetPosition(symbol string) (*domain.Position, bool) {
 
 // --- Internal methods ---
 
+// createProtectiveOrdersForPosition creates SL and TP orders for a position (lock held).
+func (pb *PaperBroker) createProtectiveOrdersForPosition(pos *domain.Position, slPrice, tpPrice float64) {
+	if slPrice <= 0 && tpPrice <= 0 {
+		return
+	}
+
+	slSide := domain.OrderSideSell
+	tpSide := domain.OrderSideSell
+	if pos.Side == domain.SideShort {
+		slSide = domain.OrderSideBuy
+		tpSide = domain.OrderSideBuy
+	}
+
+	if slPrice > 0 {
+		slOrder := &domain.Order{
+			ID:            pb.nextOrderID,
+			BrokerOrderID: fmt.Sprintf("paper-%d", pb.nextOrderID),
+			Symbol:        pos.Symbol,
+			Side:          slSide,
+			OrderType:     domain.OrderTypeStopMarket,
+			Qty:           pos.Size,
+			StopPrice:     &slPrice,
+			Status:        domain.OrderStatusPending,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+		}
+		pb.nextOrderID++
+		pb.openOrders[slOrder.BrokerOrderID] = slOrder
+		pos.SLOrderID = &slOrder.ID
+	}
+
+	if tpPrice > 0 {
+		tpOrder := &domain.Order{
+			ID:            pb.nextOrderID,
+			BrokerOrderID: fmt.Sprintf("paper-%d", pb.nextOrderID),
+			Symbol:        pos.Symbol,
+			Side:          tpSide,
+			OrderType:     domain.OrderTypeTakeProfitMarket,
+			Qty:           pos.Size,
+			StopPrice:     &tpPrice,
+			Status:        domain.OrderStatusPending,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+		}
+		pb.nextOrderID++
+		pb.openOrders[tpOrder.BrokerOrderID] = tpOrder
+		pos.TPOrderID = &tpOrder.ID
+	}
+}
+
+func (pb *PaperBroker) cancelSiblingOrders(pos *domain.Position) {
+	for id, order := range pb.openOrders {
+		if order.Symbol == pos.Symbol {
+			if order.ID == derefInt64(pos.SLOrderID) || order.ID == derefInt64(pos.TPOrderID) {
+				order.Status = domain.OrderStatusCancelled
+				order.UpdatedAt = time.Now()
+				delete(pb.openOrders, id)
+			}
+		}
+	}
+}
+
+func derefInt64(p *int64) int64 {
+	if p == nil {
+		return -1
+	}
+	return *p
+}
+
 func (pb *PaperBroker) sideFromOrderSide(os domain.OrderSide) domain.Side {
 	if os == domain.OrderSideBuy {
 		return domain.SideLong
@@ -371,6 +470,9 @@ func (pb *PaperBroker) sideFromOrderSide(os domain.OrderSide) domain.Side {
 }
 
 func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice float64, now time.Time) {
+	// Cancel sibling protective orders first
+	pb.cancelSiblingOrders(pos)
+
 	takerFeeBps := pb.cfg.FeeTakerBps
 	slippageBps := pb.cfg.SlippageBps
 

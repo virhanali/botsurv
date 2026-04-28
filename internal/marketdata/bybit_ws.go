@@ -43,6 +43,10 @@ type BybitWSMarketDataService struct {
 	wsMu   sync.Mutex
 
 	staleThreshold time.Duration
+
+	// dynamic symbols for all_usdt_perpetual mode
+	muDynamic     sync.RWMutex
+	dynamicSymbols []string
 }
 
 // NewBybitWSMarketDataService creates a new Bybit market data service.
@@ -675,7 +679,16 @@ func (s *BybitWSMarketDataService) symbols() []string {
 	if s.config.Symbols.Mode == "explicit" {
 		return s.config.Symbols.ExplicitList
 	}
-	return nil
+	s.muDynamic.RLock()
+	defer s.muDynamic.RUnlock()
+	return s.dynamicSymbols
+}
+
+// SetSymbols sets the symbols to track (used for all_usdt_perpetual mode).
+func (s *BybitWSMarketDataService) SetSymbols(symbols []string) {
+	s.muDynamic.Lock()
+	defer s.muDynamic.Unlock()
+	s.dynamicSymbols = symbols
 }
 
 func (s *BybitWSMarketDataService) setWSConn(conn *websocket.Conn) {
