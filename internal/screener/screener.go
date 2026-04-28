@@ -90,6 +90,11 @@ func NewScreener(cfg app.UserConfig, universe *universe.Scanner, md MarketDataPr
 	}
 }
 
+// RefreshUniverse triggers a full universe refresh.
+func (s *Screener) RefreshUniverse(ctx context.Context) error {
+	return s.universe.RefreshUniverse(ctx)
+}
+
 // ScreenResult holds the output of the screener.
 type ScreenResult struct {
 	Candidates  []domain.Candidate
