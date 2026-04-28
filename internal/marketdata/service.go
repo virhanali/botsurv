@@ -13,6 +13,9 @@ type MarketDataService interface {
 	Stop(ctx context.Context) error
 	GetCandles(ctx context.Context, symbol, timeframe string, limit int) ([]domain.Candle, error)
 	GetLatestPrice(ctx context.Context, symbol string) (float64, error)
+	GetOrderBookSummary(ctx context.Context, symbol string, targetNotional float64, side string) (domain.OrderBookSummary, error)
+	GetTradeFlow(ctx context.Context, symbol string) ([]domain.TradeFlow, error)
+	HealthStatus(symbol string) domain.MarketDataHealth
 	IsHealthy(symbol string) bool
 	LastUpdate(symbol string) time.Time
 }

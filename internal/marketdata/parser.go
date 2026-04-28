@@ -252,3 +252,159 @@ func getInt64(m map[string]interface{}, key string) (int64, error) {
 	}
 	return 0, fmt.Errorf("invalid %s", key)
 }
+
+// parseOrderBookMessage parses a Bybit v5 public WebSocket orderbook message.
+// It returns the symbol, whether the message is a snapshot, the sequence numbers,
+// and the bid/ask levels.
+// For snapshots: prevSeq=0, seq=data.seq
+// For deltas: prevSeq=data.u, seq=data.seq
+func parseOrderBookMessage(payload []byte) (symbol string, isSnapshot bool, seq, prevSeq int64, bids, asks []domain.OrderBookLevel, err error) {
+	var msg struct {
+		Topic string          `json:"topic"`
+		Type  string          `json:"type"`
+		Data  json.RawMessage `json:"data"`
+	}
+	if err = json.Unmarshal(payload, &msg); err != nil {
+		return "", false, 0, 0, nil, nil, fmt.Errorf("unmarshal orderbook message: %w", err)
+	}
+
+	topicParts := splitTopic(msg.Topic)
+	if len(topicParts) != 3 || topicParts[0] != "orderbook" {
+		return "", false, 0, 0, nil, nil, fmt.Errorf("invalid orderbook topic: %s", msg.Topic)
+	}
+	symbol = topicParts[2]
+	isSnapshot = msg.Type == "snapshot"
+
+	var data struct {
+		Symbol string     `json:"s"`
+		Bids   [][]string `json:"b"`
+		Asks   [][]string `json:"a"`
+		U      int64      `json:"u"`
+		Seq    int64      `json:"seq"`
+	}
+	if err = json.Unmarshal(msg.Data, &data); err != nil {
+		// Try alternate format where data is the object directly (not wrapped)
+		if err2 := json.Unmarshal(payload, &data); err2 != nil {
+			return symbol, false, 0, 0, nil, nil, fmt.Errorf("unmarshal orderbook data: %w", err)
+		}
+		if data.Symbol != "" {
+			symbol = data.Symbol
+		}
+	} else {
+		if data.Symbol != "" {
+			symbol = data.Symbol
+		}
+	}
+
+	seq = data.Seq
+	if isSnapshot {
+		prevSeq = 0
+	} else {
+		prevSeq = data.U
+	}
+
+	bids, err = parseLevels(data.Bids)
+	if err != nil {
+		return symbol, isSnapshot, seq, prevSeq, nil, nil, fmt.Errorf("parse bids: %w", err)
+	}
+	asks, err = parseLevels(data.Asks)
+	if err != nil {
+		return symbol, isSnapshot, seq, prevSeq, nil, nil, fmt.Errorf("parse asks: %w", err)
+	}
+	return symbol, isSnapshot, seq, prevSeq, bids, asks, nil
+}
+
+func parseLevels(rows [][]string) ([]domain.OrderBookLevel, error) {
+	levels := make([]domain.OrderBookLevel, 0, len(rows))
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		price, err := strconv.ParseFloat(row[0], 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse level price: %w", err)
+		}
+		size, err := strconv.ParseFloat(row[1], 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse level size: %w", err)
+		}
+		levels = append(levels, domain.OrderBookLevel{Price: price, Size: size})
+	}
+	return levels, nil
+}
+
+// parsePublicTradeMessage parses a Bybit v5 public WebSocket publicTrade message.
+func parsePublicTradeMessage(payload []byte) (symbol string, trades []domain.PublicTrade, err error) {
+	var msg struct {
+		Topic string          `json:"topic"`
+		Type  string          `json:"type"`
+		Ts    int64           `json:"ts"`
+		Data  json.RawMessage `json:"data"`
+	}
+	if err = json.Unmarshal(payload, &msg); err != nil {
+		return "", nil, fmt.Errorf("unmarshal publicTrade message: %w", err)
+	}
+
+	topicParts := splitTopic(msg.Topic)
+	if len(topicParts) != 2 || topicParts[0] != "publicTrade" {
+		return "", nil, fmt.Errorf("invalid publicTrade topic: %s", msg.Topic)
+	}
+	symbol = topicParts[1]
+
+	var items []struct {
+		Timestamp int64  `json:"T"`
+		Symbol    string `json:"s"`
+		Price     string `json:"p"`
+		Size      string `json:"v"`
+		Side      string `json:"S"`
+	}
+	if err = json.Unmarshal(msg.Data, &items); err != nil {
+		// Try single object
+		var single struct {
+			Timestamp int64  `json:"T"`
+			Symbol    string `json:"s"`
+			Price     string `json:"p"`
+			Size      string `json:"v"`
+			Side      string `json:"S"`
+		}
+		if err2 := json.Unmarshal(msg.Data, &single); err2 != nil {
+			return symbol, nil, fmt.Errorf("unmarshal publicTrade data: %w", err)
+		}
+		items = []struct {
+			Timestamp int64  `json:"T"`
+			Symbol    string `json:"s"`
+			Price     string `json:"p"`
+			Size      string `json:"v"`
+			Side      string `json:"S"`
+		}{single}
+	}
+
+	trades = make([]domain.PublicTrade, 0, len(items))
+	for _, item := range items {
+		price, err := strconv.ParseFloat(item.Price, 64)
+		if err != nil {
+			continue
+		}
+		size, err := strconv.ParseFloat(item.Size, 64)
+		if err != nil {
+			continue
+		}
+		ts := time.Now().UTC()
+		if item.Timestamp > 0 {
+			ts = time.UnixMilli(item.Timestamp).UTC()
+		} else if msg.Ts > 0 {
+			ts = time.UnixMilli(msg.Ts).UTC()
+		}
+		if item.Symbol != "" {
+			symbol = item.Symbol
+		}
+		trades = append(trades, domain.PublicTrade{
+			Symbol:    symbol,
+			Price:     price,
+			Size:      size,
+			Side:      item.Side,
+			Timestamp: ts,
+		})
+	}
+	return symbol, trades, nil
+}

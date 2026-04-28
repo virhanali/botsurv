@@ -252,3 +252,44 @@ type Cycle struct {
 	Status      string
 	ReasonCodes []string
 }
+
+// OrderBookLevel represents a single price level in the orderbook.
+type OrderBookLevel struct {
+	Price float64
+	Size  float64
+}
+
+// OrderBookSummary is a computed view of the local orderbook.
+type OrderBookSummary struct {
+	Symbol                   string
+	BestBid                  float64
+	BestAsk                  float64
+	SpreadBps                float64
+	BidDepth                 float64
+	AskDepth                 float64
+	DepthToPositionSizeRatio float64
+	EstimatedSlippageBps     float64
+	LastUpdate               time.Time
+	Stale                    bool
+}
+
+// PublicTrade represents a single public trade.
+type PublicTrade struct {
+	Symbol    string
+	Price     float64
+	Size      float64
+	Side      string // "Buy" or "Sell"
+	Timestamp time.Time
+}
+
+// TradeFlow is a computed view of trade activity over a rolling window.
+type TradeFlow struct {
+	Symbol        string
+	WindowSeconds int
+	BuyVolume     float64
+	SellVolume    float64
+	BuySellRatio  float64
+	TradeCount    int
+	LastUpdate    time.Time
+	Stale         bool
+}

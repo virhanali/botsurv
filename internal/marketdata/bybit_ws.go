@@ -28,6 +28,8 @@ type BybitWSMarketDataService struct {
 
 	candleCache *candleCache
 	priceCache  *priceCache
+	orderBooks  *orderBookStore
+	tradeFlows  *tradeFlowStore
 
 	mu      sync.RWMutex
 	running bool
@@ -56,6 +58,7 @@ func NewBybitWSMarketDataService(
 	if log == nil {
 		log = logger.Default()
 	}
+	stale := time.Duration(config.StaleDataThresholdSeconds) * time.Second
 	return &BybitWSMarketDataService{
 		config:         config,
 		candleRepo:     candleRepo,
@@ -63,7 +66,9 @@ func NewBybitWSMarketDataService(
 		logger:         log,
 		candleCache:    newCandleCache(),
 		priceCache:     newPriceCache(),
-		staleThreshold: time.Duration(config.StaleDataThresholdSeconds) * time.Second,
+		orderBooks:     newOrderBookStore(stale),
+		tradeFlows:     newTradeFlowStore(config.TradeFlowWindows, stale),
+		staleThreshold: stale,
 	}
 }
 
@@ -163,43 +168,115 @@ func (s *BybitWSMarketDataService) GetLatestPrice(ctx context.Context, symbol st
 	return price, nil
 }
 
-// IsHealthy reports whether market data for a symbol is not stale.
-// It considers both price and candle freshness when that data exists.
-func (s *BybitWSMarketDataService) IsHealthy(symbol string) bool {
+// GetOrderBookSummary returns a computed orderbook summary for a symbol.
+func (s *BybitWSMarketDataService) GetOrderBookSummary(ctx context.Context, symbol string, targetNotional float64, side string) (domain.OrderBookSummary, error) {
+	summary := s.orderBooks.summary(symbol, targetNotional, side)
+	return summary, nil
+}
+
+// GetTradeFlow returns trade flow summaries for all configured windows for a symbol.
+func (s *BybitWSMarketDataService) GetTradeFlow(ctx context.Context, symbol string) ([]domain.TradeFlow, error) {
+	return s.tradeFlows.flow(symbol), nil
+}
+
+// HealthStatus returns detailed market data health for a symbol.
+func (s *BybitWSMarketDataService) HealthStatus(symbol string) domain.MarketDataHealth {
+	now := time.Now()
 	priceUpdate := s.priceCache.lastUpdate(symbol)
 	candleUpdate := s.candleCache.lastUpdateAny(symbol)
+	orderBookUpdate := s.orderBooks.lastUpdate(symbol)
+	tradeFlowUpdate := s.tradeFlows.lastUpdate(symbol)
 
 	hasPrice := !priceUpdate.IsZero()
 	hasCandle := !candleUpdate.IsZero()
+	hasOrderBook := !orderBookUpdate.IsZero()
+	hasTradeFlow := !tradeFlowUpdate.IsZero()
 
-	if !hasPrice && !hasCandle {
-		return false
-	}
+	priceHealthy := !hasPrice || now.Sub(priceUpdate) <= s.staleThreshold
+	candlesHealthy := !hasCandle || now.Sub(candleUpdate) <= s.staleThreshold
+	orderBookHealthy := !hasOrderBook || now.Sub(orderBookUpdate) <= s.staleThreshold
+	tradeFlowHealthy := !hasTradeFlow || now.Sub(tradeFlowUpdate) <= s.staleThreshold
 
-	now := time.Now()
-	if hasPrice && now.Sub(priceUpdate) > s.staleThreshold {
-		return false
-	}
-	if hasCandle && now.Sub(candleUpdate) > s.staleThreshold {
-		return false
-	}
-	for _, timeframe := range s.config.Timeframes {
-		update := s.candleCache.lastUpdate(symbol, timeframe)
-		if update.IsZero() || now.Sub(update) > s.staleThreshold {
-			return false
+	// Candles require all configured timeframes to be fresh if any candle data exists.
+	if hasCandle {
+		for _, tf := range s.config.Timeframes {
+			update := s.candleCache.lastUpdate(symbol, tf)
+			if update.IsZero() || now.Sub(update) > s.staleThreshold {
+				candlesHealthy = false
+				break
+			}
 		}
 	}
-	return true
+
+	healthy := (hasPrice || hasCandle || hasOrderBook) && priceHealthy && candlesHealthy && orderBookHealthy && tradeFlowHealthy
+
+	staleReason := ""
+	if !healthy {
+		reasons := []string{}
+		if hasPrice && !priceHealthy {
+			reasons = append(reasons, "stale_price")
+		}
+		if hasCandle && !candlesHealthy {
+			reasons = append(reasons, "stale_candles")
+		}
+		if hasOrderBook && !orderBookHealthy {
+			reasons = append(reasons, "stale_orderbook")
+		}
+		if hasTradeFlow && !tradeFlowHealthy {
+			reasons = append(reasons, "stale_trade_flow")
+		}
+		if !hasPrice && !hasCandle && !hasOrderBook {
+			reasons = append(reasons, "no_data")
+		}
+		staleReason = strings.Join(reasons, ",")
+	}
+
+	lastUpdate := priceUpdate
+	if candleUpdate.After(lastUpdate) {
+		lastUpdate = candleUpdate
+	}
+	if orderBookUpdate.After(lastUpdate) {
+		lastUpdate = orderBookUpdate
+	}
+	if tradeFlowUpdate.After(lastUpdate) {
+		lastUpdate = tradeFlowUpdate
+	}
+
+	return domain.MarketDataHealth{
+		Symbol:           symbol,
+		Healthy:          healthy,
+		LastUpdate:       lastUpdate,
+		StaleReason:      staleReason,
+		CandlesHealthy:   candlesHealthy,
+		OrderBookHealthy: orderBookHealthy,
+		PriceHealthy:     priceHealthy,
+	}
 }
 
-// LastUpdate returns the most recent update time for a symbol across price and candles.
+// IsHealthy reports whether market data for a symbol is not stale.
+// It considers price, candle, and orderbook freshness.
+func (s *BybitWSMarketDataService) IsHealthy(symbol string) bool {
+	return s.HealthStatus(symbol).Healthy
+}
+
+// LastUpdate returns the most recent update time for a symbol across all data types.
 func (s *BybitWSMarketDataService) LastUpdate(symbol string) time.Time {
 	priceUpdate := s.priceCache.lastUpdate(symbol)
 	candleUpdate := s.candleCache.lastUpdateAny(symbol)
-	if priceUpdate.After(candleUpdate) {
-		return priceUpdate
+	orderBookUpdate := s.orderBooks.lastUpdate(symbol)
+	tradeFlowUpdate := s.tradeFlows.lastUpdate(symbol)
+
+	latest := priceUpdate
+	if candleUpdate.After(latest) {
+		latest = candleUpdate
 	}
-	return candleUpdate
+	if orderBookUpdate.After(latest) {
+		latest = orderBookUpdate
+	}
+	if tradeFlowUpdate.After(latest) {
+		latest = tradeFlowUpdate
+	}
+	return latest
 }
 
 // runWSLoop manages the WebSocket connection lifecycle with auto-reconnect.
@@ -425,6 +502,10 @@ func (s *BybitWSMarketDataService) buildTopics() []string {
 			topics = append(topics, fmt.Sprintf("kline.%s.%s", mapTimeframeToBybit(tf), symbol))
 		}
 		topics = append(topics, "tickers."+symbol)
+		if s.config.OrderbookDepth > 0 {
+			topics = append(topics, fmt.Sprintf("orderbook.%d.%s", s.config.OrderbookDepth, symbol))
+		}
+		topics = append(topics, "publicTrade."+symbol)
 	}
 	return topics
 }
@@ -455,6 +536,10 @@ func (s *BybitWSMarketDataService) dispatchMessage(payload []byte) error {
 		return s.handleKlineMessage(s.ctx, payload)
 	case "tickers":
 		return s.handleTickerMessage(payload)
+	case "orderbook":
+		return s.handleOrderBookMessage(payload)
+	case "publicTrade":
+		return s.handlePublicTradeMessage(payload)
 	default:
 		return nil
 	}
@@ -510,6 +595,56 @@ func (s *BybitWSMarketDataService) handleTickerMessage(payload []byte) error {
 		return nil
 	}
 	s.priceCache.set(symbol, price, ts)
+	return nil
+}
+
+// handleOrderBookMessage processes a raw Bybit orderbook WebSocket message.
+func (s *BybitWSMarketDataService) handleOrderBookMessage(payload []byte) error {
+	s.mu.RLock()
+	if !s.running {
+		s.mu.RUnlock()
+		return nil
+	}
+	s.mu.RUnlock()
+
+	symbol, isSnapshot, seq, prevSeq, bids, asks, err := parseOrderBookMessage(payload)
+	if err != nil {
+		return err
+	}
+	if isSnapshot {
+		s.orderBooks.reset(symbol, seq, bids, asks)
+	} else {
+		ok := s.orderBooks.applyDelta(symbol, seq, prevSeq, bids, asks)
+		if !ok {
+			s.logger.Warn("orderbook delta sequence gap or no snapshot", map[string]any{
+				"symbol":  symbol,
+				"prevSeq": prevSeq,
+				"seq":     seq,
+			})
+		}
+	}
+	return nil
+}
+
+// handlePublicTradeMessage processes a raw Bybit publicTrade WebSocket message.
+func (s *BybitWSMarketDataService) handlePublicTradeMessage(payload []byte) error {
+	s.mu.RLock()
+	if !s.running {
+		s.mu.RUnlock()
+		return nil
+	}
+	s.mu.RUnlock()
+
+	symbol, trades, err := parsePublicTradeMessage(payload)
+	if err != nil {
+		return err
+	}
+	for _, t := range trades {
+		if t.Symbol == "" {
+			t.Symbol = symbol
+		}
+		s.tradeFlows.add(t)
+	}
 	return nil
 }
 
