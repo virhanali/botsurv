@@ -21,6 +21,8 @@ func minimalValidConfig() *UserConfig {
 			Pool:   PoolConfig{MaxOpenConns: 10, MaxIdleConns: 5, ConnMaxLifetime: 1800},
 		},
 		MarketData: MarketDataConfig{
+			WSURL:                     "wss://stream.bybit.com/v5/public/linear",
+			RESTURL:                   "https://api.bybit.com",
 			StaleDataThresholdSeconds: 30,
 			ReconnectIntervalSeconds:  5,
 			BackfillCandles:           500,
@@ -96,6 +98,8 @@ database:
   driver: postgres
   dsn: postgres://test:test@localhost:5432/test?sslmode=disable
 market_data:
+  ws_url: "wss://stream.bybit.com/v5/public/linear"
+  rest_url: "https://api.bybit.com"
   stale_data_threshold_seconds: 30
   reconnect_interval_seconds: 5
   backfill_candles: 500
@@ -151,6 +155,8 @@ database:
   driver: postgres
   dsn: postgres://test:test@localhost:5432/test?sslmode=disable
 market_data:
+  ws_url: "wss://stream.bybit.com/v5/public/linear"
+  rest_url: "https://api.bybit.com"
   stale_data_threshold_seconds: 30
   reconnect_interval_seconds: 5
   backfill_candles: 500
@@ -207,6 +213,8 @@ database:
   driver: postgres
   dsn: postgres://test:test@localhost:5432/test?sslmode=disable
 market_data:
+  ws_url: "wss://stream.bybit.com/v5/public/linear"
+  rest_url: "https://api.bybit.com"
   stale_data_threshold_seconds: 30
   reconnect_interval_seconds: 5
   backfill_candles: 500

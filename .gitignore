@@ -5,6 +5,7 @@ opencode.json
 .env
 
 # Go build artifacts
+/bot
 *.exe
 *.exe~
 *.dll
@@ -26,6 +27,7 @@ opencode.json
 Thumbs.db
 
 # Temporary files
+tmp/
 /tmp/
 *.tmp
 *.log

@@ -349,6 +349,12 @@ func (c AppConfig) validate() error {
 }
 
 func (c MarketDataConfig) validate() error {
+	if c.WSURL == "" {
+		return errors.New("market_data.ws_url is required")
+	}
+	if c.RESTURL == "" {
+		return errors.New("market_data.rest_url is required")
+	}
 	if c.StaleDataThresholdSeconds <= 0 {
 		return errors.New("market_data.stale_data_threshold_seconds must be > 0")
 	}
