@@ -47,6 +47,7 @@ func TestPlaceOrder_MarketBuyLong(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder: %v", err)
@@ -80,6 +81,7 @@ func TestPlaceOrder_MarketSellShort(t *testing.T) {
 		Side:      domain.OrderSideSell,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
+		StopLoss:  1,
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder: %v", err)
@@ -108,6 +110,7 @@ func TestPlaceOrder_InsufficientMargin(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
+		StopLoss:  1,
 	})
 	if err == nil {
 		t.Error("expected error for insufficient margin")
@@ -123,6 +126,7 @@ func TestPlaceOrder_FeeCalculation(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	state, _ := pb.GetAccountState(context.Background())
@@ -145,6 +149,7 @@ func TestPlaceOrder_SlippageCalculation(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	state, _ := pb.GetAccountState(context.Background())
@@ -162,6 +167,7 @@ func TestPlaceOrder_MarginTracking(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	state, _ := pb.GetAccountState(context.Background())
@@ -187,6 +193,7 @@ func TestClosePosition_LongProfit(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// Price goes up
@@ -212,6 +219,7 @@ func TestClosePosition_LongLoss(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// Price goes down
@@ -233,6 +241,7 @@ func TestClosePosition_ShortProfit(t *testing.T) {
 		Side:      domain.OrderSideSell,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
+		StopLoss:  1,
 	})
 
 	// Price goes down (profit for short)
@@ -254,6 +263,7 @@ func TestStopLoss_Triggers(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// Set SL at 64000
@@ -282,6 +292,7 @@ func TestTakeProfit_Triggers(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// Set TP at 67000
@@ -307,6 +318,7 @@ func TestSameCandle_SLFirst(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	slPrice := 64000.0
@@ -341,12 +353,14 @@ func TestEmergencyCloseAll(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 	pb.PlaceOrder(context.Background(), OrderRequest{
 		Symbol:    "ETHUSDT",
 		Side:      domain.OrderSideSell,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
+		StopLoss:  1,
 	})
 
 	pb.EmergencyCloseAll(context.Background())
@@ -369,6 +383,7 @@ func TestSetProtectiveOrders_ValidateSL(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// SL above entry for LONG is invalid
@@ -393,6 +408,7 @@ func TestSetProtectiveOrders_ValidateTP(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// TP below entry for LONG is invalid
@@ -412,6 +428,7 @@ func TestLimitOrder_Fill(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeLimit,
 		Qty:       0.01,
+		StopLoss:  1,
 		Price:     &price,
 	})
 
@@ -428,10 +445,10 @@ func TestLimitOrder_Fill(t *testing.T) {
 		Close:  64500,
 	})
 
-	// Should be filled
+	// Should be filled with protective orders created
 	orders, _ = pb.GetOpenOrders(context.Background())
-	if len(orders) != 0 {
-		t.Errorf("expected 0 pending orders after fill, got %d", len(orders))
+	if len(orders) < 1 {
+		t.Errorf("expected at least 1 protective order after limit fill, got %d", len(orders))
 	}
 	positions, _ := pb.GetOpenPositions(context.Background())
 	if len(positions) != 1 {
@@ -449,6 +466,7 @@ func TestLimitOrder_NoFill(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeLimit,
 		Qty:       0.01,
+		StopLoss:  1,
 		Price:     &price,
 	})
 
@@ -476,6 +494,7 @@ func TestCancelOrder(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeLimit,
 		Qty:       0.01,
+		StopLoss:  1,
 		Price:     &price,
 	})
 
@@ -499,6 +518,7 @@ func TestUnrealizedPnL(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// Price goes up
@@ -523,6 +543,7 @@ func TestResetDailyLoss(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
+		StopLoss:  1,
 	})
 
 	// Close at loss

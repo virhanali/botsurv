@@ -172,7 +172,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (*CycleResult, error) {
 				SpreadBps:   ob.SpreadBps,
 				SlippageBps: ob.EstimatedSlippageBps,
 				DepthRatio:  ob.DepthToPositionSizeRatio,
-				LastUpdate:  time.Now(),
+				LastUpdate:  ob.LastUpdate,
 				Stale:       ob.Stale,
 			},
 			Portfolio: risk.PortfolioState{
@@ -261,8 +261,7 @@ func (s *Scheduler) isHalted() bool {
 	if s == nil {
 		return true
 	}
-	status := s.monitor.Status(context.Background())
-	return status.AccountState.Equity <= 0
+	return s.monitor.IsHalted()
 }
 
 func (s *Scheduler) refreshUniverseIfNeeded(ctx context.Context) error {

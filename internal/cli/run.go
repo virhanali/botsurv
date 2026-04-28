@@ -115,11 +115,37 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	mdSvc := marketdata.NewBybitWSMarketDataService(cfg.MarketData, repos.CandleRepository, httpClient, log)
 
+	// Scan universe first to get symbols for WS (needed for all_usdt_perpetual mode)
 	universeScanner := universe.NewScanner(
 		cfg.Universe, cfg.Strategy, cfg.LLMRouting,
 		cfg.MarketData.RESTURL, mdSvc,
 		repos.UniverseRepository, repos.CandleRepository, log,
 	)
+
+	// Refresh universe to populate symbol list
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := universeScanner.RefreshUniverse(ctx); err != nil {
+		log.Warn("initial universe refresh failed, using empty symbols", map[string]any{"error": err.Error()})
+	}
+
+	// Feed symbols to WS if all_usdt_perpetual mode
+	if cfg.MarketData.Symbols.Mode != "explicit" {
+		symbols, _ := universeScanner.GetUniverse(ctx)
+		symbolList := make([]string, 0, len(symbols))
+		for _, s := range symbols {
+			if !s.Blacklist {
+				symbolList = append(symbolList, s.Symbol)
+			}
+		}
+		mdSvc.SetSymbols(symbolList)
+		log.Info("marketdata symbols set", map[string]any{"count": len(symbolList)})
+	}
+
+	// Start market data service (WS connect + backfill)
+	if err := mdSvc.Start(ctx); err != nil {
+		log.Warn("marketdata service failed to start, continuing without WS data", map[string]any{"error": err.Error()})
+	}
 
 	screenerSvc := screener.NewScreener(*cfg, universeScanner, mdSvc, log)
 

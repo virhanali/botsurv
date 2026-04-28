@@ -152,6 +152,9 @@ type Order struct {
 	Status        OrderStatus
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	// Intended protective order levels (for Limit orders, applied on fill)
+	IntendedSL float64
+	IntendedTP float64
 }
 
 // PositionStatus represents the state of a position.

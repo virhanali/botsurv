@@ -69,7 +69,10 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 	if !isValidLLMDecision(input.LLMDecision) {
 		reasons = append(reasons, "INVALID_LLM_DECISION")
 	}
-	if input.LLMDecision.Confidence > 0 && input.LLMDecision.Confidence < 0.6 {
+	if input.LLMDecision.Decision == "BLOCK" {
+		reasons = append(reasons, "LLM_DECISION_BLOCK")
+	}
+	if input.LLMDecision.Confidence < 0.6 {
 		reasons = append(reasons, "LLM_LOW_CONFIDENCE")
 	}
 	if input.LLMDecision.Decision == "REDUCE_SIZE" {

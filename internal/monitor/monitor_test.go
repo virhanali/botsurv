@@ -32,6 +32,7 @@ func TestUpdate_UpdatesPrice(t *testing.T) {
 	pb.PlaceOrder(context.Background(), broker.OrderRequest{
 		Symbol: "BTCUSDT", Side: domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket, Qty: 0.01,
+  StopLoss:  100,
 	})
 
 	// Price goes up
@@ -51,6 +52,7 @@ func TestCheckKillSwitch_Triggers(t *testing.T) {
 	pb.PlaceOrder(context.Background(), broker.OrderRequest{
 		Symbol: "BTCUSDT", Side: domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket, Qty: 0.01,
+  StopLoss:  100,
 	})
 
 	// Big drop: close at 55000 (loss ~$100)
@@ -65,6 +67,7 @@ func TestCheckKillSwitch_Triggers(t *testing.T) {
 	pb.PlaceOrder(context.Background(), broker.OrderRequest{
 		Symbol: "BTCUSDT", Side: domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket, Qty: 0.01,
+  StopLoss:  100,
 	})
 
 	// Trigger kill switch
@@ -83,6 +86,7 @@ func TestResetDaily(t *testing.T) {
 	pb.PlaceOrder(context.Background(), broker.OrderRequest{
 		Symbol: "BTCUSDT", Side: domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket, Qty: 0.01,
+  StopLoss:  100,
 	})
 
 	pb.UpdatePrice("BTCUSDT", 64000)
@@ -108,6 +112,7 @@ func TestStatus_ReturnsInfo(t *testing.T) {
 	pb.PlaceOrder(context.Background(), broker.OrderRequest{
 		Symbol: "BTCUSDT", Side: domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket, Qty: 0.01,
+  StopLoss:  100,
 	})
 
 	status := mon.Status(context.Background())
@@ -127,6 +132,7 @@ func TestProcessCandle_FillsLimitOrders(t *testing.T) {
 	pb.PlaceOrder(context.Background(), broker.OrderRequest{
 		Symbol: "BTCUSDT", Side: domain.OrderSideBuy,
 		OrderType: domain.OrderTypeLimit, Qty: 0.01, Price: &price,
+  StopLoss:  100,
 	})
 
 	mon.ProcessCandle(domain.Candle{
@@ -134,8 +140,8 @@ func TestProcessCandle_FillsLimitOrders(t *testing.T) {
 	})
 
 	orders, _ := pb.GetOpenOrders(context.Background())
-	if len(orders) != 0 {
-		t.Errorf("expected 0 pending orders after candle, got %d", len(orders))
+	if len(orders) < 1 {
+		t.Errorf("expected protective orders after limit fill, got %d", len(orders))
 	}
 	positions, _ := pb.GetOpenPositions(context.Background())
 	if len(positions) != 1 {

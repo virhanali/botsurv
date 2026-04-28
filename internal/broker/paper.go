@@ -136,8 +136,15 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 	}
 
 	// Halted: block new entries
-	if pb.halted && req.Qty > 0 && (req.OrderType == domain.OrderTypeMarket || req.OrderType == domain.OrderTypeLimit) && req.StopPrice == nil {
+	if pb.halted && req.StopPrice == nil && !req.ReduceOnly && (req.OrderType == domain.OrderTypeMarket || req.OrderType == domain.OrderTypeLimit) {
 		return domain.Order{}, fmt.Errorf("broker halted: %s", pb.haltReason)
+	}
+
+	// Enforce no-position-without-SL: all entry orders must have StopLoss
+	if !req.ReduceOnly && (req.OrderType == domain.OrderTypeMarket || req.OrderType == domain.OrderTypeLimit) {
+		if req.StopLoss <= 0 {
+			return domain.Order{}, fmt.Errorf("entry order rejected: StopLoss is required (no position without SL)")
+		}
 	}
 
 	order := domain.Order{
@@ -152,6 +159,8 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 		Status:        domain.OrderStatusPending,
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
+		IntendedSL:    req.StopLoss,
+		IntendedTP:    req.TakeProfit,
 	}
 	pb.nextOrderID++
 
@@ -706,6 +715,18 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 	pb.usedMargin += margin
 	pb.balance -= fee
 	pb.totalFees += fee
+
+	// Atomic protective orders for limit fills
+	if order.IntendedSL > 0 || order.IntendedTP > 0 {
+		pb.createProtectiveOrdersForPosition(pos, order.IntendedSL, order.IntendedTP)
+	} else {
+		// No SL intended — emergency close (safety invariant)
+		pb.log.Error("limit fill with no SL — emergency closing", map[string]any{"symbol": order.Symbol})
+		pb.closePositionInternal(pos, fillPrice, time.Now())
+		order.Status = domain.OrderStatusFilled
+		order.UpdatedAt = time.Now()
+		return
+	}
 
 	order.Status = domain.OrderStatusFilled
 	order.UpdatedAt = time.Now()

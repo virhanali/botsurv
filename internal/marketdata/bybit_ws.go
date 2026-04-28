@@ -45,7 +45,7 @@ type BybitWSMarketDataService struct {
 	staleThreshold time.Duration
 
 	// dynamic symbols for all_usdt_perpetual mode
-	muDynamic     sync.RWMutex
+	muDynamic      sync.RWMutex
 	dynamicSymbols []string
 }
 

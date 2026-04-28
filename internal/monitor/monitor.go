@@ -90,6 +90,11 @@ func (m *Monitor) ResetDaily() {
 	m.log.Info("daily loss counter reset", nil)
 }
 
+// IsHalted returns whether the broker is halted.
+func (m *Monitor) IsHalted() bool {
+	return m.broker.IsHalted()
+}
+
 // Status returns a summary of current positions and account.
 func (m *Monitor) Status(ctx context.Context) MonitorStatus {
 	state, _ := m.broker.GetAccountState(ctx)
