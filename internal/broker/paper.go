@@ -1,0 +1,717 @@
+package broker
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"sync"
+	"time"
+
+	"github.com/virhan/botsurv/internal/app"
+	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/logger"
+)
+
+// PaperBroker simulates futures trading in paper mode.
+type PaperBroker struct {
+	mu sync.RWMutex
+
+	cfg app.PaperConfig
+	log *logger.Logger
+
+	// Account state
+	startingBalance float64
+	balance         float64
+	usedMargin      float64
+	realizedPnL     float64
+	unrealizedPnL   float64
+	totalFees       float64
+	totalSlippage   float64
+	dailyLoss       float64
+
+	// Positions and orders
+	openPositions   map[string]*domain.Position // symbol -> position
+	openOrders      map[string]*domain.Order    // orderID -> order
+	closedPositions []domain.Position
+
+	// ID counters
+	nextOrderID    int64
+	nextPositionID int64
+	nextExecID     int64
+
+	// Latest prices for unrealized PnL
+	prices map[string]float64
+}
+
+// NewPaperBroker creates a new PaperBroker.
+func NewPaperBroker(cfg app.PaperConfig, log *logger.Logger) *PaperBroker {
+	return &PaperBroker{
+		cfg:             cfg,
+		log:             log,
+		startingBalance: cfg.StartingBalanceUSD,
+		balance:         cfg.StartingBalanceUSD,
+		openPositions:   make(map[string]*domain.Position),
+		openOrders:      make(map[string]*domain.Order),
+		prices:          make(map[string]float64),
+		nextOrderID:     1,
+		nextPositionID:  1,
+		nextExecID:      1,
+	}
+}
+
+// GetAccountState returns the current account state.
+func (pb *PaperBroker) GetAccountState(_ context.Context) (domain.AccountState, error) {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	equity := pb.balance + pb.unrealizedPnL
+	return domain.AccountState{
+		Balance:          pb.balance,
+		AvailableBalance: pb.balance - pb.usedMargin,
+		UsedMargin:       pb.usedMargin,
+		Equity:           equity,
+		RealizedPnL:      pb.realizedPnL,
+		UnrealizedPnL:    pb.unrealizedPnL,
+		TotalFees:        pb.totalFees,
+		TotalSlippage:    pb.totalSlippage,
+		DailyLoss:        pb.dailyLoss,
+		RecordedAt:       time.Now(),
+	}, nil
+}
+
+// GetOpenPositions returns all open positions.
+func (pb *PaperBroker) GetOpenPositions(_ context.Context) ([]domain.Position, error) {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	positions := make([]domain.Position, 0, len(pb.openPositions))
+	for _, p := range pb.openPositions {
+		positions = append(positions, *p)
+	}
+	return positions, nil
+}
+
+// GetOpenOrders returns all open orders.
+func (pb *PaperBroker) GetOpenOrders(_ context.Context) ([]domain.Order, error) {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+
+	orders := make([]domain.Order, 0, len(pb.openOrders))
+	for _, o := range pb.openOrders {
+		orders = append(orders, *o)
+	}
+	return orders, nil
+}
+
+// PlaceOrder places a new order.
+func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.Order, error) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if req.Qty <= 0 {
+		return domain.Order{}, fmt.Errorf("qty must be > 0")
+	}
+	if req.Symbol == "" {
+		return domain.Order{}, fmt.Errorf("symbol is required")
+	}
+
+	order := domain.Order{
+		ID:            pb.nextOrderID,
+		BrokerOrderID: fmt.Sprintf("paper-%d", pb.nextOrderID),
+		Symbol:        req.Symbol,
+		Side:          req.Side,
+		OrderType:     req.OrderType,
+		Qty:           req.Qty,
+		Price:         req.Price,
+		StopPrice:     req.StopPrice,
+		Status:        domain.OrderStatusPending,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	pb.nextOrderID++
+
+	// Market orders fill immediately
+	if req.OrderType == domain.OrderTypeMarket {
+		price, ok := pb.prices[req.Symbol]
+		if !ok || price <= 0 {
+			return domain.Order{}, fmt.Errorf("no price available for %s", req.Symbol)
+		}
+
+		slippageBps := pb.cfg.SlippageBps
+		takerFeeBps := pb.cfg.FeeTakerBps
+
+		var fillPrice float64
+		var slippageAmt float64
+		if req.Side == domain.OrderSideBuy {
+			slippageAmt = price * slippageBps / 10000
+			fillPrice = price + slippageAmt
+		} else {
+			slippageAmt = price * slippageBps / 10000
+			fillPrice = price - slippageAmt
+		}
+
+		notional := fillPrice * req.Qty
+		fee := notional * takerFeeBps / 10000
+		margin := notional / pb.cfg.DefaultLeverage
+
+		// Check sufficient balance
+		if pb.balance-pb.usedMargin < margin+fee {
+			order.Status = domain.OrderStatusRejected
+			pb.log.Error("order rejected: insufficient margin", map[string]any{
+				"symbol":    req.Symbol,
+				"required":  margin + fee,
+				"available": pb.balance - pb.usedMargin,
+			})
+			return order, fmt.Errorf("insufficient margin: need %.2f, have %.2f", margin+fee, pb.balance-pb.usedMargin)
+		}
+
+		// Check for existing position
+		existing, hasPos := pb.openPositions[req.Symbol]
+		if hasPos && !req.ReduceOnly {
+			// Close existing position first (opposite side)
+			pb.closePositionInternal(existing, fillPrice, time.Now())
+			hasPos = false
+		}
+
+		if hasPos && req.ReduceOnly {
+			// Reduce existing position
+			pb.reducePosition(existing, req.Side, req.Qty, fillPrice, fee, slippageAmt)
+		} else {
+			// Open new position
+			pos := &domain.Position{
+				ID:         pb.nextPositionID,
+				Symbol:     req.Symbol,
+				Side:       pb.sideFromOrderSide(req.Side),
+				EntryPrice: fillPrice,
+				Size:       req.Qty,
+				Leverage:   pb.cfg.DefaultLeverage,
+				Margin:     margin,
+				Status:     domain.PositionStatusOpen,
+				Source:     "paper",
+				OpenedAt:   time.Now(),
+			}
+			pb.nextPositionID++
+			pb.openPositions[req.Symbol] = pos
+			pb.usedMargin += margin
+			pb.balance -= fee
+			pb.totalFees += fee
+			pb.totalSlippage += slippageAmt * req.Qty
+		}
+
+		order.Status = domain.OrderStatusFilled
+		order.UpdatedAt = time.Now()
+
+		pb.log.Info("market order filled", map[string]any{
+			"symbol":     req.Symbol,
+			"side":       req.Side,
+			"qty":        req.Qty,
+			"fill_price": fillPrice,
+			"fee":        fee,
+			"slippage":   slippageAmt,
+		})
+	}
+
+	// Protective orders (SL/TP) are stored and checked on price updates
+	if req.OrderType == domain.OrderTypeStopMarket || req.OrderType == domain.OrderTypeTakeProfitMarket {
+		if req.StopPrice == nil || *req.StopPrice <= 0 {
+			return domain.Order{}, fmt.Errorf("stop_price required for %s", req.OrderType)
+		}
+		order.Status = domain.OrderStatusPending
+		pb.openOrders[order.BrokerOrderID] = &order
+	}
+
+	// Limit orders are stored as pending
+	if req.OrderType == domain.OrderTypeLimit {
+		if req.Price == nil || *req.Price <= 0 {
+			return domain.Order{}, fmt.Errorf("price required for LIMIT order")
+		}
+		order.Status = domain.OrderStatusPending
+		pb.openOrders[order.BrokerOrderID] = &order
+	}
+
+	return order, nil
+}
+
+// CancelOrder cancels a pending order.
+func (pb *PaperBroker) CancelOrder(_ context.Context, orderID string) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	order, ok := pb.openOrders[orderID]
+	if !ok {
+		return fmt.Errorf("order %s not found", orderID)
+	}
+	order.Status = domain.OrderStatusCancelled
+	order.UpdatedAt = time.Now()
+	delete(pb.openOrders, orderID)
+	return nil
+}
+
+// ClosePosition closes an open position at market price.
+func (pb *PaperBroker) ClosePosition(_ context.Context, symbol string) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	pos, ok := pb.openPositions[symbol]
+	if !ok {
+		return fmt.Errorf("no open position for %s", symbol)
+	}
+
+	price, ok := pb.prices[symbol]
+	if !ok || price <= 0 {
+		return fmt.Errorf("no price available for %s", symbol)
+	}
+
+	pb.closePositionInternal(pos, price, time.Now())
+	return nil
+}
+
+// EmergencyCloseAll closes all positions and cancels all orders.
+func (pb *PaperBroker) EmergencyCloseAll(_ context.Context) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	now := time.Now()
+
+	// Cancel all open orders
+	for id, order := range pb.openOrders {
+		order.Status = domain.OrderStatusCancelled
+		order.UpdatedAt = now
+		delete(pb.openOrders, id)
+	}
+
+	// Close all positions
+	for symbol, pos := range pb.openPositions {
+		price, ok := pb.prices[symbol]
+		if !ok || price <= 0 {
+			price = pos.EntryPrice // fallback: close at entry (no PnL)
+			pb.log.Error("emergency close: no price, using entry price", map[string]any{"symbol": symbol})
+		}
+		pb.closePositionInternal(pos, price, now)
+	}
+
+	pb.log.Error("EMERGENCY CLOSE ALL executed", map[string]any{
+		"positions_closed": len(pb.openPositions),
+		"orders_cancelled": len(pb.openOrders),
+	})
+
+	return nil
+}
+
+// UpdatePrice updates the latest price and recalculates unrealized PnL.
+// This also checks protective orders (SL/TP) for fills.
+func (pb *PaperBroker) UpdatePrice(symbol string, price float64) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	pb.prices[symbol] = price
+
+	// Update unrealized PnL
+	var totalUnrealized float64
+	for _, pos := range pb.openPositions {
+		pb.updatePositionPnL(pos, price)
+		if pos.Symbol == symbol {
+			totalUnrealized += pos.UnrealizedPnL
+		} else {
+			totalUnrealized += pos.UnrealizedPnL
+		}
+	}
+	pb.unrealizedPnL = totalUnrealized
+
+	// Check protective orders
+	pb.checkProtectiveOrders(symbol, price, time.Now())
+}
+
+// ProcessCandle checks pending orders against candle OHLCV for fills.
+func (pb *PaperBroker) ProcessCandle(candle domain.Candle) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	pb.prices[candle.Symbol] = candle.Close
+
+	// Check limit orders
+	for id, order := range pb.openOrders {
+		if order.Symbol != candle.Symbol {
+			continue
+		}
+		if order.OrderType == domain.OrderTypeLimit {
+			if pb.wouldLimitFill(order, candle) {
+				pb.fillLimitOrder(order, candle)
+				delete(pb.openOrders, id)
+			}
+		}
+	}
+
+	// Check protective orders with conservative SL-first assumption
+	pb.checkProtectiveOrdersCandle(candle.Symbol, candle, time.Now())
+}
+
+// GetClosedPositions returns closed positions.
+func (pb *PaperBroker) GetClosedPositions() []domain.Position {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	return pb.closedPositions
+}
+
+// GetPosition returns a specific open position.
+func (pb *PaperBroker) GetPosition(symbol string) (*domain.Position, bool) {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	pos, ok := pb.openPositions[symbol]
+	return pos, ok
+}
+
+// --- Internal methods ---
+
+func (pb *PaperBroker) sideFromOrderSide(os domain.OrderSide) domain.Side {
+	if os == domain.OrderSideBuy {
+		return domain.SideLong
+	}
+	return domain.SideShort
+}
+
+func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice float64, now time.Time) {
+	takerFeeBps := pb.cfg.FeeTakerBps
+	slippageBps := pb.cfg.SlippageBps
+
+	// Apply slippage to exit
+	var slippageAmt float64
+	if pos.Side == domain.SideLong {
+		slippageAmt = exitPrice * slippageBps / 10000
+		exitPrice -= slippageAmt
+	} else {
+		slippageAmt = exitPrice * slippageBps / 10000
+		exitPrice += slippageAmt
+	}
+
+	// Calculate PnL
+	var pnl float64
+	if pos.Side == domain.SideLong {
+		pnl = (exitPrice - pos.EntryPrice) * pos.Size
+	} else {
+		pnl = (pos.EntryPrice - exitPrice) * pos.Size
+	}
+
+	notional := exitPrice * pos.Size
+	fee := notional * takerFeeBps / 10000
+	pnl -= fee
+
+	pos.RealizedPnL = pnl
+	pos.UnrealizedPnL = 0
+	pos.Status = domain.PositionStatusClosed
+	pos.ClosedAt = &now
+
+	// Update account
+	pb.balance += pos.Margin + pnl
+	pb.usedMargin -= pos.Margin
+	pb.realizedPnL += pnl
+	pb.totalFees += fee
+	pb.totalSlippage += slippageAmt * pos.Size
+
+	if pnl < 0 {
+		pb.dailyLoss += math.Abs(pnl)
+	}
+
+	delete(pb.openPositions, pos.Symbol)
+	pb.closedPositions = append(pb.closedPositions, *pos)
+
+	pb.log.Info("position closed", map[string]any{
+		"symbol":   pos.Symbol,
+		"side":     pos.Side,
+		"entry":    pos.EntryPrice,
+		"exit":     exitPrice,
+		"pnl":      pnl,
+		"fee":      fee,
+		"slippage": slippageAmt,
+	})
+}
+
+func (pb *PaperBroker) reducePosition(pos *domain.Position, side domain.OrderSide, qty, fillPrice, fee, slippageAmt float64) {
+	if qty >= pos.Size {
+		// Full close
+		pb.closePositionInternal(pos, fillPrice, time.Now())
+		return
+	}
+
+	// Partial close
+	var pnl float64
+	if pos.Side == domain.SideLong {
+		pnl = (fillPrice - pos.EntryPrice) * qty
+	} else {
+		pnl = (pos.EntryPrice - fillPrice) * qty
+	}
+	pnl -= fee
+
+	marginFreed := pos.Margin * (qty / pos.Size)
+	pos.Size -= qty
+	pos.Margin -= marginFreed
+	pos.RealizedPnL += pnl
+
+	pb.balance += marginFreed + pnl
+	pb.usedMargin -= marginFreed
+	pb.realizedPnL += pnl
+	pb.totalFees += fee
+	pb.totalSlippage += slippageAmt * qty
+
+	if pnl < 0 {
+		pb.dailyLoss += math.Abs(pnl)
+	}
+}
+
+func (pb *PaperBroker) updatePositionPnL(pos *domain.Position, price float64) {
+	if pos.Side == domain.SideLong {
+		pos.UnrealizedPnL = (price - pos.EntryPrice) * pos.Size
+	} else {
+		pos.UnrealizedPnL = (pos.EntryPrice - price) * pos.Size
+	}
+}
+
+func (pb *PaperBroker) checkProtectiveOrders(symbol string, price float64, now time.Time) {
+	for id, order := range pb.openOrders {
+		if order.Symbol != symbol {
+			continue
+		}
+		if order.OrderType == domain.OrderTypeStopMarket {
+			if pb.shouldTriggerSL(order, price) {
+				pb.triggerProtectiveOrder(order, price, now)
+				delete(pb.openOrders, id)
+			}
+		}
+		if order.OrderType == domain.OrderTypeTakeProfitMarket {
+			if pb.shouldTriggerTP(order, price) {
+				pb.triggerProtectiveOrder(order, price, now)
+				delete(pb.openOrders, id)
+			}
+		}
+	}
+}
+
+func (pb *PaperBroker) checkProtectiveOrdersCandle(symbol string, candle domain.Candle, now time.Time) {
+	// Conservative SL-first assumption: if both SL and TP could trigger in same candle,
+	// assume SL triggers first.
+	slTriggered := false
+
+	for id, order := range pb.openOrders {
+		if order.Symbol != symbol {
+			continue
+		}
+		if order.OrderType == domain.OrderTypeStopMarket {
+			if order.StopPrice != nil && candleCrossesPrice(candle, *order.StopPrice) {
+				pb.triggerProtectiveOrder(order, *order.StopPrice, now)
+				delete(pb.openOrders, id)
+				slTriggered = true
+			}
+		}
+	}
+
+	// Only check TP if SL was NOT triggered (conservative assumption)
+	if !slTriggered {
+		for id, order := range pb.openOrders {
+			if order.Symbol != symbol {
+				continue
+			}
+			if order.OrderType == domain.OrderTypeTakeProfitMarket {
+				if order.StopPrice != nil && candleCrossesPrice(candle, *order.StopPrice) {
+					pb.triggerProtectiveOrder(order, *order.StopPrice, now)
+					delete(pb.openOrders, id)
+				}
+			}
+		}
+	}
+}
+
+func (pb *PaperBroker) shouldTriggerSL(order *domain.Order, price float64) bool {
+	if order.StopPrice == nil {
+		return false
+	}
+	pos, ok := pb.openPositions[order.Symbol]
+	if !ok {
+		return false
+	}
+	if pos.Side == domain.SideLong {
+		return price <= *order.StopPrice
+	}
+	return price >= *order.StopPrice
+}
+
+func (pb *PaperBroker) shouldTriggerTP(order *domain.Order, price float64) bool {
+	if order.StopPrice == nil {
+		return false
+	}
+	pos, ok := pb.openPositions[order.Symbol]
+	if !ok {
+		return false
+	}
+	if pos.Side == domain.SideLong {
+		return price >= *order.StopPrice
+	}
+	return price <= *order.StopPrice
+}
+
+func (pb *PaperBroker) triggerProtectiveOrder(order *domain.Order, triggerPrice float64, now time.Time) {
+	pos, ok := pb.openPositions[order.Symbol]
+	if !ok {
+		return
+	}
+	pb.closePositionInternal(pos, triggerPrice, now)
+	order.Status = domain.OrderStatusFilled
+	order.UpdatedAt = now
+}
+
+func (pb *PaperBroker) wouldLimitFill(order *domain.Order, candle domain.Candle) bool {
+	if order.Price == nil {
+		return false
+	}
+	if order.Side == domain.OrderSideBuy {
+		return candle.Low <= *order.Price
+	}
+	return candle.High >= *order.Price
+}
+
+func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle) {
+	if order.Price == nil {
+		return
+	}
+	fillPrice := *order.Price
+
+	makerFeeBps := pb.cfg.FeeMakerBps
+	notional := fillPrice * order.Qty
+	fee := notional * makerFeeBps / 10000
+	margin := notional / pb.cfg.DefaultLeverage
+
+	if pb.balance-pb.usedMargin < margin+fee {
+		order.Status = domain.OrderStatusRejected
+		pb.log.Error("limit order rejected: insufficient margin", map[string]any{
+			"symbol": order.Symbol,
+		})
+		return
+	}
+
+	pos := &domain.Position{
+		ID:         pb.nextPositionID,
+		Symbol:     order.Symbol,
+		Side:       pb.sideFromOrderSide(order.Side),
+		EntryPrice: fillPrice,
+		Size:       order.Qty,
+		Leverage:   pb.cfg.DefaultLeverage,
+		Margin:     margin,
+		Status:     domain.PositionStatusOpen,
+		Source:     "paper",
+		OpenedAt:   time.Now(),
+	}
+	pb.nextPositionID++
+	pb.openPositions[order.Symbol] = pos
+	pb.usedMargin += margin
+	pb.balance -= fee
+	pb.totalFees += fee
+
+	order.Status = domain.OrderStatusFilled
+	order.UpdatedAt = time.Now()
+
+	pb.log.Info("limit order filled", map[string]any{
+		"symbol":     order.Symbol,
+		"side":       order.Side,
+		"qty":        order.Qty,
+		"fill_price": fillPrice,
+		"fee":        fee,
+	})
+}
+
+func candleCrossesPrice(candle domain.Candle, price float64) bool {
+	return candle.Low <= price && candle.High >= price
+}
+
+// ResetDailyLoss resets the daily loss counter.
+func (pb *PaperBroker) ResetDailyLoss() {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.dailyLoss = 0
+}
+
+// SetProtectiveOrders sets SL and TP orders for a position.
+// Returns error if SL cannot be created (safety invariant).
+func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, slPrice, tpPrice float64) error {
+	if slPrice <= 0 {
+		return fmt.Errorf("SL price must be > 0 (no position without SL)")
+	}
+
+	pos, ok := pb.GetPosition(symbol)
+	if !ok {
+		return fmt.Errorf("no open position for %s", symbol)
+	}
+
+	// Validate SL is on correct side
+	if pos.Side == domain.SideLong && slPrice >= pos.EntryPrice {
+		return fmt.Errorf("LONG SL must be below entry price")
+	}
+	if pos.Side == domain.SideShort && slPrice <= pos.EntryPrice {
+		return fmt.Errorf("SHORT SL must be above entry price")
+	}
+
+	// Validate TP is on correct side (if provided)
+	if tpPrice > 0 {
+		if pos.Side == domain.SideLong && tpPrice <= pos.EntryPrice {
+			return fmt.Errorf("LONG TP must be above entry price")
+		}
+		if pos.Side == domain.SideShort && tpPrice >= pos.EntryPrice {
+			return fmt.Errorf("SHORT TP must be below entry price")
+		}
+	}
+
+	// Place SL order
+	slReq := OrderRequest{
+		Symbol:    symbol,
+		Side:      domain.OrderSideSell, // SL for long = sell, for short = buy
+		OrderType: domain.OrderTypeStopMarket,
+		Qty:       pos.Size,
+		StopPrice: &slPrice,
+	}
+	if pos.Side == domain.SideShort {
+		slReq.Side = domain.OrderSideBuy
+	}
+
+	slOrder, err := pb.PlaceOrder(ctx, slReq)
+	if err != nil {
+		return fmt.Errorf("create SL order: %w", err)
+	}
+
+	// Place TP order if provided
+	if tpPrice > 0 {
+		tpReq := OrderRequest{
+			Symbol:    symbol,
+			Side:      domain.OrderSideSell,
+			OrderType: domain.OrderTypeTakeProfitMarket,
+			Qty:       pos.Size,
+			StopPrice: &tpPrice,
+		}
+		if pos.Side == domain.SideShort {
+			tpReq.Side = domain.OrderSideBuy
+		}
+
+		tpOrder, err := pb.PlaceOrder(ctx, tpReq)
+		if err != nil {
+			// TP failed, but SL exists — log warning but don't emergency close
+			pb.log.Warn("TP order creation failed, SL still active", map[string]any{
+				"symbol": symbol,
+				"error":  err.Error(),
+			})
+			_ = tpOrder
+		} else {
+			// Link orders to position
+			pb.mu.Lock()
+			if p, ok := pb.openPositions[symbol]; ok {
+				p.SLOrderID = &slOrder.ID
+				p.TPOrderID = &tpOrder.ID
+			}
+			pb.mu.Unlock()
+		}
+	} else {
+		pb.mu.Lock()
+		if p, ok := pb.openPositions[symbol]; ok {
+			p.SLOrderID = &slOrder.ID
+		}
+		pb.mu.Unlock()
+	}
+
+	return nil
+}
