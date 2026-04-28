@@ -87,15 +87,15 @@ type Candidate struct {
 
 // LLMDecision is the parsed response from the LLM Veto Agent.
 type LLMDecision struct {
-	Decision         string
-	Confidence       float64
-	SizeMultiplier   float64
-	Regime           string
-	ReasonCodes      []string
-	RiskFlags        []string
-	Notes            string
-	RawResponse      string
-	ValidationStatus string
+	Decision         string   `json:"decision"`
+	Confidence       float64  `json:"confidence"`
+	SizeMultiplier   float64  `json:"size_multiplier"`
+	Regime           string   `json:"regime"`
+	ReasonCodes      []string `json:"reason_codes"`
+	RiskFlags        []string `json:"risk_flags"`
+	Notes            string   `json:"notes"`
+	RawResponse      string   `json:"-"`
+	ValidationStatus string   `json:"-"`
 }
 
 // RiskDecision is the output of the Risk Engine.
