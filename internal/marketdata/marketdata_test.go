@@ -1180,7 +1180,7 @@ func TestParseOrderBookMessage_Snapshot(t *testing.T) {
 		}
 	}`)
 
-	symbol, isSnapshot, seq, prevSeq, bids, asks, err := parseOrderBookMessage(payload)
+	symbol, isSnapshot, updateID, seq, bids, asks, err := parseOrderBookMessage(payload)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1190,11 +1190,11 @@ func TestParseOrderBookMessage_Snapshot(t *testing.T) {
 	if !isSnapshot {
 		t.Error("expected snapshot")
 	}
+	if updateID != 123456 {
+		t.Errorf("updateID = %d, want 123456", updateID)
+	}
 	if seq != 789012 {
 		t.Errorf("seq = %d, want 789012", seq)
-	}
-	if prevSeq != 0 {
-		t.Errorf("prevSeq = %d, want 0 for snapshot", prevSeq)
 	}
 	if len(bids) != 2 {
 		t.Fatalf("expected 2 bids, got %d", len(bids))
@@ -1224,7 +1224,7 @@ func TestParseOrderBookMessage_Delta(t *testing.T) {
 		}
 	}`)
 
-	symbol, isSnapshot, seq, prevSeq, bids, asks, err := parseOrderBookMessage(payload)
+	symbol, isSnapshot, updateID, seq, bids, asks, err := parseOrderBookMessage(payload)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1234,11 +1234,11 @@ func TestParseOrderBookMessage_Delta(t *testing.T) {
 	if isSnapshot {
 		t.Error("expected delta")
 	}
+	if updateID != 789012 {
+		t.Errorf("updateID = %d, want 789012", updateID)
+	}
 	if seq != 789013 {
 		t.Errorf("seq = %d, want 789013", seq)
-	}
-	if prevSeq != 789012 {
-		t.Errorf("prevSeq = %d, want 789012", prevSeq)
 	}
 	if len(bids) != 2 {
 		t.Fatalf("expected 2 bid deltas, got %d", len(bids))
@@ -1316,7 +1316,7 @@ func TestOrderBookStore_ResetAndDelta(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
 
 	// Snapshot
-	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
 		{Price: 100, Size: 1},
 		{Price: 99, Size: 2},
 	}, []domain.OrderBookLevel{
@@ -1336,7 +1336,7 @@ func TestOrderBookStore_ResetAndDelta(t *testing.T) {
 	}
 
 	// Delta: remove best bid, update best ask
-	ok := store.applyDelta("BTCUSDT", 2, 1, []domain.OrderBookLevel{
+	ok := store.applyDelta("BTCUSDT", 200, 2, []domain.OrderBookLevel{
 		{Price: 100, Size: 0},
 	}, []domain.OrderBookLevel{
 		{Price: 101, Size: 0.5},
@@ -1359,22 +1359,26 @@ func TestOrderBookStore_ResetAndDelta(t *testing.T) {
 		t.Errorf("askDepth = %f, want 2.5", summary.AskDepth)
 	}
 
-	// Sequence mismatch: should reject and remove book
-	ok = store.applyDelta("BTCUSDT", 99, 98, []domain.OrderBookLevel{
+	// Sequence mismatch with wildly different u and seq: delta should still apply
+	// because we no longer compare u to seq (they are different numbering spaces).
+	ok = store.applyDelta("BTCUSDT", 9999, 99, []domain.OrderBookLevel{
 		{Price: 99, Size: 0},
 	}, nil)
-	if ok {
-		t.Fatal("expected delta rejection on prevSeq mismatch")
+	if !ok {
+		t.Fatal("expected delta to apply even with u/seq mismatch")
 	}
 	summary = store.summary("BTCUSDT", 1000, "Buy")
-	if !summary.Stale {
-		t.Error("expected stale after sequence gap removes book")
+	if summary.Stale {
+		t.Error("expected fresh after delta; u and seq are separate fields and should not cause rejection")
+	}
+	if summary.BestBid != 0 {
+		t.Errorf("bestBid after second delta = %f, want 0", summary.BestBid)
 	}
 }
 
 func TestOrderBookStore_DeltaBeforeSnapshotIgnored(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
-	ok := store.applyDelta("BTCUSDT", 2, 1, []domain.OrderBookLevel{
+	ok := store.applyDelta("BTCUSDT", 200, 2, []domain.OrderBookLevel{
 		{Price: 100, Size: 1},
 	}, []domain.OrderBookLevel{
 		{Price: 101, Size: 1},
@@ -1391,7 +1395,7 @@ func TestOrderBookStore_DeltaBeforeSnapshotIgnored(t *testing.T) {
 
 func TestOrderBookStore_SpreadCalculation(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
-	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
 		{Price: 10000, Size: 1},
 	}, []domain.OrderBookLevel{
 		{Price: 10001, Size: 1},
@@ -1406,7 +1410,7 @@ func TestOrderBookStore_SpreadCalculation(t *testing.T) {
 
 func TestOrderBookStore_DepthToPositionSizeRatio(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
-	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
 		{Price: 100, Size: 10},
 	}, []domain.OrderBookLevel{
 		{Price: 101, Size: 10},
@@ -1429,7 +1433,7 @@ func TestOrderBookStore_DepthToPositionSizeRatio(t *testing.T) {
 
 func TestOrderBookStore_SlippageEstimate(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
-	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
 		{Price: 100, Size: 1},
 	}, []domain.OrderBookLevel{
 		{Price: 101, Size: 0.5},
@@ -1458,7 +1462,7 @@ func TestOrderBookStore_SlippageEstimate(t *testing.T) {
 
 func TestOrderBookStore_SlippageInsufficientDepth(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
-	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
 		{Price: 100, Size: 1},
 	}, []domain.OrderBookLevel{
 		{Price: 101, Size: 0.1},
@@ -1472,7 +1476,7 @@ func TestOrderBookStore_SlippageInsufficientDepth(t *testing.T) {
 
 func TestOrderBookStore_StaleDetection(t *testing.T) {
 	store := newOrderBookStore(100 * time.Millisecond)
-	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
 		{Price: 100, Size: 1},
 	}, []domain.OrderBookLevel{
 		{Price: 101, Size: 1},
@@ -1487,6 +1491,161 @@ func TestOrderBookStore_StaleDetection(t *testing.T) {
 	summary = store.summary("BTCUSDT", 100, "Buy")
 	if !summary.Stale {
 		t.Error("expected stale after threshold elapsed")
+	}
+}
+
+// TestOrderBookStore_SnapshotThenDeltaNoFalseGap verifies that a delta with
+// completely different u (update ID) and seq (cross sequence) values does NOT
+// cause a false gap rejection. Bybit docs say these are separate numbering
+// spaces and must not be compared.
+func TestOrderBookStore_SnapshotThenDeltaNoFalseGap(t *testing.T) {
+	store := newOrderBookStore(30 * time.Second)
+
+	// Snapshot: u=123456, seq=789012
+	store.reset("BTCUSDT", 123456, 789012, []domain.OrderBookLevel{
+		{Price: 100, Size: 1},
+	}, []domain.OrderBookLevel{
+		{Price: 101, Size: 1},
+	})
+
+	// Delta: u=999999, seq=888888 — wildly different from snapshot values.
+	// This would have falsely rejected before the fix because prevSeq (u)
+	// was compared against stored seq.
+	ok := store.applyDelta("BTCUSDT", 999999, 888888, []domain.OrderBookLevel{
+		{Price: 100, Size: 2},
+	}, []domain.OrderBookLevel{
+		{Price: 101, Size: 2},
+	})
+	if !ok {
+		t.Fatal("expected delta to apply despite u/seq mismatch")
+	}
+
+	summary := store.summary("BTCUSDT", 100, "Buy")
+	if summary.Stale {
+		t.Error("expected book to remain fresh after delta")
+	}
+	if summary.BestBid != 100 || summary.BidDepth != 2 {
+		t.Errorf("unexpected book state after delta: bestBid=%f bidDepth=%f", summary.BestBid, summary.BidDepth)
+	}
+}
+
+// TestOrderBookStore_SummaryFreshAfterDelta verifies that summary reports
+// fresh (not stale) after a valid delta is applied.
+func TestOrderBookStore_SummaryFreshAfterDelta(t *testing.T) {
+	store := newOrderBookStore(30 * time.Second)
+
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
+		{Price: 100, Size: 1},
+	}, []domain.OrderBookLevel{
+		{Price: 101, Size: 1},
+	})
+
+	// Apply delta that adds deeper levels and removes the old best bid.
+	ok := store.applyDelta("BTCUSDT", 200, 2, []domain.OrderBookLevel{
+		{Price: 100, Size: 0},
+		{Price: 99, Size: 1},
+	}, []domain.OrderBookLevel{
+		{Price: 101, Size: 0},
+		{Price: 102, Size: 1},
+	})
+	if !ok {
+		t.Fatal("expected delta to apply")
+	}
+
+	summary := store.summary("BTCUSDT", 100, "Buy")
+	if summary.Stale {
+		t.Error("expected summary to be fresh after delta")
+	}
+	if summary.BestBid != 99 {
+		t.Errorf("bestBid = %f, want 99", summary.BestBid)
+	}
+	if summary.BestAsk != 102 {
+		t.Errorf("bestAsk = %f, want 102", summary.BestAsk)
+	}
+}
+
+// TestOrderBookStore_OutOfOrderDeltaIgnored verifies that a delta with
+// updateID <= stored updateID is ignored (not applied).
+func TestOrderBookStore_OutOfOrderDeltaIgnored(t *testing.T) {
+	store := newOrderBookStore(30 * time.Second)
+
+	store.reset("BTCUSDT", 500, 1, []domain.OrderBookLevel{
+		{Price: 100, Size: 10},
+	}, []domain.OrderBookLevel{
+		{Price: 101, Size: 10},
+	})
+
+	// Delta with same updateID: should be ignored
+	ok := store.applyDelta("BTCUSDT", 500, 2, []domain.OrderBookLevel{
+		{Price: 100, Size: 5},
+	}, []domain.OrderBookLevel{
+		{Price: 101, Size: 5},
+	})
+	if ok {
+		t.Fatal("expected out-of-order delta (same updateID) to be ignored")
+	}
+
+	// Delta with older updateID: should be ignored
+	ok = store.applyDelta("BTCUSDT", 499, 3, []domain.OrderBookLevel{
+		{Price: 99, Size: 1},
+	}, []domain.OrderBookLevel{
+		{Price: 102, Size: 1},
+	})
+	if ok {
+		t.Fatal("expected out-of-order delta (older updateID) to be ignored")
+	}
+
+	// Book should still have original values
+	summary := store.summary("BTCUSDT", 100, "Buy")
+	if summary.BestBid != 100 || summary.BidDepth != 10 {
+		t.Errorf("book mutated after out-of-order delta: bestBid=%f bidDepth=%f", summary.BestBid, summary.BidDepth)
+	}
+}
+
+// TestOrderBookStore_UpdateIDOneRejectedAsOutOfOrder verifies that a delta with
+// updateID==1 is not treated as a snapshot rebuild. It is rejected as
+// out-of-order when the book already has a higher updateID, and ignored when
+// no book exists.
+func TestOrderBookStore_UpdateIDOneRejectedAsOutOfOrder(t *testing.T) {
+	store := newOrderBookStore(30 * time.Second)
+
+	// updateID==1 without a book: ignored (no snapshot to update)
+	ok := store.applyDelta("BTCUSDT", 1, 1, []domain.OrderBookLevel{
+		{Price: 200, Size: 5},
+	}, []domain.OrderBookLevel{
+		{Price: 201, Size: 5},
+	})
+	if ok {
+		t.Fatal("expected updateID==1 without snapshot to be ignored")
+	}
+
+	// Now create a book with updateID=100
+	store.reset("BTCUSDT", 100, 50, []domain.OrderBookLevel{
+		{Price: 100, Size: 1},
+	}, []domain.OrderBookLevel{
+		{Price: 101, Size: 1},
+	})
+
+	// Delta with updateID==1 (older than stored 100): rejected as out-of-order
+	ok = store.applyDelta("BTCUSDT", 1, 60, []domain.OrderBookLevel{
+		{Price: 200, Size: 5},
+	}, []domain.OrderBookLevel{
+		{Price: 201, Size: 5},
+	})
+	if ok {
+		t.Fatal("expected updateID==1 to be rejected as out-of-order when book has higher updateID")
+	}
+
+	// Book should still have original values
+	summary := store.summary("BTCUSDT", 100, "Buy")
+	if summary.Stale {
+		t.Error("expected book to be fresh after rejecting out-of-order delta")
+	}
+	if summary.BestBid != 100 || summary.BidDepth != 1 {
+		t.Errorf("book mutated: bestBid=%f bidDepth=%f, want bestBid=100 bidDepth=1", summary.BestBid, summary.BidDepth)
+	}
+	if summary.BestAsk != 101 || summary.AskDepth != 1 {
+		t.Errorf("book mutated: bestAsk=%f askDepth=%f", summary.BestAsk, summary.AskDepth)
 	}
 }
 
@@ -1670,7 +1829,7 @@ func TestHealthStatus_WithOrderBookAndTradeFlow(t *testing.T) {
 	now := time.Now().UTC()
 
 	// Only orderbook fresh
-	svc.orderBooks.reset("BTCUSDT", 1, []domain.OrderBookLevel{{Price: 100, Size: 1}}, []domain.OrderBookLevel{{Price: 101, Size: 1}})
+	svc.orderBooks.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{{Price: 100, Size: 1}}, []domain.OrderBookLevel{{Price: 101, Size: 1}})
 	// Manually set lastUpdate to now because reset uses time.Now
 	svc.orderBooks.lastUpdate("BTCUSDT")
 
@@ -2108,13 +2267,13 @@ func TestStart_OldFailedStartCannotOverwriteNewStartResult(t *testing.T) {
 
 func TestOrderBookStore_ResetReplacesOldData(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
-	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 100, 1, []domain.OrderBookLevel{
 		{Price: 100, Size: 1},
 	}, []domain.OrderBookLevel{
 		{Price: 101, Size: 1},
 	})
 
-	store.reset("BTCUSDT", 2, []domain.OrderBookLevel{
+	store.reset("BTCUSDT", 200, 2, []domain.OrderBookLevel{
 		{Price: 200, Size: 2},
 	}, []domain.OrderBookLevel{
 		{Price: 201, Size: 2},

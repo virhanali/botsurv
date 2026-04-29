@@ -28,5 +28,8 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newUniverseCmd())
 	root.AddCommand(newRunOnceCmd())
 	root.AddCommand(newRunCmd())
+	root.AddCommand(newReportCmd())
+	root.AddCommand(newPositionsCmd())
+	root.AddCommand(newOrdersCmd())
 	return root
 }

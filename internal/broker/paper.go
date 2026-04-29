@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/virhan/botsurv/internal/alert"
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
 	"github.com/virhan/botsurv/internal/logger"
@@ -45,6 +46,42 @@ type PaperBroker struct {
 	// Halted state
 	halted     bool
 	haltReason string
+
+	// DB repositories (optional, nil = no persistence)
+	posRepo  PositionRepository
+	ordRepo  OrderRepository
+	execRepo ExecutionRepository
+	snapRepo AccountSnapshotRepository
+
+	// Alert service (optional, nil = no alerts)
+	alert alert.Service
+
+	// Last snapshot time for throttling
+	lastSnapshotAt time.Time
+}
+
+// PositionRepository is the minimal interface for position persistence.
+type PositionRepository interface {
+	Insert(ctx context.Context, p domain.Position) (int64, error)
+	Update(ctx context.Context, p domain.Position) error
+	GetOpen(ctx context.Context) ([]domain.Position, error)
+}
+
+// OrderRepository is the minimal interface for order persistence.
+type OrderRepository interface {
+	Insert(ctx context.Context, o domain.Order) (int64, error)
+	Update(ctx context.Context, o domain.Order) error
+	GetOpen(ctx context.Context) ([]domain.Order, error)
+}
+
+// ExecutionRepository is the minimal interface for execution persistence.
+type ExecutionRepository interface {
+	Insert(ctx context.Context, e domain.Execution) (int64, error)
+}
+
+// AccountSnapshotRepository is the minimal interface for account snapshot persistence.
+type AccountSnapshotRepository interface {
+	Insert(ctx context.Context, a domain.AccountState) (int64, error)
 }
 
 // NewPaperBroker creates a new PaperBroker.
@@ -62,6 +99,21 @@ func NewPaperBroker(cfg app.PaperConfig, log *logger.Logger) *PaperBroker {
 		nextExecID:      1,
 	}
 }
+
+// SetPositionRepo sets an optional position repository for DB persistence.
+func (pb *PaperBroker) SetPositionRepo(repo PositionRepository) { pb.posRepo = repo }
+
+// SetOrderRepo sets an optional order repository for DB persistence.
+func (pb *PaperBroker) SetOrderRepo(repo OrderRepository) { pb.ordRepo = repo }
+
+// SetExecutionRepo sets an optional execution repository for DB persistence.
+func (pb *PaperBroker) SetExecutionRepo(repo ExecutionRepository) { pb.execRepo = repo }
+
+// SetAccountSnapshotRepo sets an optional account snapshot repository for DB persistence.
+func (pb *PaperBroker) SetAccountSnapshotRepo(repo AccountSnapshotRepository) { pb.snapRepo = repo }
+
+// SetAlertSender sets an optional alert sender.
+func (pb *PaperBroker) SetAlertSender(svc alert.Service) { pb.alert = svc }
 
 // GetAccountState returns the current account state.
 func (pb *PaperBroker) GetAccountState(_ context.Context) (domain.AccountState, error) {
@@ -241,18 +293,44 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 			pb.totalFees += fee
 			pb.totalSlippage += slippageAmt * req.Qty
 
-			// Atomic protective orders: no position without SL
+			// Save execution (uses paper-order-ID; will be updated after DB persistence)
+			exec := &domain.Execution{
+				ID:         pb.nextExecID,
+				OrderID:    order.ID,
+				Symbol:     req.Symbol,
+				Side:       req.Side,
+				Qty:        req.Qty,
+				Price:      fillPrice,
+				Fee:        fee,
+				Slippage:   slippageAmt,
+				ExecutedAt: time.Now(),
+			}
+			pb.nextExecID++
+			pb.saveExecution(exec)
+
+			// Atomic protective orders: create first, then persist position with SL/TP.
 			if req.StopLoss > 0 || req.TakeProfit > 0 {
 				if !pb.createProtectiveOrdersForPosition(pos, req.StopLoss, req.TakeProfit) {
 					// Position was emergency-closed due to invalid SL.
 					order.Status = domain.OrderStatusRejected
+					pb.saveOrder(&order)
 					return order, fmt.Errorf("position rejected: invalid StopLoss price for %s side", pos.Side)
 				}
 			}
-		}
+			// Set SL/TP on position only after protective orders are confirmed.
+			pos.StopLoss = req.StopLoss
+			pos.TakeProfit = req.TakeProfit
 
-		order.Status = domain.OrderStatusFilled
-		order.UpdatedAt = time.Now()
+			order.Status = domain.OrderStatusFilled
+			order.UpdatedAt = time.Now()
+
+			// DB persistence: save position (with SL/TP) and main order (filled)
+			// only after protective state is finalized.
+			pb.savePosition(pos)
+			pb.saveOrder(&order)
+			// Persist protective orders (STOP_MARKET / TAKE_PROFIT_MARKET).
+			pb.saveProtectiveOrdersForPosition(pos)
+		}
 
 		pb.log.Info("market order filled", map[string]any{
 			"symbol":     req.Symbol,
@@ -326,6 +404,10 @@ func (pb *PaperBroker) EmergencyCloseAll(_ context.Context) error {
 
 	now := time.Now()
 
+	// Capture counts before loops
+	cancelledCount := len(pb.openOrders)
+	closedCount := len(pb.openPositions)
+
 	// Cancel all open orders
 	for id, order := range pb.openOrders {
 		order.Status = domain.OrderStatusCancelled
@@ -344,8 +426,16 @@ func (pb *PaperBroker) EmergencyCloseAll(_ context.Context) error {
 	}
 
 	pb.log.Error("EMERGENCY CLOSE ALL executed", map[string]any{
-		"positions_closed": len(pb.openPositions),
-		"orders_cancelled": len(pb.openOrders),
+		"positions_closed": closedCount,
+		"orders_cancelled": cancelledCount,
+	})
+
+	// Alert on emergency close
+	pb.sendAlert(alert.AlertEvent{
+		Type:      "emergency_close",
+		Severity:  "danger",
+		Message:   fmt.Sprintf("Emergency close all: %d positions closed, %d orders cancelled", closedCount, cancelledCount),
+		Timestamp: now,
 	})
 
 	return nil
@@ -525,8 +615,26 @@ func (pb *PaperBroker) cancelSiblingOrders(pos *domain.Position) {
 			if order.ID == derefInt64(pos.SLOrderID) || order.ID == derefInt64(pos.TPOrderID) {
 				order.Status = domain.OrderStatusCancelled
 				order.UpdatedAt = time.Now()
+				pb.updateOrderInDB(order)
 				delete(pb.openOrders, id)
 			}
+		}
+	}
+}
+
+func (pb *PaperBroker) saveProtectiveOrdersForPosition(pos *domain.Position) {
+	if pb.ordRepo == nil {
+		return
+	}
+	for _, o := range pb.openOrders {
+		if o.Symbol != pos.Symbol {
+			continue
+		}
+		if o.OrderType != domain.OrderTypeStopMarket && o.OrderType != domain.OrderTypeTakeProfitMarket {
+			continue
+		}
+		if (pos.SLOrderID != nil && o.ID == *pos.SLOrderID) || (pos.TPOrderID != nil && o.ID == *pos.TPOrderID) {
+			pb.saveOrder(o)
 		}
 	}
 }
@@ -593,6 +701,9 @@ func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice flo
 	delete(pb.openPositions, pos.Symbol)
 	pb.closedPositions = append(pb.closedPositions, *pos)
 
+	// DB persistence: update if already persisted, otherwise insert closed.
+	pb.upsertPosition(pos)
+	pb.saveAccountSnapshot()
 	pb.log.Info("position closed", map[string]any{
 		"symbol":   pos.Symbol,
 		"side":     pos.Side,
@@ -601,6 +712,16 @@ func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice flo
 		"pnl":      pnl,
 		"fee":      fee,
 		"slippage": slippageAmt,
+	})
+
+	// Alert on position close
+	pb.sendAlert(alert.AlertEvent{
+		Type:      "position_closed",
+		Severity:  severityForPnL(pnl),
+		Message:   fmt.Sprintf("Position closed: %s %s PnL=%.2f", pos.Symbol, pos.Side, pnl),
+		Symbol:    pos.Symbol,
+		PnL:       pnl,
+		Timestamp: now,
 	})
 }
 
@@ -734,6 +855,7 @@ func (pb *PaperBroker) triggerProtectiveOrder(order *domain.Order, triggerPrice 
 	pb.closePositionInternal(pos, triggerPrice, now)
 	order.Status = domain.OrderStatusFilled
 	order.UpdatedAt = now
+	pb.updateOrderInDB(order)
 }
 
 func (pb *PaperBroker) wouldLimitFill(order *domain.Order, candle domain.Candle) bool {
@@ -793,12 +915,27 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 	pb.balance -= fee
 	pb.totalFees += fee
 
-	// Atomic protective orders for limit fills
+	// Save execution for limit fill
+	pb.saveExecution(&domain.Execution{
+		ID:         pb.nextExecID,
+		OrderID:    order.ID,
+		Symbol:     order.Symbol,
+		Side:       order.Side,
+		Qty:        order.Qty,
+		Price:      fillPrice,
+		Fee:        fee,
+		Slippage:   0,
+		ExecutedAt: time.Now(),
+	})
+	pb.nextExecID++
+
+	// Atomic protective orders for limit fills: create first, then persist.
 	if order.IntendedSL > 0 || order.IntendedTP > 0 {
 		if !pb.createProtectiveOrdersForPosition(pos, order.IntendedSL, order.IntendedTP) {
 			// Position was emergency-closed due to invalid SL.
 			order.Status = domain.OrderStatusRejected
 			order.UpdatedAt = time.Now()
+			pb.saveOrder(order)
 			pb.log.Error("limit fill rejected: invalid StopLoss price", map[string]any{"symbol": order.Symbol})
 			return
 		}
@@ -808,11 +945,23 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 		pb.closePositionInternal(pos, fillPrice, time.Now())
 		order.Status = domain.OrderStatusRejected
 		order.UpdatedAt = time.Now()
+		pb.saveOrder(order)
 		return
 	}
 
+	// Set SL/TP on position after protective orders are confirmed.
+	pos.StopLoss = order.IntendedSL
+	pos.TakeProfit = order.IntendedTP
+
 	order.Status = domain.OrderStatusFilled
 	order.UpdatedAt = time.Now()
+
+	// DB persistence: save position (with SL/TP) and main order (filled)
+	// only after protective state is finalized.
+	pb.savePosition(pos)
+	pb.saveOrder(order)
+	// Persist protective orders (STOP_MARKET / TAKE_PROFIT_MARKET).
+	pb.saveProtectiveOrdersForPosition(pos)
 
 	pb.log.Info("limit order filled", map[string]any{
 		"symbol":     order.Symbol,
@@ -908,6 +1057,9 @@ func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, s
 			if p, ok := pb.openPositions[symbol]; ok {
 				p.SLOrderID = &slOrder.ID
 				p.TPOrderID = &tpOrder.ID
+				p.StopLoss = slPrice
+				p.TakeProfit = tpPrice
+				pb.updatePositionInDB(p)
 			}
 			pb.mu.Unlock()
 		}
@@ -915,9 +1067,119 @@ func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, s
 		pb.mu.Lock()
 		if p, ok := pb.openPositions[symbol]; ok {
 			p.SLOrderID = &slOrder.ID
+			p.StopLoss = slPrice
+			pb.updatePositionInDB(p)
 		}
 		pb.mu.Unlock()
 	}
 
 	return nil
+}
+
+// --- DB persistence helpers ---
+
+func (pb *PaperBroker) savePosition(pos *domain.Position) {
+	if pb.posRepo == nil {
+		return
+	}
+	ctx := context.Background()
+	id, err := pb.posRepo.Insert(ctx, *pos)
+	if err != nil {
+		pb.log.Error("failed to save position to DB", map[string]any{"symbol": pos.Symbol, "error": err.Error()})
+		return
+	}
+	pos.ID = id
+}
+
+func (pb *PaperBroker) saveOrder(order *domain.Order) {
+	if pb.ordRepo == nil {
+		return
+	}
+	ctx := context.Background()
+	id, err := pb.ordRepo.Insert(ctx, *order)
+	if err != nil {
+		pb.log.Error("failed to save order to DB", map[string]any{"symbol": order.Symbol, "error": err.Error()})
+		return
+	}
+	order.ID = id
+}
+
+func (pb *PaperBroker) updatePositionInDB(pos *domain.Position) {
+	if pb.posRepo == nil {
+		return
+	}
+	ctx := context.Background()
+	if err := pb.posRepo.Update(ctx, *pos); err != nil {
+		pb.log.Error("failed to update position in DB", map[string]any{"symbol": pos.Symbol, "error": err.Error()})
+	}
+}
+
+// upsertPosition persists a position via update, falling back to insert
+// if the position was never persisted (e.g. emergency-close before initial save).
+func (pb *PaperBroker) upsertPosition(pos *domain.Position) {
+	if pb.posRepo == nil {
+		return
+	}
+	ctx := context.Background()
+	if err := pb.posRepo.Update(ctx, *pos); err != nil {
+		if _, insErr := pb.posRepo.Insert(ctx, *pos); insErr != nil {
+			pb.log.Error("failed to upsert position in DB", map[string]any{"symbol": pos.Symbol, "error": insErr.Error()})
+		}
+	}
+}
+
+func (pb *PaperBroker) updateOrderInDB(order *domain.Order) {
+	if pb.ordRepo == nil {
+		return
+	}
+	ctx := context.Background()
+	if err := pb.ordRepo.Update(ctx, *order); err != nil {
+		pb.log.Error("failed to update order in DB", map[string]any{"symbol": order.Symbol, "error": err.Error()})
+	}
+}
+
+func (pb *PaperBroker) saveExecution(exec *domain.Execution) {
+	if pb.execRepo == nil {
+		return
+	}
+	ctx := context.Background()
+	if _, err := pb.execRepo.Insert(ctx, *exec); err != nil {
+		pb.log.Error("failed to save execution to DB", map[string]any{"symbol": exec.Symbol, "error": err.Error()})
+	}
+}
+
+func (pb *PaperBroker) saveAccountSnapshot() {
+	if pb.snapRepo == nil {
+		return
+	}
+	// Throttle: max once every 5 minutes
+	if time.Since(pb.lastSnapshotAt) < 5*time.Minute {
+		return
+	}
+	pb.lastSnapshotAt = time.Now()
+
+	state, _ := pb.GetAccountState(context.Background())
+	ctx := context.Background()
+	if _, err := pb.snapRepo.Insert(ctx, state); err != nil {
+		pb.log.Error("failed to save account snapshot", map[string]any{"error": err.Error()})
+	}
+}
+
+func (pb *PaperBroker) sendAlert(event alert.AlertEvent) {
+	if pb.alert == nil {
+		return
+	}
+	if err := pb.alert.Send(context.Background(), event); err != nil {
+		pb.log.Error("failed to send alert", map[string]any{"type": event.Type, "error": err.Error()})
+	}
+}
+
+func severityForPnL(pnl float64) string {
+	if pnl >= 0 {
+		return "info"
+	}
+	if pnl > -10 {
+		return "warning"
+	}
+	return "danger"
 }

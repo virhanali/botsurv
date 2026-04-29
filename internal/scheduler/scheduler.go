@@ -6,7 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/virhan/botsurv/internal/alert"
 	"github.com/virhan/botsurv/internal/app"
+	"github.com/virhan/botsurv/internal/db"
 	"github.com/virhan/botsurv/internal/domain"
 	"github.com/virhan/botsurv/internal/executor"
 	"github.com/virhan/botsurv/internal/llm"
@@ -30,6 +32,11 @@ type Scheduler struct {
 	mu       sync.Mutex
 	running  bool
 	cycleSeq int
+
+	alertSvc        alert.Service
+	llmDecisionRepo db.LLMDecisionRepository
+	cycleRepo       db.CycleRepository
+	candidateRepo   db.CandidateRepository
 }
 
 // NewScheduler creates a new Scheduler.
@@ -55,6 +62,18 @@ func NewScheduler(
 	}
 }
 
+// SetAlertService sets the alert service for sending notifications.
+func (s *Scheduler) SetAlertService(svc alert.Service) { s.alertSvc = svc }
+
+// SetLLMDecisionRepo sets the LLM decision repository for persistence.
+func (s *Scheduler) SetLLMDecisionRepo(repo db.LLMDecisionRepository) { s.llmDecisionRepo = repo }
+
+// SetCycleRepo sets the cycle repository for persistence.
+func (s *Scheduler) SetCycleRepo(repo db.CycleRepository) { s.cycleRepo = repo }
+
+// SetCandidateRepo sets the candidate repository for persistence.
+func (s *Scheduler) SetCandidateRepo(repo db.CandidateRepository) { s.candidateRepo = repo }
+
 // CycleResult holds the outcome of a trading cycle.
 type CycleResult struct {
 	CycleID     string
@@ -73,7 +92,7 @@ type SkipReason struct {
 }
 
 // RunOnce executes a single trading cycle.
-func (s *Scheduler) RunOnce(ctx context.Context) (*CycleResult, error) {
+func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error) {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
@@ -92,10 +111,21 @@ func (s *Scheduler) RunOnce(ctx context.Context) (*CycleResult, error) {
 	cycleID := fmt.Sprintf("cycle-%d-%s", s.cycleSeq, time.Now().Format("20060102-150405"))
 	startedAt := time.Now()
 
-	result := &CycleResult{
+	result = &CycleResult{
 		CycleID:   cycleID,
 		StartedAt: startedAt,
 	}
+
+	// Insert cycle as "running" at start, update to final status at end.
+	s.insertCycleRunning(ctx, cycleID, startedAt)
+	defer func() {
+		if result != nil {
+			if result.EndedAt.IsZero() {
+				result.EndedAt = time.Now()
+			}
+			s.updateCycleFinal(result, err)
+		}
+	}()
 
 	s.log.Info("cycle started", map[string]any{"cycle_id": cycleID})
 
@@ -108,21 +138,24 @@ func (s *Scheduler) RunOnce(ctx context.Context) (*CycleResult, error) {
 	}
 
 	// 2. Refresh universe if needed
-	if err := s.refreshUniverseIfNeeded(ctx); err != nil {
-		s.log.Error("universe refresh failed", map[string]any{"error": err.Error()})
+	if refreshErr := s.refreshUniverseIfNeeded(ctx); refreshErr != nil {
+		s.log.Error("universe refresh failed", map[string]any{"error": refreshErr.Error()})
 		result.ReasonCodes = append(result.ReasonCodes, "UNIVERSE_REFRESH_FAILED")
 	}
 
 	// 3. Run screener
-	screenResult, err := s.screener.Screen(ctx, cycleID)
-	if err != nil {
+	screenResult, screenErr := s.screener.Screen(ctx, cycleID)
+	if screenErr != nil {
 		result.ReasonCodes = append(result.ReasonCodes, "SCREEN_FAILED")
 		result.EndedAt = time.Now()
-		s.log.Error("screener failed", map[string]any{"error": err.Error()})
-		return result, err
+		s.log.Error("screener failed", map[string]any{"error": screenErr.Error()})
+		return result, screenErr
 	}
 
 	result.Candidates = len(screenResult.Candidates)
+
+	// Persist all generated candidates and track DB IDs for LLM decisions.
+	candidateIDs := s.persistCandidates(ctx, screenResult.Candidates, screenResult.NonEligible, cycleID)
 
 	if len(screenResult.Candidates) == 0 {
 		result.ReasonCodes = append(result.ReasonCodes, "NO_CANDIDATE")
@@ -146,6 +179,13 @@ func (s *Scheduler) RunOnce(ctx context.Context) (*CycleResult, error) {
 			continue
 		}
 		result.LLMCalls++
+
+		// Persist LLM decision with real candidate_id
+		candID := candidateIDs[cand.Symbol]
+		if candID == 0 {
+			candID = -1
+		}
+		s.saveLLMDecision(ctx, llmDecision, candID, cycleID)
 
 		if llmDecision.Decision == "BLOCK" {
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_BLOCK"})
@@ -202,6 +242,21 @@ func (s *Scheduler) RunOnce(ctx context.Context) (*CycleResult, error) {
 				"side":     cand.Side,
 				"order_id": execResult.OrderID,
 			})
+
+			// Alert on trade executed
+			if s.alertSvc != nil {
+				msg := fmt.Sprintf("Trade executed: %s %s at proposed entry", cand.Symbol, cand.Side)
+				if execResult.OrderID != "" {
+					msg = fmt.Sprintf("Trade executed: %s %s [%s]", cand.Symbol, cand.Side, execResult.OrderID)
+				}
+				_ = s.alertSvc.Send(ctx, alert.AlertEvent{
+					Type:      "trade_executed",
+					Severity:  "info",
+					Message:   msg,
+					Symbol:    cand.Symbol,
+					Timestamp: time.Now(),
+				})
+			}
 		} else {
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "EXECUTION_FAILED"})
 		}
@@ -265,8 +320,87 @@ func (s *Scheduler) isHalted() bool {
 }
 
 func (s *Scheduler) refreshUniverseIfNeeded(ctx context.Context) error {
-	// Always refresh for now; in production, check last refresh time
 	return s.screener.RefreshUniverse(ctx)
+}
+
+func (s *Scheduler) persistCandidates(ctx context.Context, eligible, nonEligible []domain.Candidate, cycleID string) map[string]int64 {
+	ids := make(map[string]int64)
+	if s.candidateRepo == nil {
+		return ids
+	}
+	all := make([]domain.Candidate, 0, len(eligible)+len(nonEligible))
+	all = append(all, eligible...)
+	all = append(all, nonEligible...)
+	for _, c := range all {
+		id, err := s.candidateRepo.Insert(ctx, c)
+		if err != nil {
+			s.log.Error("failed to save candidate", map[string]any{"symbol": c.Symbol, "error": err.Error()})
+			continue
+		}
+		ids[c.Symbol] = id
+	}
+	return ids
+}
+
+func (s *Scheduler) saveLLMDecision(ctx context.Context, d domain.LLMDecision, candidateID int64, cycleID string) {
+	if s.llmDecisionRepo == nil {
+		return
+	}
+	if _, err := s.llmDecisionRepo.Insert(ctx, d, candidateID, cycleID); err != nil {
+		s.log.Error("failed to save LLM decision", map[string]any{"error": err.Error()})
+	}
+}
+
+func (s *Scheduler) insertCycleRunning(ctx context.Context, cycleID string, startedAt time.Time) {
+	if s.cycleRepo == nil {
+		return
+	}
+	cycle := domain.Cycle{
+		CycleID:   cycleID,
+		StartedAt: startedAt,
+		Status:    "running",
+	}
+	if _, err := s.cycleRepo.Insert(ctx, cycle); err != nil {
+		s.log.Error("failed to insert running cycle", map[string]any{"error": err.Error()})
+	}
+}
+
+func (s *Scheduler) updateCycleFinal(result *CycleResult, runErr error) {
+	if s.cycleRepo == nil {
+		return
+	}
+	status := "completed"
+	if runErr != nil {
+		status = "failed"
+	} else if containsAny(result.ReasonCodes, []string{"BOT_HALTED", "NO_CANDIDATE"}) {
+		status = "skipped"
+	}
+	cycle := domain.Cycle{
+		CycleID:     result.CycleID,
+		StartedAt:   result.StartedAt,
+		Status:      status,
+		ReasonCodes: result.ReasonCodes,
+	}
+	if !result.EndedAt.IsZero() {
+		cycle.EndedAt = &result.EndedAt
+	}
+	if err := s.cycleRepo.Update(context.Background(), cycle); err != nil {
+		// Fallback to insert if update fails (e.g. cycle row not found).
+		if _, insErr := s.cycleRepo.Insert(context.Background(), cycle); insErr != nil {
+			s.log.Error("failed to save cycle", map[string]any{"error": insErr.Error()})
+		}
+	}
+}
+
+func containsAny(haystack []string, needles []string) bool {
+	for _, h := range haystack {
+		for _, n := range needles {
+			if h == n {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RefreshUniverse exposes universe refresh for CLI.

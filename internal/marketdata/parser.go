@@ -254,11 +254,11 @@ func getInt64(m map[string]interface{}, key string) (int64, error) {
 }
 
 // parseOrderBookMessage parses a Bybit v5 public WebSocket orderbook message.
-// It returns the symbol, whether the message is a snapshot, the sequence numbers,
-// and the bid/ask levels.
-// For snapshots: prevSeq=0, seq=data.seq
-// For deltas: prevSeq=data.u, seq=data.seq
-func parseOrderBookMessage(payload []byte) (symbol string, isSnapshot bool, seq, prevSeq int64, bids, asks []domain.OrderBookLevel, err error) {
+// It returns the symbol, whether the message is a snapshot, the update ID (u),
+// cross sequence (seq), and the bid/ask levels.
+// Bybit docs: u = update ID, seq = cross sequence. These are separate numbering
+// spaces and must not be compared against each other.
+func parseOrderBookMessage(payload []byte) (symbol string, isSnapshot bool, updateID, seq int64, bids, asks []domain.OrderBookLevel, err error) {
 	var msg struct {
 		Topic string          `json:"topic"`
 		Type  string          `json:"type"`
@@ -296,22 +296,18 @@ func parseOrderBookMessage(payload []byte) (symbol string, isSnapshot bool, seq,
 		}
 	}
 
+	updateID = data.U
 	seq = data.Seq
-	if isSnapshot {
-		prevSeq = 0
-	} else {
-		prevSeq = data.U
-	}
 
 	bids, err = parseLevels(data.Bids)
 	if err != nil {
-		return symbol, isSnapshot, seq, prevSeq, nil, nil, fmt.Errorf("parse bids: %w", err)
+		return symbol, isSnapshot, updateID, seq, nil, nil, fmt.Errorf("parse bids: %w", err)
 	}
 	asks, err = parseLevels(data.Asks)
 	if err != nil {
-		return symbol, isSnapshot, seq, prevSeq, nil, nil, fmt.Errorf("parse asks: %w", err)
+		return symbol, isSnapshot, updateID, seq, nil, nil, fmt.Errorf("parse asks: %w", err)
 	}
-	return symbol, isSnapshot, seq, prevSeq, bids, asks, nil
+	return symbol, isSnapshot, updateID, seq, bids, asks, nil
 }
 
 func parseLevels(rows [][]string) ([]domain.OrderBookLevel, error) {

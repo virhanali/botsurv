@@ -162,9 +162,40 @@ Required JSON format:
 		req.Header.Set("X-Title", appName)
 	}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		c.log.Error("LLM API error", map[string]any{"error": err.Error()})
+	// Retry loop for transient failures (5xx, timeout) with exponential backoff.
+	// Non-5xx errors (4xx, invalid auth) are not retried.
+	var resp *http.Response
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * time.Second
+			if backoff > 5*time.Second {
+				backoff = 5 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return c.fallbackDecision("BLOCK", "TIMEOUT_CANCELED"), ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		// Recreate request for each attempt (body is consumed by Do).
+		retryReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return c.fallbackDecision("BLOCK", "REQUEST_CREATE_ERROR"), nil
+		}
+		retryReq.Header = req.Header.Clone()
+
+		resp, lastErr = c.client.Do(retryReq)
+		if lastErr != nil {
+			continue
+		}
+		if resp.StatusCode < 500 {
+			break
+		}
+		resp.Body.Close()
+	}
+	if lastErr != nil {
+		c.log.Error("LLM API error after retries", map[string]any{"error": lastErr.Error()})
 		return c.fallbackDecision("BLOCK", "API_ERROR"), nil
 	}
 	defer resp.Body.Close()

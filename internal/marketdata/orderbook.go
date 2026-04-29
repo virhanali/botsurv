@@ -21,7 +21,8 @@ type orderBookStore struct {
 type orderBook struct {
 	bids       map[string]float64 // price string -> size
 	asks       map[string]float64 // price string -> size
-	seq        int64
+	seq        int64              // cross sequence from Bybit
+	updateID   int64              // update ID (u) from Bybit; separate from seq
 	lastUpdate time.Time
 }
 
@@ -33,7 +34,7 @@ func newOrderBookStore(staleThreshold time.Duration) *orderBookStore {
 }
 
 // reset rebuilds the orderbook from a snapshot.
-func (s *orderBookStore) reset(symbol string, seq int64, bids, asks []domain.OrderBookLevel) {
+func (s *orderBookStore) reset(symbol string, updateID, seq int64, bids, asks []domain.OrderBookLevel) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -41,6 +42,7 @@ func (s *orderBookStore) reset(symbol string, seq int64, bids, asks []domain.Ord
 		bids:       make(map[string]float64, len(bids)),
 		asks:       make(map[string]float64, len(asks)),
 		seq:        seq,
+		updateID:   updateID,
 		lastUpdate: time.Now().UTC(),
 	}
 	for _, l := range bids {
@@ -57,24 +59,29 @@ func (s *orderBookStore) reset(symbol string, seq int64, bids, asks []domain.Ord
 }
 
 // applyDelta applies incremental updates to the orderbook.
-// prevSeq is the expected previous sequence (u from Bybit delta).
-// If prevSeq does not match the stored seq, the delta is rejected and the book is removed
-// so that it becomes stale until a new snapshot arrives.
-func (s *orderBookStore) applyDelta(symbol string, seq, prevSeq int64, bids, asks []domain.OrderBookLevel) bool {
+// Bybit V5 orderbook deltas do not provide a previous update ID or cross sequence
+// that can be used to prove strict continuity, so we apply deltas without sequence
+// validation. Stale detection is handled by lastUpdate timestamp.
+//
+// Rules:
+//   - Out-of-order deltas (updateID <= stored updateID) are ignored.
+//   - If no snapshot exists yet, the delta is ignored (no book to update).
+func (s *orderBookStore) applyDelta(symbol string, updateID, seq int64, bids, asks []domain.OrderBookLevel) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ob, ok := s.books[symbol]
+
 	if !ok {
 		// If no snapshot exists yet, ignore delta.
 		return false
 	}
-	if prevSeq != 0 && prevSeq != ob.seq {
-		// Sequence gap detected. Remove the book to force stale state
-		// until a new snapshot arrives on reconnect.
-		delete(s.books, symbol)
+
+	// Ignore out-of-order deltas (Bybit guarantees monotonically increasing u).
+	if updateID <= ob.updateID {
 		return false
 	}
+
 	for _, l := range bids {
 		key := formatPrice(l.Price)
 		if l.Size == 0 {
@@ -92,6 +99,7 @@ func (s *orderBookStore) applyDelta(symbol string, seq, prevSeq int64, bids, ask
 		}
 	}
 	ob.seq = seq
+	ob.updateID = updateID
 	ob.lastUpdate = time.Now().UTC()
 	return true
 }

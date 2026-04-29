@@ -44,6 +44,11 @@ type BybitWSMarketDataService struct {
 
 	staleThreshold time.Duration
 
+	// orderbookGapLogLast tracks the last time we logged a delta rejection
+	// per symbol to avoid flooding logs.
+	orderbookGapLogLast   map[string]time.Time
+	orderbookGapLogLastMu sync.Mutex
+
 	// dynamic symbols for all_usdt_perpetual mode
 	muDynamic      sync.RWMutex
 	dynamicSymbols []string
@@ -78,17 +83,18 @@ func NewBybitWSMarketDataService(
 		startTimeout = time.Duration(config.StartTimeoutSeconds) * time.Second
 	}
 	return &BybitWSMarketDataService{
-		config:         config,
-		candleRepo:     candleRepo,
-		httpClient:     httpClient,
-		logger:         log,
-		candleCache:    newCandleCache(),
-		priceCache:     newPriceCache(),
-		orderBooks:     newOrderBookStore(stale),
-		tradeFlows:     newTradeFlowStore(config.TradeFlowWindows, stale),
-		staleThreshold: stale,
-		ready:          make(chan struct{}),
-		startTimeout:   startTimeout,
+		config:              config,
+		candleRepo:          candleRepo,
+		httpClient:          httpClient,
+		logger:              log,
+		candleCache:         newCandleCache(),
+		priceCache:          newPriceCache(),
+		orderBooks:          newOrderBookStore(stale),
+		tradeFlows:          newTradeFlowStore(config.TradeFlowWindows, stale),
+		staleThreshold:      stale,
+		ready:               make(chan struct{}),
+		startTimeout:        startTimeout,
+		orderbookGapLogLast: make(map[string]time.Time),
 	}
 }
 
@@ -684,20 +690,28 @@ func (s *BybitWSMarketDataService) handleOrderBookMessage(payload []byte) error 
 	}
 	s.mu.RUnlock()
 
-	symbol, isSnapshot, seq, prevSeq, bids, asks, err := parseOrderBookMessage(payload)
+	symbol, isSnapshot, updateID, seq, bids, asks, err := parseOrderBookMessage(payload)
 	if err != nil {
 		return err
 	}
 	if isSnapshot {
-		s.orderBooks.reset(symbol, seq, bids, asks)
+		s.orderBooks.reset(symbol, updateID, seq, bids, asks)
 	} else {
-		ok := s.orderBooks.applyDelta(symbol, seq, prevSeq, bids, asks)
+		ok := s.orderBooks.applyDelta(symbol, updateID, seq, bids, asks)
 		if !ok {
-			s.logger.Warn("orderbook delta sequence gap or no snapshot", map[string]any{
-				"symbol":  symbol,
-				"prevSeq": prevSeq,
-				"seq":     seq,
-			})
+			// Throttle per-symbol to avoid flooding logs when deltas arrive before snapshot.
+			s.orderbookGapLogLastMu.Lock()
+			last, exists := s.orderbookGapLogLast[symbol]
+			shouldLog := !exists || time.Since(last) > 5*time.Second
+			if shouldLog {
+				s.orderbookGapLogLast[symbol] = time.Now()
+			}
+			s.orderbookGapLogLastMu.Unlock()
+			if shouldLog {
+				s.logger.Debug("orderbook delta rejected (no snapshot)", map[string]any{
+					"symbol": symbol,
+				})
+			}
 		}
 	}
 	return nil

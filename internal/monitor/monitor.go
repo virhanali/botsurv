@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/virhan/botsurv/internal/alert"
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/broker"
 	"github.com/virhan/botsurv/internal/domain"
@@ -22,6 +23,7 @@ type Monitor struct {
 	cfg          app.PortfolioRiskConfig
 	log          *logger.Logger
 	dailyResetAt time.Time
+	alertSvc     alert.Service
 }
 
 // NewMonitor creates a new position Monitor.
@@ -33,6 +35,9 @@ func NewMonitor(broker *broker.PaperBroker, md MarketDataProvider, cfg app.Portf
 		log:    log,
 	}
 }
+
+// SetAlertService sets the alert service for sending notifications.
+func (m *Monitor) SetAlertService(svc alert.Service) { m.alertSvc = svc }
 
 // Update processes a price tick: updates PnL, checks kill switch.
 func (m *Monitor) Update(ctx context.Context, symbol string, price float64) {
@@ -79,6 +84,16 @@ func (m *Monitor) checkKillSwitch(ctx context.Context) {
 		// Emergency close all
 		if err := m.broker.EmergencyCloseAll(ctx); err != nil {
 			m.log.Error("emergency close failed", map[string]any{"error": err.Error()})
+		}
+
+		// Alert on kill switch
+		if m.alertSvc != nil {
+			_ = m.alertSvc.Send(ctx, alert.AlertEvent{
+				Type:      "kill_switch",
+				Severity:  "danger",
+				Message:   "Daily loss kill switch triggered. All positions closed, new entries halted.",
+				Timestamp: time.Now(),
+			})
 		}
 	}
 }

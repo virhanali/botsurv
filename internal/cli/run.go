@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/virhan/botsurv/internal/alert"
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/broker"
 	"github.com/virhan/botsurv/internal/db"
@@ -123,6 +124,27 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 
 	pb := broker.NewPaperBroker(cfg.Broker.Paper, log)
 
+	// Wire DB repositories for persistence
+	pb.SetPositionRepo(repos.PositionRepository)
+	pb.SetOrderRepo(repos.OrderRepository)
+	pb.SetExecutionRepo(repos.ExecutionRepository)
+	pb.SetAccountSnapshotRepo(repos.AccountSnapshotRepository)
+
+	// Create alert service
+	var alertSvc alert.Service
+	if cfg.Alerts.Enabled {
+		if cfg.Alerts.Provider == "telegram" {
+			alertSvc = alert.NewTelegramService(cfg.Alerts.Telegram.BotToken, cfg.Alerts.Telegram.ChatID)
+		} else {
+			alertSvc = alert.NewNoopService()
+		}
+	} else {
+		alertSvc = alert.NewNoopService()
+	}
+
+	// Wire alert service to broker
+	pb.SetAlertSender(alertSvc)
+
 	// Create Bybit WS market data service
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	mdSvc := marketdata.NewBybitWSMarketDataService(cfg.MarketData, repos.CandleRepository, httpClient, log)
@@ -136,19 +158,30 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 
 	screenerSvc := screener.NewScreener(*cfg, universeScanner, mdSvc, log)
 
-	llmClient := llm.NewMockClient(domain.LLMDecision{
-		Decision:       "ALLOW_MARKET",
-		Confidence:     0.9,
-		SizeMultiplier: 1.0,
-	}, nil)
+	// Create LLM client (conditionally)
+	var llmClient llm.Client
+	if cfg.LLM.Enabled {
+		llmClient = llm.NewOpenRouterClient(cfg.LLM, log)
+	} else {
+		llmClient = llm.NewMockClient(domain.LLMDecision{
+			Decision:       "ALLOW_MARKET",
+			Confidence:     0.9,
+			SizeMultiplier: 1.0,
+		}, nil)
+	}
 
 	riskEng := risk.NewEngine(*cfg)
 
 	exec := executor.NewExecutor(pb, log)
 
 	mon := monitor.NewMonitor(pb, mdSvc, cfg.PortfolioRisk, log)
+	mon.SetAlertService(alertSvc)
 
 	sched := scheduler.NewScheduler(*cfg, screenerSvc, llmClient, riskEng, exec, mon, mdSvc, log)
+	sched.SetAlertService(alertSvc)
+	sched.SetLLMDecisionRepo(repos.LLMDecisionRepository)
+	sched.SetCycleRepo(repos.CycleRepository)
+	sched.SetCandidateRepo(repos.CandidateRepository)
 
 	cleanup := func() {
 		mdSvc.Stop(context.Background())

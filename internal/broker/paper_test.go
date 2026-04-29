@@ -3,11 +3,96 @@ package broker
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
 	"github.com/virhan/botsurv/internal/logger"
 )
+
+// --- DB Repo Mocks for testing persistence ---
+
+type mockPositionRepo struct {
+	positions []domain.Position
+}
+
+func (m *mockPositionRepo) Insert(ctx context.Context, p domain.Position) (int64, error) {
+	m.positions = append(m.positions, p)
+	return int64(len(m.positions)), nil
+}
+
+func (m *mockPositionRepo) Update(ctx context.Context, p domain.Position) error {
+	for i := range m.positions {
+		if m.positions[i].ID == p.ID {
+			m.positions[i] = p
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *mockPositionRepo) GetOpen(ctx context.Context) ([]domain.Position, error) {
+	var open []domain.Position
+	for _, p := range m.positions {
+		if p.Status == domain.PositionStatusOpen {
+			open = append(open, p)
+		}
+	}
+	return open, nil
+}
+
+func (m *mockPositionRepo) GetClosed(ctx context.Context, since time.Time) ([]domain.Position, error) {
+	return nil, nil
+}
+
+func (m *mockPositionRepo) GetBySymbol(ctx context.Context, symbol string) (*domain.Position, error) {
+	return nil, nil
+}
+
+type mockOrderRepo struct {
+	orders []domain.Order
+}
+
+func (m *mockOrderRepo) Insert(ctx context.Context, o domain.Order) (int64, error) {
+	m.orders = append(m.orders, o)
+	return int64(len(m.orders)), nil
+}
+
+func (m *mockOrderRepo) Update(ctx context.Context, o domain.Order) error {
+	for i := range m.orders {
+		if m.orders[i].ID == o.ID {
+			m.orders[i] = o
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *mockOrderRepo) GetOpen(ctx context.Context) ([]domain.Order, error) {
+	return nil, nil
+}
+
+func (m *mockOrderRepo) GetBySymbol(ctx context.Context, symbol string) ([]domain.Order, error) {
+	return nil, nil
+}
+
+type mockExecRepo struct {
+	executions []domain.Execution
+}
+
+func (m *mockExecRepo) Insert(ctx context.Context, e domain.Execution) (int64, error) {
+	m.executions = append(m.executions, e)
+	return int64(len(m.executions)), nil
+}
+
+type mockAcctSnapRepo struct {
+	snapshots []domain.AccountState
+}
+
+func (m *mockAcctSnapRepo) Insert(ctx context.Context, a domain.AccountState) (int64, error) {
+	m.snapshots = append(m.snapshots, a)
+	return int64(len(m.snapshots)), nil
+}
 
 func newTestBroker() *PaperBroker {
 	cfg := app.PaperConfig{
@@ -724,5 +809,91 @@ func TestLimitOrder_Fill_InvalidIntendedSL_Rejected(t *testing.T) {
 	positions, _ := pb.GetOpenPositions(context.Background())
 	if len(positions) != 0 {
 		t.Errorf("expected 0 positions, got %d", len(positions))
+	}
+}
+
+// --- DB Persistence Tests ---
+
+func TestPlaceOrder_MarketBuy_PersistsFilledOrderAndPositionWithSL(t *testing.T) {
+	pb := newTestBroker()
+	pb.UpdatePrice("BTCUSDT", 65000)
+
+	posRepo := &mockPositionRepo{}
+	ordRepo := &mockOrderRepo{}
+	execRepo := &mockExecRepo{}
+	snapRepo := &mockAcctSnapRepo{}
+	pb.SetPositionRepo(posRepo)
+	pb.SetOrderRepo(ordRepo)
+	pb.SetExecutionRepo(execRepo)
+	pb.SetAccountSnapshotRepo(snapRepo)
+
+	_, err := pb.PlaceOrder(context.Background(), OrderRequest{
+		Symbol:    "BTCUSDT",
+		Side:      domain.OrderSideBuy,
+		OrderType: domain.OrderTypeMarket,
+		Qty:       0.01,
+		StopLoss:  64000,
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder: %v", err)
+	}
+
+	foundMain := false
+	for _, o := range ordRepo.orders {
+		if o.OrderType == domain.OrderTypeMarket && o.Status == domain.OrderStatusFilled {
+			foundMain = true
+		}
+	}
+	if !foundMain {
+		t.Error("expected filled market order persisted")
+	}
+
+	if len(posRepo.positions) == 0 {
+		t.Fatal("expected at least 1 position persisted")
+	}
+	pos := posRepo.positions[0]
+	if pos.StopLoss != 64000 {
+		t.Errorf("expected StopLoss=64000, got %f", pos.StopLoss)
+	}
+
+	foundSL := false
+	for _, o := range ordRepo.orders {
+		if o.OrderType == domain.OrderTypeStopMarket {
+			foundSL = true
+		}
+	}
+	if !foundSL {
+		t.Error("expected protective STOP_MARKET order persisted")
+	}
+}
+
+func TestPlaceOrder_InvalidSL_DoesNotLeaveOpenPositionInDB(t *testing.T) {
+	pb := newTestBroker()
+	pb.UpdatePrice("BTCUSDT", 65000)
+
+	posRepo := &mockPositionRepo{}
+	ordRepo := &mockOrderRepo{}
+	execRepo := &mockExecRepo{}
+	snapRepo := &mockAcctSnapRepo{}
+	pb.SetPositionRepo(posRepo)
+	pb.SetOrderRepo(ordRepo)
+	pb.SetExecutionRepo(execRepo)
+	pb.SetAccountSnapshotRepo(snapRepo)
+
+	_, err := pb.PlaceOrder(context.Background(), OrderRequest{
+		Symbol:    "BTCUSDT",
+		Side:      domain.OrderSideBuy,
+		OrderType: domain.OrderTypeMarket,
+		Qty:       0.01,
+		StopLoss:  66000, // invalid LONG SL above entry
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid SL")
+	}
+
+	for _, p := range posRepo.positions {
+		if p.Status == domain.PositionStatusOpen {
+			t.Errorf("unexpected open position in DB after invalid SL: %+v", p)
+		}
 	}
 }
