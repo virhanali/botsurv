@@ -73,6 +73,10 @@ func NewBybitWSMarketDataService(
 		log = logger.Default()
 	}
 	stale := time.Duration(config.StaleDataThresholdSeconds) * time.Second
+	startTimeout := 60 * time.Second
+	if config.StartTimeoutSeconds > 0 {
+		startTimeout = time.Duration(config.StartTimeoutSeconds) * time.Second
+	}
 	return &BybitWSMarketDataService{
 		config:         config,
 		candleRepo:     candleRepo,
@@ -84,7 +88,7 @@ func NewBybitWSMarketDataService(
 		tradeFlows:     newTradeFlowStore(config.TradeFlowWindows, stale),
 		staleThreshold: stale,
 		ready:          make(chan struct{}),
-		startTimeout:   60 * time.Second,
+		startTimeout:   startTimeout,
 	}
 }
 

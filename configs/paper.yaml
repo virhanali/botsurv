@@ -24,6 +24,7 @@ market_data:
   reconnect_interval_seconds: 5
   stale_data_threshold_seconds: 30
   backfill_candles: 500
+  start_timeout_seconds: 300
   timeframes:
     - 15m
     - 1H

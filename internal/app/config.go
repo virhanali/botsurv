@@ -62,6 +62,7 @@ type MarketDataConfig struct {
 	ReconnectIntervalSeconds  int           `yaml:"reconnect_interval_seconds"`
 	StaleDataThresholdSeconds int           `yaml:"stale_data_threshold_seconds"`
 	BackfillCandles           int           `yaml:"backfill_candles"`
+	StartTimeoutSeconds       int           `yaml:"start_timeout_seconds"`
 	Timeframes                []string      `yaml:"timeframes"`
 	OrderbookDepth            int           `yaml:"orderbook_depth"`
 	TradeFlowWindows          []int         `yaml:"trade_flow_windows"`
@@ -363,6 +364,9 @@ func (c MarketDataConfig) validate() error {
 	}
 	if c.BackfillCandles < 0 {
 		return errors.New("market_data.backfill_candles must be >= 0")
+	}
+	if c.StartTimeoutSeconds < 0 {
+		return errors.New("market_data.start_timeout_seconds must be >= 0")
 	}
 	if len(c.Timeframes) == 0 {
 		return errors.New("market_data.timeframes must not be empty")
