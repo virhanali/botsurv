@@ -1,0 +1,118 @@
+name: Deploy Paper
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy"
+        required: true
+        default: "main"
+
+concurrency:
+  group: deploy-paper
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy paper bot to VPS
+    runs-on: ubuntu-latest
+    environment: paper
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: botsurv
+          POSTGRES_PASSWORD: botsurv
+          POSTGRES_DB: botsurv
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U botsurv -d botsurv"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        env:
+          BOTSURV_TEST_POSTGRES_DSN: postgres://botsurv:botsurv@localhost:5432/botsurv?sslmode=disable
+        run: |
+          go test -count=1 ./...
+          go vet ./...
+          go test -race -count=1 ./internal/broker ./internal/risk ./internal/cli ./internal/scheduler ./internal/marketdata
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/bot ./cmd/bot
+
+      - name: Prepare release payload
+        run: |
+          mkdir -p dist/release
+          cp dist/bot dist/release/bot
+          cp -R configs dist/release/configs
+          cp -R migrations dist/release/migrations
+          cp -R deploy dist/release/deploy
+          tar -C dist/release -czf dist/botsurv-paper.tar.gz .
+
+      - name: Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload release
+        run: |
+          scp -i ~/.ssh/deploy_key dist/botsurv-paper.tar.gz "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/botsurv-paper.tar.gz"
+
+      - name: Deploy and restart service
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          APP_DIR=/opt/botsurv/app
+          RELEASES_DIR=/opt/botsurv/releases
+          RELEASE_ID="$(date -u +%Y%m%d%H%M%S)"
+          RELEASE_DIR="${RELEASES_DIR}/${RELEASE_ID}"
+
+          mkdir -p "$RELEASE_DIR" "$APP_DIR"
+          tar -xzf /tmp/botsurv-paper.tar.gz -C "$RELEASE_DIR"
+          chmod +x "$RELEASE_DIR/bot"
+
+          if [ ! -f /etc/botsurv/paper.env ]; then
+            echo "Missing /etc/botsurv/paper.env. Run deploy/scripts/bootstrap-vps.sh on the VPS first." >&2
+            exit 1
+          fi
+
+          ln -sfn "$RELEASE_DIR" "${APP_DIR}.next"
+          mv -Tf "${APP_DIR}.next" "$APP_DIR"
+
+          install -m 0644 "$APP_DIR/deploy/systemd/botsurv-paper.service" /etc/systemd/system/botsurv-paper.service
+          systemctl daemon-reload
+
+          cd "$APP_DIR"
+          set -a
+          . /etc/botsurv/paper.env
+          set +a
+
+          ./bot config validate --config "$APP_DIR/configs/paper.vps.yaml"
+          ./bot init --config "$APP_DIR/configs/paper.vps.yaml" --migrations-dir "$APP_DIR/migrations"
+
+          systemctl restart botsurv-paper.service
+          systemctl --no-pager --full status botsurv-paper.service
+          REMOTE
+

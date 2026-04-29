@@ -1,0 +1,26 @@
+[Unit]
+Description=BotSurv Paper Trading Bot
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=botsurv
+Group=botsurv
+WorkingDirectory=/opt/botsurv/app
+EnvironmentFile=/etc/botsurv/paper.env
+ExecStart=/opt/botsurv/app/bot run --config /opt/botsurv/app/configs/paper.vps.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/botsurv /var/lib/botsurv /var/log/botsurv
+
+[Install]
+WantedBy=multi-user.target
+

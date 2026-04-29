@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: botsurv
+          POSTGRES_PASSWORD: botsurv
+          POSTGRES_DB: botsurv
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U botsurv -d botsurv"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        env:
+          BOTSURV_TEST_POSTGRES_DSN: postgres://botsurv:botsurv@localhost:5432/botsurv?sslmode=disable
+        run: go test -count=1 ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run focused race tests
+        run: go test -race -count=1 ./internal/broker ./internal/risk ./internal/cli ./internal/scheduler ./internal/marketdata
+
+      - name: Build Linux binary
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/bot ./cmd/bot
+
