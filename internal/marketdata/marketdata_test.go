@@ -1701,6 +1701,411 @@ func TestHealthStatus_WithOrderBookAndTradeFlow(t *testing.T) {
 	}
 }
 
+func TestStart_BackfillAllFails_ReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Always return error so backfill fails
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	repo := &fakeCandleRepo{}
+	cfg := app.MarketDataConfig{
+		RESTURL:                   server.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(cfg, repo, server.Client(), nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := svc.Start(ctx)
+	if err == nil {
+		t.Fatal("expected error when all backfills fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "backfills failed") {
+		t.Errorf("expected 'backfills failed' error, got: %v", err)
+	}
+}
+
+func TestStart_BackfillAllFails_SecondStartRetries(t *testing.T) {
+	failCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failCount++
+		if failCount == 1 {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"category":"linear",
+				"list":[["1672324800000","100","110","90","105","10","1000"]]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	repo := &fakeCandleRepo{}
+	cfg := app.MarketDataConfig{
+		RESTURL:                   server.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(cfg, repo, server.Client(), nil)
+
+	ctx := context.Background()
+
+	// First Start should fail
+	if err := svc.Start(ctx); err == nil {
+		t.Fatal("expected first Start to fail")
+	}
+
+	// Second Start should retry and succeed (server now returns data)
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("expected second Start to succeed, got: %v", err)
+	}
+
+	// Verify data is actually present
+	candles, _ := svc.GetCandles(ctx, "BTCUSDT", "15m", 1)
+	if len(candles) == 0 {
+		t.Error("expected cached candles after second Start")
+	}
+
+	svc.Stop(ctx)
+}
+
+func TestStart_Stop_StartAgain_NoRace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"category":"linear",
+				"list":[["1672324800000","100","110","90","105","10","1000"]]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	repo := &fakeCandleRepo{}
+	cfg := app.MarketDataConfig{
+		RESTURL:                   server.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(cfg, repo, server.Client(), nil)
+
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		if err := svc.Start(ctx); err != nil {
+			t.Fatalf("iteration %d start error: %v", i, err)
+		}
+		if err := svc.Stop(ctx); err != nil {
+			t.Fatalf("iteration %d stop error: %v", i, err)
+		}
+	}
+}
+
+func TestStart_AllBackfillsFail_CancelsInternalContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	repo := &fakeCandleRepo{}
+	cfg := app.MarketDataConfig{
+		RESTURL:                   server.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(cfg, repo, server.Client(), nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := svc.Start(ctx)
+	if err == nil {
+		t.Fatal("expected error when all backfills fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "backfills failed") {
+		t.Errorf("expected 'backfills failed' error, got: %v", err)
+	}
+
+	// Assert service is not running.
+	if svc.running {
+		t.Fatal("expected service to not be running after all backfills fail")
+	}
+
+	// Assert internal context is cancelled so no background goroutines leak.
+	svc.mu.RLock()
+	ctxErr := svc.ctx.Err()
+	svc.mu.RUnlock()
+	if ctxErr == nil {
+		t.Fatal("expected internal context to be cancelled after all backfills fail")
+	}
+
+	// Second Start() should retry cleanly.
+	// Create a new server that succeeds.
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"category":"linear",
+				"list":[["1672324800000","100","110","90","105","10","1000"]]
+			}
+		}`))
+	}))
+	defer server2.Close()
+
+	// Second Start() should succeed with a working server.
+	cfg2 := app.MarketDataConfig{
+		RESTURL:                   server2.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc2 := NewBybitWSMarketDataService(cfg2, repo, server2.Client(), nil)
+	if err := svc2.Start(ctx); err != nil {
+		t.Fatalf("second Start should succeed after clean retry, got: %v", err)
+	}
+	svc2.Stop(ctx)
+}
+
+func TestStart_Timeout_CancelsInternalContext(t *testing.T) {
+	// A mock HTTP server that blocks until the request context is cancelled.
+	blockingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer blockingServer.Close()
+
+	repo := &fakeCandleRepo{}
+	cfg := app.MarketDataConfig{
+		RESTURL:                   blockingServer.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(cfg, repo, blockingServer.Client(), nil)
+	// Override start timeout to a short value so the test doesn't block for 60s.
+	svc.startTimeout = 300 * time.Millisecond
+
+	ctx := context.Background()
+	err := svc.Start(ctx)
+	if err == nil {
+		t.Fatal("expected timeout error from Start()")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected 'timed out' error, got: %v", err)
+	}
+
+	// Assert service is not running.
+	if svc.running {
+		t.Fatal("expected service to not be running after timeout")
+	}
+
+	// Assert internal context is cancelled so background goroutines cannot
+	// enter the WS loop after the caller believes Start() failed.
+	svc.mu.RLock()
+	ctxErr := svc.ctx.Err()
+	svc.mu.RUnlock()
+	if ctxErr == nil {
+		t.Fatal("expected internal context to be cancelled after timeout")
+	}
+
+	// Verify the background goroutine has exited by waiting on wg.
+	// This proves no background WS loop can continue after Start() returns.
+	done := make(chan struct{})
+	go func() {
+		svc.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// goroutine exited cleanly
+	case <-time.After(3 * time.Second):
+		t.Fatal("background goroutine did not terminate after timeout + cancel")
+	}
+}
+
+func TestStart_OldFailedStartCannotCancelNewStart(t *testing.T) {
+	// First server blocks indefinitely — triggers timeout in first Start.
+	blockingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer blockingServer.Close()
+
+	// Second server responds immediately — will be used by second Start.
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"category":"linear",
+				"list":[["1672324800000","100","110","90","105","10","1000"]]
+			}
+		}`))
+	}))
+	defer goodServer.Close()
+
+	repo := &fakeCandleRepo{}
+
+	blockingCfg := app.MarketDataConfig{
+		RESTURL:                   blockingServer.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(blockingCfg, repo, blockingServer.Client(), nil)
+	svc.startTimeout = 300 * time.Millisecond
+
+	ctx := context.Background()
+
+	// First Start — the backfill blocks, Start times out.
+	err := svc.Start(ctx)
+	if err == nil {
+		t.Fatal("expected first Start to time out")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected timeout error, got: %v", err)
+	}
+
+	// Second Start — uses the good server, should succeed.
+	goodCfg := app.MarketDataConfig{
+		RESTURL:                   goodServer.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc2 := NewBybitWSMarketDataService(goodCfg, repo, goodServer.Client(), nil)
+	if err := svc2.Start(ctx); err != nil {
+		t.Fatalf("second Start should succeed, got: %v", err)
+	}
+
+	// Assert service is running after second Start.
+	if !svc2.running {
+		t.Fatal("expected service to be running after second Start")
+	}
+
+	// Assert the second Start's internal context is alive (not cancelled by the old goroutine).
+	svc2.mu.RLock()
+	ctxErr := svc2.ctx.Err()
+	svc2.mu.RUnlock()
+	if ctxErr != nil {
+		t.Fatalf("expected second Start's context to be alive, got: %v", ctxErr)
+	}
+
+	// Stop should succeed cleanly.
+	if err := svc2.Stop(ctx); err != nil {
+		t.Fatalf("Stop after second Start failed: %v", err)
+	}
+}
+
+func TestStart_OldFailedStartCannotOverwriteNewStartResult(t *testing.T) {
+	blockingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer blockingServer.Close()
+
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"category":"linear",
+				"list":[["1672324800000","100","110","90","105","10","1000"]]
+			}
+		}`))
+	}))
+	defer goodServer.Close()
+
+	repo := &fakeCandleRepo{}
+
+	// First Start with blocking server → times out.
+	blockingCfg := app.MarketDataConfig{
+		RESTURL:                   blockingServer.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(blockingCfg, repo, blockingServer.Client(), nil)
+	svc.startTimeout = 300 * time.Millisecond
+
+	ctx := context.Background()
+
+	if err := svc.Start(ctx); err == nil {
+		t.Fatal("expected first Start to time out")
+	}
+
+	// Second Start with working server → succeeds.
+	goodCfg := app.MarketDataConfig{
+		RESTURL:                   goodServer.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc2 := NewBybitWSMarketDataService(goodCfg, repo, goodServer.Client(), nil)
+	if err := svc2.Start(ctx); err != nil {
+		t.Fatalf("second Start should succeed, got: %v", err)
+	}
+
+	// Third Start while already running — should return nil (Start() result), not the old error.
+	start3Err := svc2.Start(ctx)
+	if start3Err != nil {
+		t.Fatalf("third Start (while already running) should return nil, got: %v", start3Err)
+	}
+
+	// Cleanup.
+	svc2.Stop(ctx)
+}
+
 func TestOrderBookStore_ResetReplacesOldData(t *testing.T) {
 	store := newOrderBookStore(30 * time.Second)
 	store.reset("BTCUSDT", 1, []domain.OrderBookLevel{
@@ -1722,4 +2127,169 @@ func TestOrderBookStore_ResetReplacesOldData(t *testing.T) {
 	if summary.BestAsk != 201 {
 		t.Errorf("bestAsk after reset = %f, want 201", summary.BestAsk)
 	}
+}
+
+// TestStart_OldFailedStartCannotRunWSLoopAfterNewStart verifies that an old
+// (failed/timed-out) Start goroutine cannot enter runWSLoop after a newer
+// Start() succeeds on the same service instance.
+func TestStart_OldFailedStartCannotRunWSLoopAfterNewStart(t *testing.T) {
+	blockCount := 0
+	var blockMu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		blockMu.Lock()
+		blockCount++
+		bc := blockCount
+		blockMu.Unlock()
+
+		if bc == 1 {
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"category":"linear",
+				"list":[["1672324800000","100","110","90","105","10","1000"]]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	repo := &fakeCandleRepo{}
+	cfg := app.MarketDataConfig{
+		RESTURL:                   server.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(cfg, repo, server.Client(), nil)
+	svc.startTimeout = 300 * time.Millisecond
+
+	wsLoopEntered := make(chan struct{}, 1)
+	svc.runWSLoopHook = func() {
+		wsLoopEntered <- struct{}{}
+	}
+
+	ctx := context.Background()
+
+	err := svc.Start(ctx)
+	if err == nil {
+		t.Fatal("expected first Start to time out")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected timeout error, got: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		svc.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old goroutine did not exit after first Start timeout")
+	}
+
+	select {
+	case <-wsLoopEntered:
+		t.Fatal("old goroutine should NOT have entered runWSLoop")
+	default:
+	}
+
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("second Start should succeed, got: %v", err)
+	}
+
+	select {
+	case <-wsLoopEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second goroutine should have entered runWSLoop")
+	}
+
+	if err := svc.Stop(ctx); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+}
+
+// TestStart_GoroutineUsesCapturedStartContext proves that the Start goroutine
+// uses its per-start captured context, not the mutable s.ctx field.
+// After a first Start times out and its internal context is cancelled, the
+// goroutine exits because its captured startCtx is done — even if s.ctx is
+// later replaced with a live context.
+func TestStart_GoroutineUsesCapturedStartContext(t *testing.T) {
+	blockCount := 0
+	var blockMu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		blockMu.Lock()
+		blockCount++
+		bc := blockCount
+		blockMu.Unlock()
+
+		if bc == 1 {
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"category":"linear",
+				"list":[["1672324800000","100","110","90","105","10","1000"]]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	repo := &fakeCandleRepo{}
+	cfg := app.MarketDataConfig{
+		RESTURL:                   server.URL,
+		StaleDataThresholdSeconds: 60,
+		BackfillCandles:           1,
+		Symbols: app.SymbolsConfig{
+			Mode:         "explicit",
+			ExplicitList: []string{"BTCUSDT"},
+		},
+		Timeframes: []string{"15m"},
+	}
+	svc := NewBybitWSMarketDataService(cfg, repo, server.Client(), nil)
+	svc.startTimeout = 300 * time.Millisecond
+
+	ctx := context.Background()
+
+	err := svc.Start(ctx)
+	if err == nil {
+		t.Fatal("expected first Start to time out")
+	}
+
+	svc.mu.Lock()
+	svc.ctx, svc.cancel = context.WithCancel(context.Background())
+	svc.running = true
+	liveCtx := svc.ctx
+	svc.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		svc.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old goroutine did not exit; it may be using s.ctx instead of captured startCtx")
+	}
+
+	if liveCtx.Err() != nil {
+		t.Fatal("new live context was unexpectedly cancelled; old goroutine may be using s.cancel")
+	}
+
+	svc.mu.Lock()
+	svc.running = false
+	svc.cancel()
+	svc.mu.Unlock()
 }

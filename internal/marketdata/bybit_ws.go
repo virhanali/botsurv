@@ -47,6 +47,16 @@ type BybitWSMarketDataService struct {
 	// dynamic symbols for all_usdt_perpetual mode
 	muDynamic      sync.RWMutex
 	dynamicSymbols []string
+
+	// readiness signals when initial backfill completes.
+	ready       chan struct{}
+	startResult error // result of the last Start(), protected by mu
+
+	startTimeout time.Duration // max time to wait for initial backfill readiness
+
+	// runWSLoopHook is a test-only hook called just before entering runWSLoop.
+	// Set to nil for production.
+	runWSLoopHook func()
 }
 
 // NewBybitWSMarketDataService creates a new Bybit market data service.
@@ -73,10 +83,14 @@ func NewBybitWSMarketDataService(
 		orderBooks:     newOrderBookStore(stale),
 		tradeFlows:     newTradeFlowStore(config.TradeFlowWindows, stale),
 		staleThreshold: stale,
+		ready:          make(chan struct{}),
+		startTimeout:   60 * time.Second,
 	}
 }
 
 // Start begins the market data service: backfills candles, then starts the WebSocket loop.
+// Blocks until initial backfill completes or the provided context is cancelled.
+// Returns an error if backfill fails for all symbol/timeframe pairs.
 func (s *BybitWSMarketDataService) Start(ctx context.Context) error {
 	if len(s.symbols()) == 0 {
 		return fmt.Errorf("no symbols configured for market data")
@@ -84,41 +98,91 @@ func (s *BybitWSMarketDataService) Start(ctx context.Context) error {
 
 	s.mu.Lock()
 	if s.running {
+		ready := s.ready
 		s.mu.Unlock()
-		return nil
+		// Already running; wait for the same ready channel and return its result.
+		select {
+		case <-ready:
+			s.mu.RLock()
+			err := s.startResult
+			s.mu.RUnlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	s.running = true
+	s.startResult = nil
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.ready = make(chan struct{})
+	readyCh := s.ready
+	cancel := s.cancel
+	startCtx := s.ctx
 	s.mu.Unlock()
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 
+		backfillOK := 0
+		backfillTotal := 0
+
 		// Backfill first so that older REST data does not overwrite live WS updates.
 		if s.config.BackfillCandles > 0 {
 			for _, symbol := range s.symbols() {
 				for _, tf := range s.config.Timeframes {
-					backfillCtx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+					backfillTotal++
+					backfillCtx, cancel := context.WithTimeout(startCtx, 30*time.Second)
 					if err := s.backfillAndWarm(backfillCtx, symbol, tf, s.config.BackfillCandles); err != nil {
 						s.logger.Warn("backfill failed", map[string]any{
 							"symbol":    symbol,
 							"timeframe": tf,
 							"error":     err.Error(),
 						})
+					} else {
+						backfillOK++
 					}
 					cancel()
 				}
 			}
 		}
 
-		if s.ctx.Err() != nil {
+		// Fail closed if every backfill failed and we expected some data.
+		if backfillTotal > 0 && backfillOK == 0 {
+			s.failStartIfCurrent(readyCh, cancel, fmt.Errorf("market data start failed: all %d backfills failed", backfillTotal))
+			close(readyCh)
 			return
 		}
 
+		// Signal readiness after backfill completes.
+		close(readyCh)
+
+		if startCtx.Err() != nil {
+			return
+		}
+
+		if s.runWSLoopHook != nil {
+			s.runWSLoopHook()
+		}
 		s.runWSLoop()
 	}()
-	return nil
+
+	// Wait for initial backfill readiness (or timeout).
+	select {
+	case <-readyCh:
+		s.mu.RLock()
+		err := s.startResult
+		s.mu.RUnlock()
+		return err
+	case <-ctx.Done():
+		err := fmt.Errorf("market data start cancelled: %w", ctx.Err())
+		s.failStartIfCurrent(readyCh, cancel, err)
+		return err
+	case <-time.After(s.startTimeout):
+		err := fmt.Errorf("market data start timed out waiting for initial backfill")
+		s.failStartIfCurrent(readyCh, cancel, err)
+		return err
+	}
 }
 
 // Stop shuts down the market data service gracefully.
@@ -130,6 +194,11 @@ func (s *BybitWSMarketDataService) Stop(ctx context.Context) error {
 	}
 	s.running = false
 	s.cancel()
+	s.startResult = nil
+	// Reset readiness channel so a future Start() can wait again.
+	// The old goroutine may still reference the old channel; closing
+	// a closed channel panics, so we only swap the field here.
+	s.ready = make(chan struct{})
 	s.mu.Unlock()
 
 	s.closeWS()
@@ -689,6 +758,21 @@ func (s *BybitWSMarketDataService) SetSymbols(symbols []string) {
 	s.muDynamic.Lock()
 	defer s.muDynamic.Unlock()
 	s.dynamicSymbols = symbols
+}
+
+// failStartIfCurrent records a fatal start error and cancels the captured context,
+// but only mutates s.startResult and s.running if s.ready still matches readyCh
+// (i.e. no newer Start() has replaced the readiness channel).
+func (s *BybitWSMarketDataService) failStartIfCurrent(readyCh chan struct{}, cancel context.CancelFunc, err error) {
+	s.mu.Lock()
+	if s.ready == readyCh {
+		s.startResult = err
+		s.running = false
+	}
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (s *BybitWSMarketDataService) setWSConn(conn *websocket.Conn) {
