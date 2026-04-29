@@ -54,6 +54,11 @@ func newRunCmd() *cobra.Command {
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 
+			// Preflight: universe refresh + market data start.
+			if err := preflight(ctx, cfg, components); err != nil {
+				return err
+			}
+
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			go func() {
@@ -79,6 +84,11 @@ func runCycle(ctx context.Context, configPath string) error {
 	}
 	defer cleanup()
 
+	// Preflight: universe refresh + market data start.
+	if err := preflight(ctx, cfg, components); err != nil {
+		return err
+	}
+
 	result, err := components.scheduler.RunOnce(ctx)
 	if err != nil {
 		return err
@@ -97,7 +107,9 @@ func runCycle(ctx context.Context, configPath string) error {
 }
 
 type components struct {
-	scheduler *scheduler.Scheduler
+	scheduler       *scheduler.Scheduler
+	mdSvc           marketdata.MarketDataService
+	universeScanner *universe.Scanner
 }
 
 func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
@@ -122,31 +134,6 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 		repos.UniverseRepository, repos.CandleRepository, log,
 	)
 
-	// Refresh universe to populate symbol list
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := universeScanner.RefreshUniverse(ctx); err != nil {
-		log.Warn("initial universe refresh failed, using empty symbols", map[string]any{"error": err.Error()})
-	}
-
-	// Feed symbols to WS if all_usdt_perpetual mode
-	if cfg.MarketData.Symbols.Mode != "explicit" {
-		symbols, _ := universeScanner.GetUniverse(ctx)
-		symbolList := make([]string, 0, len(symbols))
-		for _, s := range symbols {
-			if !s.Blacklist {
-				symbolList = append(symbolList, s.Symbol)
-			}
-		}
-		mdSvc.SetSymbols(symbolList)
-		log.Info("marketdata symbols set", map[string]any{"count": len(symbolList)})
-	}
-
-	// Start market data service (WS connect + backfill)
-	if err := mdSvc.Start(ctx); err != nil {
-		log.Warn("marketdata service failed to start, continuing without WS data", map[string]any{"error": err.Error()})
-	}
-
 	screenerSvc := screener.NewScreener(*cfg, universeScanner, mdSvc, log)
 
 	llmClient := llm.NewMockClient(domain.LLMDecision{
@@ -168,5 +155,55 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 		database.Close()
 	}
 
-	return &components{scheduler: sched}, cleanup, nil
+	return &components{
+		scheduler:       sched,
+		mdSvc:           mdSvc,
+		universeScanner: universeScanner,
+	}, cleanup, nil
+}
+
+// preflight performs network-dependent initialization: universe refresh,
+// symbol provisioning, and market data service start. Fails closed for
+// bybit_ws if any step fails.
+func preflight(ctx context.Context, cfg *app.UserConfig, c *components) error {
+	log := logger.New(nil, logger.Level(cfg.App.LogLevel))
+
+	// Refresh universe to populate symbol list
+	preflightCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := c.universeScanner.RefreshUniverse(preflightCtx); err != nil {
+		log.Warn("universe refresh failed", map[string]any{"error": err.Error()})
+		if cfg.MarketData.Provider == "bybit_ws" {
+			return fmt.Errorf("universe refresh failed: %w", err)
+		}
+	}
+
+	// Feed symbols to WS if all_usdt_perpetual mode
+	if cfg.MarketData.Symbols.Mode != "explicit" {
+		symbols, err := c.universeScanner.GetUniverse(preflightCtx)
+		if err != nil {
+			return fmt.Errorf("get universe failed: %w", err)
+		}
+		symbolList := make([]string, 0, len(symbols))
+		for _, s := range symbols {
+			if !s.Blacklist {
+				symbolList = append(symbolList, s.Symbol)
+			}
+		}
+		c.mdSvc.SetSymbols(symbolList)
+		log.Info("marketdata symbols set", map[string]any{"count": len(symbolList)})
+	}
+
+	// Start market data service (blocks until initial backfill ready).
+	if err := c.mdSvc.Start(ctx); err != nil {
+		if cfg.MarketData.Provider == "bybit_ws" {
+			return fmt.Errorf("market data provider %q failed to start: %w", cfg.MarketData.Provider, err)
+		}
+		log.Warn("marketdata service failed to start, continuing without live data", map[string]any{
+			"provider": cfg.MarketData.Provider,
+			"error":    err.Error(),
+		})
+	}
+
+	return nil
 }

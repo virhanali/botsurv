@@ -451,3 +451,47 @@ func assertContainsReason(t *testing.T, reasons []string, expected string) {
 	}
 	t.Errorf("expected reason %q in %v", expected, reasons)
 }
+
+func TestValidate_RejectsBLOCKDecision(t *testing.T) {
+	e := NewEngine(defaultConfig())
+	input := validInput()
+	input.LLMDecision.Decision = "BLOCK"
+	input.LLMDecision.Confidence = 0.9
+	output := e.Validate(input)
+	if output.Approved {
+		t.Error("expected rejected: BLOCK decision")
+	}
+	assertContainsReason(t, output.ReasonCodes, "LLM_DECISION_BLOCK")
+}
+
+func TestValidate_RejectsConfidenceZero(t *testing.T) {
+	e := NewEngine(defaultConfig())
+	input := validInput()
+	input.LLMDecision.Confidence = 0
+	output := e.Validate(input)
+	if output.Approved {
+		t.Error("expected rejected: confidence 0")
+	}
+	assertContainsReason(t, output.ReasonCodes, "LLM_LOW_CONFIDENCE")
+}
+
+func TestValidate_RejectsConfidenceBelowThreshold(t *testing.T) {
+	e := NewEngine(defaultConfig())
+	input := validInput()
+	input.LLMDecision.Confidence = 0.59
+	output := e.Validate(input)
+	if output.Approved {
+		t.Error("expected rejected: confidence 0.59")
+	}
+	assertContainsReason(t, output.ReasonCodes, "LLM_LOW_CONFIDENCE")
+}
+
+func TestValidate_AcceptsConfidenceAtThreshold(t *testing.T) {
+	e := NewEngine(defaultConfig())
+	input := validInput()
+	input.LLMDecision.Confidence = 0.6
+	output := e.Validate(input)
+	if !output.Approved {
+		t.Errorf("expected approved at confidence 0.6, got rejected: %v", output.ReasonCodes)
+	}
+}

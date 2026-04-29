@@ -47,7 +47,7 @@ func TestPlaceOrder_MarketBuyLong(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder: %v", err)
@@ -81,7 +81,7 @@ func TestPlaceOrder_MarketSellShort(t *testing.T) {
 		Side:      domain.OrderSideSell,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
-		StopLoss:  1,
+		StopLoss:  3100,
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder: %v", err)
@@ -110,7 +110,7 @@ func TestPlaceOrder_InsufficientMargin(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 	if err == nil {
 		t.Error("expected error for insufficient margin")
@@ -126,7 +126,7 @@ func TestPlaceOrder_FeeCalculation(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	state, _ := pb.GetAccountState(context.Background())
@@ -149,7 +149,7 @@ func TestPlaceOrder_SlippageCalculation(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	state, _ := pb.GetAccountState(context.Background())
@@ -167,7 +167,7 @@ func TestPlaceOrder_MarginTracking(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	state, _ := pb.GetAccountState(context.Background())
@@ -193,7 +193,7 @@ func TestClosePosition_LongProfit(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// Price goes up
@@ -219,7 +219,7 @@ func TestClosePosition_LongLoss(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// Price goes down
@@ -241,7 +241,7 @@ func TestClosePosition_ShortProfit(t *testing.T) {
 		Side:      domain.OrderSideSell,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
-		StopLoss:  1,
+		StopLoss:  3100,
 	})
 
 	// Price goes down (profit for short)
@@ -263,7 +263,7 @@ func TestStopLoss_Triggers(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// Set SL at 64000
@@ -292,7 +292,7 @@ func TestTakeProfit_Triggers(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// Set TP at 67000
@@ -318,7 +318,7 @@ func TestSameCandle_SLFirst(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	slPrice := 64000.0
@@ -353,14 +353,14 @@ func TestEmergencyCloseAll(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  3100,
 	})
 	pb.PlaceOrder(context.Background(), OrderRequest{
 		Symbol:    "ETHUSDT",
 		Side:      domain.OrderSideSell,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       1.0,
-		StopLoss:  1,
+		StopLoss:  3100,
 	})
 
 	pb.EmergencyCloseAll(context.Background())
@@ -383,7 +383,7 @@ func TestSetProtectiveOrders_ValidateSL(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// SL above entry for LONG is invalid
@@ -408,7 +408,7 @@ func TestSetProtectiveOrders_ValidateTP(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// TP below entry for LONG is invalid
@@ -428,7 +428,7 @@ func TestLimitOrder_Fill(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeLimit,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  63000,
 		Price:     &price,
 	})
 
@@ -466,7 +466,7 @@ func TestLimitOrder_NoFill(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeLimit,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  63000,
 		Price:     &price,
 	})
 
@@ -494,7 +494,7 @@ func TestCancelOrder(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeLimit,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  63000,
 		Price:     &price,
 	})
 
@@ -518,7 +518,7 @@ func TestUnrealizedPnL(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// Price goes up
@@ -543,7 +543,7 @@ func TestResetDailyLoss(t *testing.T) {
 		Side:      domain.OrderSideBuy,
 		OrderType: domain.OrderTypeMarket,
 		Qty:       0.01,
-		StopLoss:  1,
+		StopLoss:  64000,
 	})
 
 	// Close at loss
@@ -559,5 +559,170 @@ func TestResetDailyLoss(t *testing.T) {
 	state, _ = pb.GetAccountState(context.Background())
 	if state.DailyLoss != 0 {
 		t.Errorf("expected daily loss 0 after reset, got %.4f", state.DailyLoss)
+	}
+}
+
+func TestPlaceOrder_RejectInvalidSL_LongSLAboveEntry(t *testing.T) {
+	pb := newTestBroker()
+	pb.UpdatePrice("BTCUSDT", 65000)
+
+	_, err := pb.PlaceOrder(context.Background(), OrderRequest{
+		Symbol:    "BTCUSDT",
+		Side:      domain.OrderSideBuy,
+		OrderType: domain.OrderTypeMarket,
+		Qty:       0.01,
+		StopLoss:  66000, // invalid: LONG SL above entry
+	})
+	if err == nil {
+		t.Fatal("expected error for LONG SL above entry")
+	}
+	// Position was never opened (rejected at broker layer)
+	positions, _ := pb.GetOpenPositions(context.Background())
+	if len(positions) != 0 {
+		t.Errorf("expected 0 positions, got %d", len(positions))
+	}
+}
+
+func TestPlaceOrder_RejectInvalidSL_ShortSLBelowEntry(t *testing.T) {
+	pb := newTestBroker()
+	pb.UpdatePrice("ETHUSDT", 3000)
+
+	_, err := pb.PlaceOrder(context.Background(), OrderRequest{
+		Symbol:    "ETHUSDT",
+		Side:      domain.OrderSideSell,
+		OrderType: domain.OrderTypeMarket,
+		Qty:       1.0,
+		StopLoss:  2900, // invalid: SHORT SL below entry
+	})
+	if err == nil {
+		t.Fatal("expected error for SHORT SL below entry")
+	}
+	positions, _ := pb.GetOpenPositions(context.Background())
+	if len(positions) != 0 {
+		t.Errorf("expected 0 positions, got %d", len(positions))
+	}
+}
+
+func TestPlaceOrder_InvalidSL_NoDirtyState(t *testing.T) {
+	pb := newTestBroker()
+	pb.UpdatePrice("BTCUSDT", 65000)
+
+	stateBefore, _ := pb.GetAccountState(context.Background())
+
+	_, err := pb.PlaceOrder(context.Background(), OrderRequest{
+		Symbol:    "BTCUSDT",
+		Side:      domain.OrderSideBuy,
+		OrderType: domain.OrderTypeMarket,
+		Qty:       0.01,
+		StopLoss:  66000, // invalid LONG SL
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	// No position, no closed position, no fee, no margin change
+	positions, _ := pb.GetOpenPositions(context.Background())
+	if len(positions) != 0 {
+		t.Errorf("expected 0 open positions, got %d", len(positions))
+	}
+	if len(pb.closedPositions) != 0 {
+		t.Errorf("expected 0 closed positions, got %d", len(pb.closedPositions))
+	}
+
+	stateAfter, _ := pb.GetAccountState(context.Background())
+	if stateAfter.Balance != stateBefore.Balance {
+		t.Errorf("balance changed: %.4f -> %.4f", stateBefore.Balance, stateAfter.Balance)
+	}
+	if stateAfter.UsedMargin != stateBefore.UsedMargin {
+		t.Errorf("margin changed: %.4f -> %.4f", stateBefore.UsedMargin, stateAfter.UsedMargin)
+	}
+	if stateAfter.TotalFees != stateBefore.TotalFees {
+		t.Errorf("fees changed: %.4f -> %.4f", stateBefore.TotalFees, stateAfter.TotalFees)
+	}
+}
+
+func TestLimitOrder_Fill_InvalidSL_NoDirtyState(t *testing.T) {
+	pb := newTestBroker()
+	pb.UpdatePrice("BTCUSDT", 65000)
+
+	stateBefore, _ := pb.GetAccountState(context.Background())
+
+	price := 64000.0
+	pb.PlaceOrder(context.Background(), OrderRequest{
+		Symbol:    "BTCUSDT",
+		Side:      domain.OrderSideBuy,
+		OrderType: domain.OrderTypeLimit,
+		Qty:       0.01,
+		StopLoss:  66000, // invalid LONG SL
+		Price:     &price,
+	})
+
+	pb.ProcessCandle(domain.Candle{
+		Symbol: "BTCUSDT",
+		High:   65000,
+		Low:    63500,
+		Close:  64500,
+	})
+
+	positions, _ := pb.GetOpenPositions(context.Background())
+	if len(positions) != 0 {
+		t.Errorf("expected 0 open positions, got %d", len(positions))
+	}
+	if len(pb.closedPositions) != 0 {
+		t.Errorf("expected 0 closed positions, got %d", len(pb.closedPositions))
+	}
+
+	stateAfter, _ := pb.GetAccountState(context.Background())
+	if stateAfter.Balance != stateBefore.Balance {
+		t.Errorf("balance changed: %.4f -> %.4f", stateBefore.Balance, stateAfter.Balance)
+	}
+	if stateAfter.UsedMargin != stateBefore.UsedMargin {
+		t.Errorf("margin changed: %.4f -> %.4f", stateBefore.UsedMargin, stateAfter.UsedMargin)
+	}
+	if stateAfter.TotalFees != stateBefore.TotalFees {
+		t.Errorf("fees changed: %.4f -> %.4f", stateBefore.TotalFees, stateAfter.TotalFees)
+	}
+}
+
+func TestLimitOrder_Fill_InvalidIntendedSL_Rejected(t *testing.T) {
+	pb := newTestBroker()
+	pb.UpdatePrice("BTCUSDT", 65000)
+
+	price := 64000.0
+	order, _ := pb.PlaceOrder(context.Background(), OrderRequest{
+		Symbol:    "BTCUSDT",
+		Side:      domain.OrderSideBuy,
+		OrderType: domain.OrderTypeLimit,
+		Qty:       0.01,
+		StopLoss:  66000, // invalid intended SL for LONG (above entry)
+		Price:     &price,
+	})
+
+	// Candle touches limit price
+	pb.ProcessCandle(domain.Candle{
+		Symbol: "BTCUSDT",
+		High:   65000,
+		Low:    63500,
+		Close:  64500,
+	})
+
+	// Order should be rejected, position never opened.
+	// Look up the updated order from the broker (PlaceOrder returns a copy).
+	orders, _ := pb.GetOpenOrders(context.Background())
+	var found *domain.Order
+	for i := range orders {
+		if orders[i].BrokerOrderID == order.BrokerOrderID {
+			found = &orders[i]
+			break
+		}
+	}
+	if found == nil {
+		// Order may have been removed from openOrders when rejected — that's also acceptable.
+	} else if found.Status != domain.OrderStatusRejected {
+		t.Errorf("expected rejected, got %s", found.Status)
+	}
+	positions, _ := pb.GetOpenPositions(context.Background())
+	if len(positions) != 0 {
+		t.Errorf("expected 0 positions, got %d", len(positions))
 	}
 }

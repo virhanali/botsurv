@@ -184,6 +184,16 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 			fillPrice = price - slippageAmt
 		}
 
+		// Validate SL side BEFORE mutating any broker state (H3 fix).
+		if !req.ReduceOnly && (req.OrderType == domain.OrderTypeMarket || req.OrderType == domain.OrderTypeLimit) {
+			if req.StopLoss > 0 {
+				if err := pb.validateStopLoss(req.Side, fillPrice, req.StopLoss); err != nil {
+					order.Status = domain.OrderStatusRejected
+					return order, err
+				}
+			}
+		}
+
 		notional := fillPrice * req.Qty
 		fee := notional * takerFeeBps / 10000
 		margin := notional / pb.cfg.DefaultLeverage
@@ -233,7 +243,11 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 
 			// Atomic protective orders: no position without SL
 			if req.StopLoss > 0 || req.TakeProfit > 0 {
-				pb.createProtectiveOrdersForPosition(pos, req.StopLoss, req.TakeProfit)
+				if !pb.createProtectiveOrdersForPosition(pos, req.StopLoss, req.TakeProfit) {
+					// Position was emergency-closed due to invalid SL.
+					order.Status = domain.OrderStatusRejected
+					return order, fmt.Errorf("position rejected: invalid StopLoss price for %s side", pos.Side)
+				}
 			}
 		}
 
@@ -403,9 +417,46 @@ func (pb *PaperBroker) GetPosition(symbol string) (*domain.Position, bool) {
 // --- Internal methods ---
 
 // createProtectiveOrdersForPosition creates SL and TP orders for a position (lock held).
-func (pb *PaperBroker) createProtectiveOrdersForPosition(pos *domain.Position, slPrice, tpPrice float64) {
+// Validates that SL/TP prices are on the correct side of the entry price.
+// If SL is invalid, the position is emergency-closed (fail closed).
+// Returns true if the position survived (SL/TP created successfully), false if emergency-closed.
+func (pb *PaperBroker) createProtectiveOrdersForPosition(pos *domain.Position, slPrice, tpPrice float64) bool {
 	if slPrice <= 0 && tpPrice <= 0 {
-		return
+		return true
+	}
+
+	// Validate SL is on the correct side
+	if slPrice > 0 {
+		if pos.Side == domain.SideLong && slPrice >= pos.EntryPrice {
+			pb.log.Error("invalid LONG SL >= entry — emergency closing position", map[string]any{
+				"symbol": pos.Symbol, "sl": slPrice, "entry": pos.EntryPrice,
+			})
+			pb.closePositionInternal(pos, pos.EntryPrice, time.Now())
+			return false
+		}
+		if pos.Side == domain.SideShort && slPrice <= pos.EntryPrice {
+			pb.log.Error("invalid SHORT SL <= entry — emergency closing position", map[string]any{
+				"symbol": pos.Symbol, "sl": slPrice, "entry": pos.EntryPrice,
+			})
+			pb.closePositionInternal(pos, pos.EntryPrice, time.Now())
+			return false
+		}
+	}
+
+	// Validate TP is on the correct side (skip TP if invalid, but don't close position)
+	if tpPrice > 0 {
+		if pos.Side == domain.SideLong && tpPrice <= pos.EntryPrice {
+			pb.log.Error("invalid LONG TP <= entry — skipping TP", map[string]any{
+				"symbol": pos.Symbol, "tp": tpPrice, "entry": pos.EntryPrice,
+			})
+			tpPrice = 0
+		}
+		if pos.Side == domain.SideShort && tpPrice >= pos.EntryPrice {
+			pb.log.Error("invalid SHORT TP >= entry — skipping TP", map[string]any{
+				"symbol": pos.Symbol, "tp": tpPrice, "entry": pos.EntryPrice,
+			})
+			tpPrice = 0
+		}
 	}
 
 	slSide := domain.OrderSideSell
@@ -450,6 +501,22 @@ func (pb *PaperBroker) createProtectiveOrdersForPosition(pos *domain.Position, s
 		pb.openOrders[tpOrder.BrokerOrderID] = tpOrder
 		pos.TPOrderID = &tpOrder.ID
 	}
+	return true
+}
+
+// validateStopLoss checks that the SL price is on the correct side of the entry price.
+// Must be called before any broker state is mutated.
+func (pb *PaperBroker) validateStopLoss(side domain.OrderSide, entryPrice, slPrice float64) error {
+	if side == domain.OrderSideBuy {
+		if slPrice >= entryPrice {
+			return fmt.Errorf("LONG StopLoss %.2f must be below entry %.2f", slPrice, entryPrice)
+		}
+	} else {
+		if slPrice <= entryPrice {
+			return fmt.Errorf("SHORT StopLoss %.2f must be above entry %.2f", slPrice, entryPrice)
+		}
+	}
+	return nil
 }
 
 func (pb *PaperBroker) cancelSiblingOrders(pos *domain.Position) {
@@ -685,6 +752,16 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 	}
 	fillPrice := *order.Price
 
+	// Validate SL side BEFORE mutating any broker state (H3 fix).
+	if order.IntendedSL > 0 {
+		if err := pb.validateStopLoss(order.Side, fillPrice, order.IntendedSL); err != nil {
+			order.Status = domain.OrderStatusRejected
+			order.UpdatedAt = time.Now()
+			pb.log.Error("limit fill rejected: invalid StopLoss price", map[string]any{"symbol": order.Symbol, "error": err.Error()})
+			return
+		}
+	}
+
 	makerFeeBps := pb.cfg.FeeMakerBps
 	notional := fillPrice * order.Qty
 	fee := notional * makerFeeBps / 10000
@@ -718,12 +795,18 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 
 	// Atomic protective orders for limit fills
 	if order.IntendedSL > 0 || order.IntendedTP > 0 {
-		pb.createProtectiveOrdersForPosition(pos, order.IntendedSL, order.IntendedTP)
+		if !pb.createProtectiveOrdersForPosition(pos, order.IntendedSL, order.IntendedTP) {
+			// Position was emergency-closed due to invalid SL.
+			order.Status = domain.OrderStatusRejected
+			order.UpdatedAt = time.Now()
+			pb.log.Error("limit fill rejected: invalid StopLoss price", map[string]any{"symbol": order.Symbol})
+			return
+		}
 	} else {
 		// No SL intended — emergency close (safety invariant)
 		pb.log.Error("limit fill with no SL — emergency closing", map[string]any{"symbol": order.Symbol})
 		pb.closePositionInternal(pos, fillPrice, time.Now())
-		order.Status = domain.OrderStatusFilled
+		order.Status = domain.OrderStatusRejected
 		order.UpdatedAt = time.Now()
 		return
 	}

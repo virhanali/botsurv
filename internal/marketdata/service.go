@@ -11,6 +11,7 @@ import (
 type MarketDataService interface {
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error
+	SetSymbols(symbols []string)
 	GetCandles(ctx context.Context, symbol, timeframe string, limit int) ([]domain.Candle, error)
 	GetLatestPrice(ctx context.Context, symbol string) (float64, error)
 	GetOrderBookSummary(ctx context.Context, symbol string, targetNotional float64, side string) (domain.OrderBookSummary, error)
