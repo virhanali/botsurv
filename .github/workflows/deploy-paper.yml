@@ -95,17 +95,24 @@ jobs:
           RELEASE_ID="$(date -u +%Y%m%d%H%M%S)"
           RELEASE_DIR="${RELEASES_DIR}/${RELEASE_ID}"
 
-          mkdir -p "$RELEASE_DIR" "$APP_DIR"
+          mkdir -p "$RELEASE_DIR" "$RELEASES_DIR"
           tar -xzf /tmp/botsurv-paper.tar.gz -C "$RELEASE_DIR"
           chmod +x "$RELEASE_DIR/bot"
+          chown -R botsurv:botsurv "$RELEASE_DIR"
 
           if [ ! -f /etc/botsurv/paper.env ]; then
             echo "Missing /etc/botsurv/paper.env. Run deploy/scripts/bootstrap-vps.sh on the VPS first." >&2
             exit 1
           fi
 
+          if [ -d "$APP_DIR" ] && [ ! -L "$APP_DIR" ]; then
+            rmdir "$APP_DIR" 2>/dev/null || {
+              echo "$APP_DIR exists as a non-empty directory; refusing to replace it." >&2
+              exit 1
+            }
+          fi
           ln -sfn "$RELEASE_DIR" "${APP_DIR}.next"
-          mv -Tf "${APP_DIR}.next" "$APP_DIR"
+          mv -T "${APP_DIR}.next" "$APP_DIR"
 
           install -m 0644 "$APP_DIR/deploy/systemd/botsurv-paper.service" /etc/systemd/system/botsurv-paper.service
           systemctl daemon-reload
