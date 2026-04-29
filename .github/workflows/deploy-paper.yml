@@ -1,6 +1,12 @@
 name: Deploy Paper
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       ref:
@@ -37,7 +43,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -115,4 +121,3 @@ jobs:
           systemctl restart botsurv-paper.service
           systemctl --no-pager --full status botsurv-paper.service
           REMOTE
-
