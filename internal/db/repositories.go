@@ -48,6 +48,7 @@ type OrderRepository interface {
 	Update(ctx context.Context, o domain.Order) error
 	GetOpen(ctx context.Context) ([]domain.Order, error)
 	GetBySymbol(ctx context.Context, symbol string) ([]domain.Order, error)
+	GetAll(ctx context.Context, since time.Time) ([]domain.Order, error)
 }
 
 // ExecutionRepository persists executions.
@@ -60,6 +61,7 @@ type ExecutionRepository interface {
 type AccountSnapshotRepository interface {
 	Insert(ctx context.Context, a domain.AccountState) (int64, error)
 	GetLatest(ctx context.Context) (*domain.AccountState, error)
+	GetLatestBefore(ctx context.Context, before time.Time) (*domain.AccountState, error)
 }
 
 // LLMDecisionRepository persists LLM decisions.

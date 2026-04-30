@@ -154,6 +154,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 	result.Candidates = len(screenResult.Candidates)
 
+	// Check existing positions for SL/TP before new entries.
+	s.monitor.CheckAllPositions(ctx)
+
 	// Persist all generated candidates and track DB IDs for LLM decisions.
 	candidateIDs := s.persistCandidates(ctx, screenResult.Candidates, screenResult.NonEligible, cycleID)
 

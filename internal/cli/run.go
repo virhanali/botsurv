@@ -176,6 +176,7 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 
 	mon := monitor.NewMonitor(pb, mdSvc, cfg.PortfolioRisk, log)
 	mon.SetAlertService(alertSvc)
+	mon.SetTimeframe(cfg.Strategy.Timeframes.Execution)
 
 	sched := scheduler.NewScheduler(*cfg, screenerSvc, llmClient, riskEng, exec, mon, mdSvc, log)
 	sched.SetAlertService(alertSvc)

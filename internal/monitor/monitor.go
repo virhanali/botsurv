@@ -11,9 +11,11 @@ import (
 	"github.com/virhan/botsurv/internal/logger"
 )
 
-// MarketDataProvider provides price updates.
+// MarketDataProvider provides price and candle data.
 type MarketDataProvider interface {
 	GetLatestPrice(ctx context.Context, symbol string) (float64, error)
+	IsHealthy(symbol string) bool
+	GetCandles(ctx context.Context, symbol, timeframe string, limit int) ([]domain.Candle, error)
 }
 
 // Monitor continuously monitors positions and enforces kill switch.
@@ -24,6 +26,7 @@ type Monitor struct {
 	log          *logger.Logger
 	dailyResetAt time.Time
 	alertSvc     alert.Service
+	timeframe    string
 }
 
 // NewMonitor creates a new position Monitor.
@@ -38,6 +41,9 @@ func NewMonitor(broker *broker.PaperBroker, md MarketDataProvider, cfg app.Portf
 
 // SetAlertService sets the alert service for sending notifications.
 func (m *Monitor) SetAlertService(svc alert.Service) { m.alertSvc = svc }
+
+// SetTimeframe sets the candle timeframe for position checks.
+func (m *Monitor) SetTimeframe(tf string) { m.timeframe = tf }
 
 // Update processes a price tick: updates PnL, checks kill switch.
 func (m *Monitor) Update(ctx context.Context, symbol string, price float64) {
@@ -95,6 +101,32 @@ func (m *Monitor) checkKillSwitch(ctx context.Context) {
 				Timestamp: time.Now(),
 			})
 		}
+	}
+}
+
+// CheckAllPositions processes latest candles for all open positions to check SL/TP.
+func (m *Monitor) CheckAllPositions(ctx context.Context) {
+	positions, err := m.broker.GetOpenPositions(ctx)
+	if err != nil || len(positions) == 0 {
+		return
+	}
+
+	tf := m.timeframe
+	if tf == "" {
+		tf = "15m"
+	}
+
+	for _, pos := range positions {
+		candles, err := m.md.GetCandles(ctx, pos.Symbol, tf, 1)
+		if err != nil || len(candles) == 0 {
+			// Fallback: update price
+			price, priceErr := m.md.GetLatestPrice(ctx, pos.Symbol)
+			if priceErr == nil && price > 0 {
+				m.Update(ctx, pos.Symbol, price)
+			}
+			continue
+		}
+		m.ProcessCandle(candles[len(candles)-1])
 	}
 }
 

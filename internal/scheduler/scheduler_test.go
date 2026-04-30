@@ -139,6 +139,7 @@ func (m *mockMarketData) GetCandles(ctx context.Context, symbol, timeframe strin
 func (m *mockMarketData) GetLatestPrice(ctx context.Context, symbol string) (float64, error) {
 	return 65000, nil
 }
+func (m *mockMarketData) IsHealthy(symbol string) bool { return true }
 func (m *mockMarketData) GetTradeFlow(ctx context.Context, symbol string) ([]domain.TradeFlow, error) {
 	return nil, nil
 }

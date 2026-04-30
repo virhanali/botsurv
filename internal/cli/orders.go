@@ -3,16 +3,18 @@ package cli
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/db"
+	"github.com/virhan/botsurv/internal/domain"
 )
 
 func newOrdersCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "orders",
-		Short: "Show open orders from DB",
+		Short: "Show recent orders from DB",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := app.LoadConfig(configPath)
 			if err != nil {
@@ -29,32 +31,53 @@ func newOrdersCmd() *cobra.Command {
 			repos := db.NewPostgresRepositories(database)
 			ctx := context.Background()
 
-			orders, err := repos.OrderRepository.GetOpen(ctx)
+			// Show all orders from the last 48h
+			since := time.Now().UTC().Add(-48 * time.Hour)
+			orders, err := repos.OrderRepository.GetAll(ctx, since)
 			if err != nil {
 				return fmt.Errorf("query orders: %w", err)
 			}
 
 			if len(orders) == 0 {
-				fmt.Println("No persisted orders found.")
+				fmt.Println("No orders found in the last 48 hours.")
 				return nil
 			}
 
-			fmt.Println("Symbol\tType\tSide\tQty\tPrice\tStop\tStatus")
-			fmt.Println("------\t----\t----\t---\t-----\t----\t------")
-			for _, o := range orders {
-				priceStr := "-"
-				if o.Price != nil {
-					priceStr = fmt.Sprintf("%.4f", *o.Price)
+			openOrders, _ := repos.OrderRepository.GetOpen(ctx)
+
+			if len(openOrders) > 0 {
+				fmt.Println("--- Open Orders ---")
+				fmt.Printf("%-12s %-18s %-8s %-10s %-8s %-12s %-14s\n", "Symbol", "Type", "Side", "Qty", "Price", "Stop", "Status")
+				fmt.Println("--------------------------------------------------")
+				for _, o := range openOrders {
+					printOrder(o)
 				}
-				stopStr := "-"
-				if o.StopPrice != nil {
-					stopStr = fmt.Sprintf("%.4f", *o.StopPrice)
+				fmt.Println()
+			}
+
+			if len(orders) > 0 {
+				fmt.Println("--- All Recent Orders ---")
+				fmt.Printf("%-12s %-18s %-8s %-10s %-8s %-12s %-14s\n", "Symbol", "Type", "Side", "Qty", "Price", "Stop", "Status")
+				fmt.Println("--------------------------------------------------")
+				for _, o := range orders {
+					printOrder(o)
 				}
-				fmt.Printf("%s\t%s\t%s\t%.4f\t%s\t%s\t%s\n",
-					o.Symbol, o.OrderType, o.Side, o.Qty, priceStr, stopStr, o.Status)
 			}
 
 			return nil
 		},
 	}
+}
+
+func printOrder(o domain.Order) {
+	priceStr := "-"
+	if o.Price != nil {
+		priceStr = fmt.Sprintf("%.4f", *o.Price)
+	}
+	stopStr := "-"
+	if o.StopPrice != nil {
+		stopStr = fmt.Sprintf("%.4f", *o.StopPrice)
+	}
+	fmt.Printf("%-12s %-18s %-8s %-10.4f %-8s %-12s %-14s\n",
+		o.Symbol, o.OrderType, o.Side, o.Qty, priceStr, stopStr, o.Status)
 }

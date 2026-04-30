@@ -14,6 +14,15 @@ import (
 )
 
 // PaperBroker simulates futures trading in paper mode.
+//
+// Restart recovery gap: state is entirely in-memory. On restart, open positions,
+// orders, and account state must be rehydrated from DB to prevent orphaned
+// positions or incorrect balance. Required before production paper mode:
+// - Rehydrate balance/usedMargin/realizedPnL from latest account_snapshot
+// - Reload open positions from positions table (status='open')
+// - Reload open orders from orders table (status='pending')
+// - Re-sync price cache if needed
+// - Rebuild nextOrderID/nextPositionID/nextExecID counters from DB sequences
 type PaperBroker struct {
 	mu sync.RWMutex
 
@@ -72,6 +81,8 @@ type OrderRepository interface {
 	Insert(ctx context.Context, o domain.Order) (int64, error)
 	Update(ctx context.Context, o domain.Order) error
 	GetOpen(ctx context.Context) ([]domain.Order, error)
+	GetBySymbol(ctx context.Context, symbol string) ([]domain.Order, error)
+	GetAll(ctx context.Context, since time.Time) ([]domain.Order, error)
 }
 
 // ExecutionRepository is the minimal interface for execution persistence.
@@ -82,6 +93,8 @@ type ExecutionRepository interface {
 // AccountSnapshotRepository is the minimal interface for account snapshot persistence.
 type AccountSnapshotRepository interface {
 	Insert(ctx context.Context, a domain.AccountState) (int64, error)
+	GetLatest(ctx context.Context) (*domain.AccountState, error)
+	GetLatestBefore(ctx context.Context, before time.Time) (*domain.AccountState, error)
 }
 
 // NewPaperBroker creates a new PaperBroker.
@@ -265,7 +278,7 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 		existing, hasPos := pb.openPositions[req.Symbol]
 		if hasPos && !req.ReduceOnly {
 			// Close existing position first (opposite side)
-			pb.closePositionInternal(existing, fillPrice, time.Now())
+			pb.closePositionInternalWithOrder(existing, fillPrice, time.Now(), nil)
 			hasPos = false
 		}
 
@@ -293,22 +306,7 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 			pb.totalFees += fee
 			pb.totalSlippage += slippageAmt * req.Qty
 
-			// Save execution (uses paper-order-ID; will be updated after DB persistence)
-			exec := &domain.Execution{
-				ID:         pb.nextExecID,
-				OrderID:    order.ID,
-				Symbol:     req.Symbol,
-				Side:       req.Side,
-				Qty:        req.Qty,
-				Price:      fillPrice,
-				Fee:        fee,
-				Slippage:   slippageAmt,
-				ExecutedAt: time.Now(),
-			}
-			pb.nextExecID++
-			pb.saveExecution(exec)
-
-			// Atomic protective orders: create first, then persist position with SL/TP.
+			// Atomic protective orders: create first (in-memory), then persist position with SL/TP.
 			if req.StopLoss > 0 || req.TakeProfit > 0 {
 				if !pb.createProtectiveOrdersForPosition(pos, req.StopLoss, req.TakeProfit) {
 					// Position was emergency-closed due to invalid SL.
@@ -324,12 +322,26 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 			order.Status = domain.OrderStatusFilled
 			order.UpdatedAt = time.Now()
 
-			// DB persistence: save position (with SL/TP) and main order (filled)
-			// only after protective state is finalized.
-			pb.savePosition(pos)
+			// DB persistence order: main order → protective orders → position → execution
+			// This ensures all cross-referencing IDs are DB IDs, not paper IDs.
 			pb.saveOrder(&order)
-			// Persist protective orders (STOP_MARKET / TAKE_PROFIT_MARKET).
 			pb.saveProtectiveOrdersForPosition(pos)
+			pb.savePosition(pos)
+			// Save entry execution with DB main order ID
+			pb.saveExecution(&domain.Execution{
+				ID:         pb.nextExecID,
+				OrderID:    order.ID,
+				Symbol:     req.Symbol,
+				Side:       req.Side,
+				Qty:        req.Qty,
+				Price:      fillPrice,
+				Fee:        fee,
+				Slippage:   slippageAmt,
+				ExecutedAt: time.Now(),
+			})
+			pb.nextExecID++
+			// Snapshot account state after entry.
+			pb.saveAccountSnapshotNow()
 		}
 
 		pb.log.Info("market order filled", map[string]any{
@@ -351,13 +363,14 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, req OrderRequest) (domain.O
 		pb.openOrders[order.BrokerOrderID] = &order
 	}
 
-	// Limit orders are stored as pending
+	// Limit orders are stored as pending and persisted immediately.
 	if req.OrderType == domain.OrderTypeLimit {
 		if req.Price == nil || *req.Price <= 0 {
 			return domain.Order{}, fmt.Errorf("price required for LIMIT order")
 		}
 		order.Status = domain.OrderStatusPending
 		pb.openOrders[order.BrokerOrderID] = &order
+		pb.saveOrder(&order)
 	}
 
 	return order, nil
@@ -374,6 +387,7 @@ func (pb *PaperBroker) CancelOrder(_ context.Context, orderID string) error {
 	}
 	order.Status = domain.OrderStatusCancelled
 	order.UpdatedAt = time.Now()
+	pb.updateOrderInDB(order)
 	delete(pb.openOrders, orderID)
 	return nil
 }
@@ -393,7 +407,7 @@ func (pb *PaperBroker) ClosePosition(_ context.Context, symbol string) error {
 		return fmt.Errorf("no price available for %s", symbol)
 	}
 
-	pb.closePositionInternal(pos, price, time.Now())
+	pb.closePositionInternalWithOrder(pos, price, time.Now(), nil)
 	return nil
 }
 
@@ -422,7 +436,7 @@ func (pb *PaperBroker) EmergencyCloseAll(_ context.Context) error {
 			price = pos.EntryPrice // fallback: close at entry (no PnL)
 			pb.log.Error("emergency close: no price, using entry price", map[string]any{"symbol": symbol})
 		}
-		pb.closePositionInternal(pos, price, now)
+		pb.closePositionInternalWithOrder(pos, price, now, nil)
 	}
 
 	pb.log.Error("EMERGENCY CLOSE ALL executed", map[string]any{
@@ -521,14 +535,14 @@ func (pb *PaperBroker) createProtectiveOrdersForPosition(pos *domain.Position, s
 			pb.log.Error("invalid LONG SL >= entry — emergency closing position", map[string]any{
 				"symbol": pos.Symbol, "sl": slPrice, "entry": pos.EntryPrice,
 			})
-			pb.closePositionInternal(pos, pos.EntryPrice, time.Now())
+			pb.closePositionInternalWithOrder(pos, pos.EntryPrice, time.Now(), nil)
 			return false
 		}
 		if pos.Side == domain.SideShort && slPrice <= pos.EntryPrice {
 			pb.log.Error("invalid SHORT SL <= entry — emergency closing position", map[string]any{
 				"symbol": pos.Symbol, "sl": slPrice, "entry": pos.EntryPrice,
 			})
-			pb.closePositionInternal(pos, pos.EntryPrice, time.Now())
+			pb.closePositionInternalWithOrder(pos, pos.EntryPrice, time.Now(), nil)
 			return false
 		}
 	}
@@ -653,7 +667,7 @@ func (pb *PaperBroker) sideFromOrderSide(os domain.OrderSide) domain.Side {
 	return domain.SideShort
 }
 
-func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice float64, now time.Time) {
+func (pb *PaperBroker) closePositionInternalWithOrder(pos *domain.Position, exitPrice float64, now time.Time, closingOrder *domain.Order) {
 	// Cancel sibling protective orders first
 	pb.cancelSiblingOrders(pos)
 
@@ -688,7 +702,9 @@ func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice flo
 	pos.ClosedAt = &now
 
 	// Update account
-	pb.balance += pos.Margin + pnl
+	// Wallet balance model: margin was never subtracted from balance on open,
+	// so only add realized PnL (which already includes exit fee) on close.
+	pb.balance += pnl
 	pb.usedMargin -= pos.Margin
 	pb.realizedPnL += pnl
 	pb.totalFees += fee
@@ -700,6 +716,45 @@ func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice flo
 
 	delete(pb.openPositions, pos.Symbol)
 	pb.closedPositions = append(pb.closedPositions, *pos)
+
+	// Save closing execution
+	closeSide := domain.OrderSideSell
+	if pos.Side == domain.SideShort {
+		closeSide = domain.OrderSideBuy
+	}
+	var closeOrderID int64
+	if closingOrder != nil {
+		closeOrderID = closingOrder.ID
+	} else {
+		// Synthetic MARKET close order for manual/emergency closes.
+		// Never use order_id=0 — traceability invariant.
+		synthOrder := &domain.Order{
+			ID:            pb.nextOrderID,
+			BrokerOrderID: fmt.Sprintf("paper-%d", pb.nextOrderID),
+			Symbol:        pos.Symbol,
+			Side:          closeSide,
+			OrderType:     domain.OrderTypeMarket,
+			Qty:           pos.Size,
+			Status:        domain.OrderStatusFilled,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		pb.nextOrderID++
+		pb.saveOrder(synthOrder)
+		closeOrderID = synthOrder.ID
+	}
+	pb.saveExecution(&domain.Execution{
+		ID:         pb.nextExecID,
+		OrderID:    closeOrderID,
+		Symbol:     pos.Symbol,
+		Side:       closeSide,
+		Qty:        pos.Size,
+		Price:      exitPrice,
+		Fee:        fee,
+		Slippage:   slippageAmt,
+		ExecutedAt: now,
+	})
+	pb.nextExecID++
 
 	// DB persistence: update if already persisted, otherwise insert closed.
 	pb.upsertPosition(pos)
@@ -728,7 +783,7 @@ func (pb *PaperBroker) closePositionInternal(pos *domain.Position, exitPrice flo
 func (pb *PaperBroker) reducePosition(pos *domain.Position, side domain.OrderSide, qty, fillPrice, fee, slippageAmt float64) {
 	if qty >= pos.Size {
 		// Full close
-		pb.closePositionInternal(pos, fillPrice, time.Now())
+		pb.closePositionInternalWithOrder(pos, fillPrice, time.Now(), nil)
 		return
 	}
 
@@ -746,7 +801,7 @@ func (pb *PaperBroker) reducePosition(pos *domain.Position, side domain.OrderSid
 	pos.Margin -= marginFreed
 	pos.RealizedPnL += pnl
 
-	pb.balance += marginFreed + pnl
+	pb.balance += pnl
 	pb.usedMargin -= marginFreed
 	pb.realizedPnL += pnl
 	pb.totalFees += fee
@@ -852,7 +907,7 @@ func (pb *PaperBroker) triggerProtectiveOrder(order *domain.Order, triggerPrice 
 	if !ok {
 		return
 	}
-	pb.closePositionInternal(pos, triggerPrice, now)
+	pb.closePositionInternalWithOrder(pos, triggerPrice, now, order)
 	order.Status = domain.OrderStatusFilled
 	order.UpdatedAt = now
 	pb.updateOrderInDB(order)
@@ -879,6 +934,7 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 		if err := pb.validateStopLoss(order.Side, fillPrice, order.IntendedSL); err != nil {
 			order.Status = domain.OrderStatusRejected
 			order.UpdatedAt = time.Now()
+			pb.updateOrderInDB(order)
 			pb.log.Error("limit fill rejected: invalid StopLoss price", map[string]any{"symbol": order.Symbol, "error": err.Error()})
 			return
 		}
@@ -891,6 +947,8 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 
 	if pb.balance-pb.usedMargin < margin+fee {
 		order.Status = domain.OrderStatusRejected
+		order.UpdatedAt = time.Now()
+		pb.updateOrderInDB(order)
 		pb.log.Error("limit order rejected: insufficient margin", map[string]any{
 			"symbol": order.Symbol,
 		})
@@ -915,7 +973,37 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 	pb.balance -= fee
 	pb.totalFees += fee
 
-	// Save execution for limit fill
+	// Atomic protective orders for limit fills: create first (in-memory), then persist.
+	if order.IntendedSL > 0 || order.IntendedTP > 0 {
+		if !pb.createProtectiveOrdersForPosition(pos, order.IntendedSL, order.IntendedTP) {
+			// Position was emergency-closed due to invalid SL.
+			order.Status = domain.OrderStatusRejected
+			order.UpdatedAt = time.Now()
+			pb.updateOrderInDB(order)
+			pb.log.Error("limit fill rejected: invalid StopLoss price", map[string]any{"symbol": order.Symbol})
+			return
+		}
+	} else {
+		// No SL intended — emergency close (safety invariant)
+		pb.log.Error("limit fill with no SL — emergency closing", map[string]any{"symbol": order.Symbol})
+		pb.closePositionInternalWithOrder(pos, fillPrice, time.Now(), nil)
+		order.Status = domain.OrderStatusRejected
+		order.UpdatedAt = time.Now()
+		pb.updateOrderInDB(order)
+		return
+	}
+
+	// Set SL/TP on position after protective orders are confirmed.
+	pos.StopLoss = order.IntendedSL
+	pos.TakeProfit = order.IntendedTP
+
+	order.Status = domain.OrderStatusFilled
+	order.UpdatedAt = time.Now()
+
+	// DB persistence order: main order → protective orders → position → execution
+	pb.updateOrderInDB(order)
+	pb.saveProtectiveOrdersForPosition(pos)
+	pb.savePosition(pos)
 	pb.saveExecution(&domain.Execution{
 		ID:         pb.nextExecID,
 		OrderID:    order.ID,
@@ -928,40 +1016,8 @@ func (pb *PaperBroker) fillLimitOrder(order *domain.Order, candle domain.Candle)
 		ExecutedAt: time.Now(),
 	})
 	pb.nextExecID++
-
-	// Atomic protective orders for limit fills: create first, then persist.
-	if order.IntendedSL > 0 || order.IntendedTP > 0 {
-		if !pb.createProtectiveOrdersForPosition(pos, order.IntendedSL, order.IntendedTP) {
-			// Position was emergency-closed due to invalid SL.
-			order.Status = domain.OrderStatusRejected
-			order.UpdatedAt = time.Now()
-			pb.saveOrder(order)
-			pb.log.Error("limit fill rejected: invalid StopLoss price", map[string]any{"symbol": order.Symbol})
-			return
-		}
-	} else {
-		// No SL intended — emergency close (safety invariant)
-		pb.log.Error("limit fill with no SL — emergency closing", map[string]any{"symbol": order.Symbol})
-		pb.closePositionInternal(pos, fillPrice, time.Now())
-		order.Status = domain.OrderStatusRejected
-		order.UpdatedAt = time.Now()
-		pb.saveOrder(order)
-		return
-	}
-
-	// Set SL/TP on position after protective orders are confirmed.
-	pos.StopLoss = order.IntendedSL
-	pos.TakeProfit = order.IntendedTP
-
-	order.Status = domain.OrderStatusFilled
-	order.UpdatedAt = time.Now()
-
-	// DB persistence: save position (with SL/TP) and main order (filled)
-	// only after protective state is finalized.
-	pb.savePosition(pos)
-	pb.saveOrder(order)
-	// Persist protective orders (STOP_MARKET / TAKE_PROFIT_MARKET).
-	pb.saveProtectiveOrdersForPosition(pos)
+	// Snapshot account state after entry.
+	pb.saveAccountSnapshotNow()
 
 	pb.log.Info("limit order filled", map[string]any{
 		"symbol":     order.Symbol,
@@ -985,10 +1041,18 @@ func (pb *PaperBroker) ResetDailyLoss() {
 
 // SetProtectiveOrders sets SL and TP orders for a position.
 // Returns error if SL cannot be created (safety invariant).
+// Idempotent: cancels existing SL/TP orders before creating new ones.
 func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, slPrice, tpPrice float64) error {
 	if slPrice <= 0 {
 		return fmt.Errorf("SL price must be > 0 (no position without SL)")
 	}
+
+	// Cancel existing protective orders to avoid duplicates.
+	pb.mu.Lock()
+	if pos, ok := pb.openPositions[symbol]; ok {
+		pb.cancelSiblingOrders(pos)
+	}
+	pb.mu.Unlock()
 
 	pos, ok := pb.GetPosition(symbol)
 	if !ok {
@@ -1149,16 +1213,30 @@ func (pb *PaperBroker) saveExecution(exec *domain.Execution) {
 }
 
 func (pb *PaperBroker) saveAccountSnapshot() {
+	pb.saveAccountSnapshotNow()
+}
+
+func (pb *PaperBroker) saveAccountSnapshotNow() {
 	if pb.snapRepo == nil {
-		return
-	}
-	// Throttle: max once every 5 minutes
-	if time.Since(pb.lastSnapshotAt) < 5*time.Minute {
 		return
 	}
 	pb.lastSnapshotAt = time.Now()
 
-	state, _ := pb.GetAccountState(context.Background())
+	// Must access fields directly since caller holds pb.mu.Lock().
+	// GetAccountState would deadlock on pb.mu.RLock().
+	equity := pb.balance + pb.unrealizedPnL
+	state := domain.AccountState{
+		Balance:          pb.balance,
+		AvailableBalance: pb.balance - pb.usedMargin,
+		UsedMargin:       pb.usedMargin,
+		Equity:           equity,
+		RealizedPnL:      pb.realizedPnL,
+		UnrealizedPnL:    pb.unrealizedPnL,
+		TotalFees:        pb.totalFees,
+		TotalSlippage:    pb.totalSlippage,
+		DailyLoss:        pb.dailyLoss,
+		RecordedAt:       time.Now(),
+	}
 	ctx := context.Background()
 	if _, err := pb.snapRepo.Insert(ctx, state); err != nil {
 		pb.log.Error("failed to save account snapshot", map[string]any{"error": err.Error()})

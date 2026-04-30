@@ -337,11 +337,12 @@ func (r *postgresPositionRepository) Insert(ctx context.Context, p domain.Positi
 		tp = &p.TakeProfit
 	}
 	err := r.db.QueryRowContext(ctx,
-		`INSERT INTO positions (symbol, side, entry_price, size, leverage, margin, stop_loss, take_profit, unrealized_pnl, realized_pnl, status, source, opened_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		`INSERT INTO positions (symbol, side, entry_price, size, leverage, margin, stop_loss, take_profit, unrealized_pnl, realized_pnl, status, source, opened_at, sl_order_id, tp_order_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		 RETURNING id`,
 		p.Symbol, string(p.Side), p.EntryPrice, p.Size, p.Leverage, p.Margin, p.StopLoss, tp,
-		p.UnrealizedPnL, p.RealizedPnL, string(p.Status), p.Source, p.OpenedAt).Scan(&id)
+		p.UnrealizedPnL, p.RealizedPnL, string(p.Status), p.Source, p.OpenedAt,
+		nullableInt64Ptr(p.SLOrderID), nullableInt64Ptr(p.TPOrderID)).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert position: %w", err)
 	}
@@ -359,10 +360,12 @@ func (r *postgresPositionRepository) Update(ctx context.Context, p domain.Positi
 	}
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE positions SET entry_price=$1, size=$2, leverage=$3, margin=$4, stop_loss=$5, take_profit=$6,
-		 unrealized_pnl=$7, realized_pnl=$8, status=$9, source=$10, closed_at=$11
-		 WHERE id=$12`,
+		 unrealized_pnl=$7, realized_pnl=$8, status=$9, source=$10, closed_at=$11,
+		 sl_order_id=$12, tp_order_id=$13
+		 WHERE id=$14`,
 		p.EntryPrice, p.Size, p.Leverage, p.Margin, p.StopLoss, tp,
-		p.UnrealizedPnL, p.RealizedPnL, string(p.Status), p.Source, closedAt, p.ID)
+		p.UnrealizedPnL, p.RealizedPnL, string(p.Status), p.Source, closedAt,
+		nullableInt64Ptr(p.SLOrderID), nullableInt64Ptr(p.TPOrderID), p.ID)
 	if err != nil {
 		return fmt.Errorf("update position: %w", err)
 	}
@@ -372,7 +375,8 @@ func (r *postgresPositionRepository) Update(ctx context.Context, p domain.Positi
 func (r *postgresPositionRepository) GetOpen(ctx context.Context) ([]domain.Position, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, symbol, side, entry_price, size, leverage, margin, stop_loss, take_profit,
-		 unrealized_pnl, realized_pnl, status, source, opened_at, closed_at
+		 unrealized_pnl, realized_pnl, status, source, opened_at, closed_at,
+		 sl_order_id, tp_order_id
 		 FROM positions WHERE status = 'open' ORDER BY opened_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("query open positions: %w", err)
@@ -384,7 +388,8 @@ func (r *postgresPositionRepository) GetOpen(ctx context.Context) ([]domain.Posi
 func (r *postgresPositionRepository) GetClosed(ctx context.Context, since time.Time) ([]domain.Position, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, symbol, side, entry_price, size, leverage, margin, stop_loss, take_profit,
-		 unrealized_pnl, realized_pnl, status, source, opened_at, closed_at
+		 unrealized_pnl, realized_pnl, status, source, opened_at, closed_at,
+		 sl_order_id, tp_order_id
 		 FROM positions WHERE status = 'closed' AND closed_at >= $1 ORDER BY closed_at DESC`, since)
 	if err != nil {
 		return nil, fmt.Errorf("query closed positions: %w", err)
@@ -396,14 +401,17 @@ func (r *postgresPositionRepository) GetClosed(ctx context.Context, since time.T
 func (r *postgresPositionRepository) GetBySymbol(ctx context.Context, symbol string) (*domain.Position, error) {
 	row := r.db.QueryRowContext(ctx,
 		`SELECT id, symbol, side, entry_price, size, leverage, margin, stop_loss, take_profit,
-		 unrealized_pnl, realized_pnl, status, source, opened_at, closed_at
+		 unrealized_pnl, realized_pnl, status, source, opened_at, closed_at,
+		 sl_order_id, tp_order_id
 		 FROM positions WHERE symbol = $1 AND status = 'open'`, symbol)
 	var p domain.Position
 	var side, status, source string
 	var tp sql.NullFloat64
 	var closedAt sql.NullTime
+	var slOrderID, tpOrderID sql.NullInt64
 	err := row.Scan(&p.ID, &p.Symbol, &side, &p.EntryPrice, &p.Size, &p.Leverage, &p.Margin,
-		&p.StopLoss, &tp, &p.UnrealizedPnL, &p.RealizedPnL, &status, &source, &p.OpenedAt, &closedAt)
+		&p.StopLoss, &tp, &p.UnrealizedPnL, &p.RealizedPnL, &status, &source, &p.OpenedAt, &closedAt,
+		&slOrderID, &tpOrderID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -419,6 +427,12 @@ func (r *postgresPositionRepository) GetBySymbol(ctx context.Context, symbol str
 	if closedAt.Valid {
 		p.ClosedAt = &closedAt.Time
 	}
+	if slOrderID.Valid {
+		p.SLOrderID = &slOrderID.Int64
+	}
+	if tpOrderID.Valid {
+		p.TPOrderID = &tpOrderID.Int64
+	}
 	return &p, nil
 }
 
@@ -429,8 +443,10 @@ func scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 		var side, status, source string
 		var tp sql.NullFloat64
 		var closedAt sql.NullTime
+		var slOrderID, tpOrderID sql.NullInt64
 		if err := rows.Scan(&p.ID, &p.Symbol, &side, &p.EntryPrice, &p.Size, &p.Leverage, &p.Margin,
-			&p.StopLoss, &tp, &p.UnrealizedPnL, &p.RealizedPnL, &status, &source, &p.OpenedAt, &closedAt); err != nil {
+			&p.StopLoss, &tp, &p.UnrealizedPnL, &p.RealizedPnL, &status, &source, &p.OpenedAt, &closedAt,
+			&slOrderID, &tpOrderID); err != nil {
 			return nil, fmt.Errorf("scan position: %w", err)
 		}
 		p.Side = domain.Side(side)
@@ -441,6 +457,12 @@ func scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 		}
 		if closedAt.Valid {
 			p.ClosedAt = &closedAt.Time
+		}
+		if slOrderID.Valid {
+			p.SLOrderID = &slOrderID.Int64
+		}
+		if tpOrderID.Valid {
+			p.TPOrderID = &tpOrderID.Int64
 		}
 		positions = append(positions, p)
 	}
@@ -502,6 +524,17 @@ func (r *postgresOrderRepository) GetBySymbol(ctx context.Context, symbol string
 		 FROM orders WHERE symbol = $1 AND status IN ('pending', 'partially_filled') ORDER BY created_at DESC`, symbol)
 	if err != nil {
 		return nil, fmt.Errorf("query orders by symbol: %w", err)
+	}
+	defer rows.Close()
+	return scanOrders(rows)
+}
+
+func (r *postgresOrderRepository) GetAll(ctx context.Context, since time.Time) ([]domain.Order, error) {
+	query := `SELECT id, broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at
+		 FROM orders WHERE created_at >= $1 OR updated_at >= $1 ORDER BY created_at DESC`
+	rows, err := r.db.QueryContext(ctx, query, since)
+	if err != nil {
+		return nil, fmt.Errorf("query all orders: %w", err)
 	}
 	defer rows.Close()
 	return scanOrders(rows)
@@ -606,6 +639,22 @@ func (r *postgresAccountSnapshotRepository) GetLatest(ctx context.Context) (*dom
 	row := r.db.QueryRowContext(ctx,
 		`SELECT id, balance, available_balance, used_margin, equity, realized_pnl, unrealized_pnl, total_fees, total_slippage, daily_loss, recorded_at
 		 FROM account_snapshots ORDER BY recorded_at DESC LIMIT 1`)
+	var a domain.AccountState
+	err := row.Scan(&a.ID, &a.Balance, &a.AvailableBalance, &a.UsedMargin, &a.Equity,
+		&a.RealizedPnL, &a.UnrealizedPnL, &a.TotalFees, &a.TotalSlippage, &a.DailyLoss, &a.RecordedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get latest account snapshot: %w", err)
+	}
+	return &a, nil
+}
+
+func (r *postgresAccountSnapshotRepository) GetLatestBefore(ctx context.Context, before time.Time) (*domain.AccountState, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT id, balance, available_balance, used_margin, equity, realized_pnl, unrealized_pnl, total_fees, total_slippage, daily_loss, recorded_at
+		 FROM account_snapshots WHERE recorded_at < $1 ORDER BY recorded_at DESC LIMIT 1`, before)
 	var a domain.AccountState
 	err := row.Scan(&a.ID, &a.Balance, &a.AvailableBalance, &a.UsedMargin, &a.Equity,
 		&a.RealizedPnL, &a.UnrealizedPnL, &a.TotalFees, &a.TotalSlippage, &a.DailyLoss, &a.RecordedAt)

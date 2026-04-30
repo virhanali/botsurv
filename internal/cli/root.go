@@ -31,5 +31,6 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newReportCmd())
 	root.AddCommand(newPositionsCmd())
 	root.AddCommand(newOrdersCmd())
+	root.AddCommand(newSimulateCmd())
 	return root
 }
