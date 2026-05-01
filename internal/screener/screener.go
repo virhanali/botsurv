@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
@@ -274,8 +275,9 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 	tf, _ := s.md.GetTradeFlow(ctx, cand.Symbol)
 	price, _ := s.md.GetLatestPrice(ctx, cand.Symbol)
 
-	// Compute ATR for context
-	candles1H, _ := s.md.GetCandles(ctx, cand.Symbol, "1H", 15)
+	// Compute ATR and EMA for context.
+	// Need 210 candles for EMA200 (same as evaluateSymbol) + ATR period.
+	candles1H, _ := s.md.GetCandles(ctx, cand.Symbol, "1H", 210)
 	atr := strategy.ATR(candles1H, s.cfg.Strategy.Indicators.ATRPeriod)
 	ema200 := strategy.EMA(candles1H, 200)
 
@@ -320,24 +322,72 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 		}
 	}
 
-	estFee := price * 0.00055
-	estSlip := price * 0.0005
-	ctxObj.CostSummary = &CostSummary{
-		EstimatedFee:      estFee,
-		EstimatedSlippage: estSlip,
-		TotalCost:         estFee + estSlip,
-		CostBps:           (estFee + estSlip) / price * 10000,
+	if price > 0 {
+		estFee := price * 0.00055
+		estSlip := price * 0.0005
+		ctxObj.CostSummary = &CostSummary{
+			EstimatedFee:      estFee,
+			EstimatedSlippage: estSlip,
+			TotalCost:         estFee + estSlip,
+			CostBps:           (estFee + estSlip) / price * 10000,
+		}
 	}
 
 	ctxObj.RiskSummary = &RiskSummary{
 		MaxOpenPositions: s.cfg.PortfolioRisk.MaxOpenPositions,
 	}
 
+	// Sanitize NaN/Inf values that would break JSON marshal.
+	sanitizeContext(&ctxObj)
+
 	b, err := json.Marshal(ctxObj)
 	if err != nil {
 		return "", fmt.Errorf("marshal context: %w", err)
 	}
 	return string(b), nil
+}
+
+// sanitizeContext replaces NaN and +/-Inf float64 values with 0
+// to prevent json.Marshal from failing.
+func sanitizeContext(c *CandidateContext) {
+	c.ProposedEntry = sanitizeFloat(c.ProposedEntry)
+	c.StopLoss = sanitizeFloat(c.StopLoss)
+	c.TakeProfit = sanitizeFloat(c.TakeProfit)
+	c.RR = sanitizeFloat(c.RR)
+	c.SetupScore = sanitizeFloat(c.SetupScore)
+	c.ExpectedMove = sanitizeFloat(c.ExpectedMove)
+
+	if c.OrderBook != nil {
+		c.OrderBook.SpreadBps = sanitizeFloat(c.OrderBook.SpreadBps)
+		c.OrderBook.BidDepth = sanitizeFloat(c.OrderBook.BidDepth)
+		c.OrderBook.AskDepth = sanitizeFloat(c.OrderBook.AskDepth)
+		c.OrderBook.SlippageBps = sanitizeFloat(c.OrderBook.SlippageBps)
+	}
+
+	if c.TradeFlow != nil {
+		c.TradeFlow.BuySellRatio = sanitizeFloat(c.TradeFlow.BuySellRatio)
+	}
+
+	if c.RegimeSummary != nil {
+		c.RegimeSummary.EMA200 = sanitizeFloat(c.RegimeSummary.EMA200)
+		c.RegimeSummary.PriceVsEMA = sanitizeFloat(c.RegimeSummary.PriceVsEMA)
+		c.RegimeSummary.ATR = sanitizeFloat(c.RegimeSummary.ATR)
+		c.RegimeSummary.ATRPct = sanitizeFloat(c.RegimeSummary.ATRPct)
+	}
+
+	if c.CostSummary != nil {
+		c.CostSummary.EstimatedFee = sanitizeFloat(c.CostSummary.EstimatedFee)
+		c.CostSummary.EstimatedSlippage = sanitizeFloat(c.CostSummary.EstimatedSlippage)
+		c.CostSummary.TotalCost = sanitizeFloat(c.CostSummary.TotalCost)
+		c.CostSummary.CostBps = sanitizeFloat(c.CostSummary.CostBps)
+	}
+}
+
+func sanitizeFloat(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return v
 }
 
 // helpers

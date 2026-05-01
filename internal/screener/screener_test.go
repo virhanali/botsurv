@@ -2,6 +2,7 @@ package screener
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/virhan/botsurv/internal/app"
@@ -271,6 +272,73 @@ func TestEvaluateLLMEligibility_RequireExecutionOkTrue_BlocksBadSpreadSlippage(t
 	}
 	if !foundSlippage {
 		t.Errorf("expected slippage_too_high, got %v", result.LLMRoutingReasonCodes)
+	}
+}
+
+func TestSanitizeContext_NaNInf(t *testing.T) {
+	c := &CandidateContext{
+		Symbol:        "BTCUSDT",
+		ProposedEntry: math.NaN(),
+		StopLoss:      math.Inf(1),
+		TakeProfit:    math.Inf(-1),
+		RR:            2.0,
+		SetupScore:    80.0,
+		OrderBook: &OrderBookSummary{
+			SpreadBps:   math.NaN(),
+			BidDepth:    math.Inf(1),
+			AskDepth:    math.Inf(-1),
+			SlippageBps: math.NaN(),
+		},
+		TradeFlow: &TradeFlowSummary{
+			BuySellRatio: math.NaN(),
+			TradeCount:   100,
+		},
+		RegimeSummary: &RegimeSummary{
+			EMA200:     math.Inf(1),
+			PriceVsEMA: math.NaN(),
+			ATR:        math.Inf(-1),
+			ATRPct:     math.NaN(),
+		},
+		CostSummary: &CostSummary{
+			EstimatedFee:      math.NaN(),
+			EstimatedSlippage: math.Inf(1),
+			TotalCost:         math.Inf(-1),
+			CostBps:           math.NaN(),
+		},
+	}
+
+	sanitizeContext(c)
+
+	// Verify all NaN/Inf values replaced with 0
+	fields := map[string]float64{
+		"ProposedEntry": c.ProposedEntry,
+		"StopLoss":      c.StopLoss,
+		"TakeProfit":    c.TakeProfit,
+		"SpreadBps":     c.OrderBook.SpreadBps,
+		"BidDepth":      c.OrderBook.BidDepth,
+		"AskDepth":      c.OrderBook.AskDepth,
+		"SlippageBps":   c.OrderBook.SlippageBps,
+		"BuySellRatio":  c.TradeFlow.BuySellRatio,
+		"EMA200":        c.RegimeSummary.EMA200,
+		"PriceVsEMA":    c.RegimeSummary.PriceVsEMA,
+		"ATR":           c.RegimeSummary.ATR,
+		"ATRPct":        c.RegimeSummary.ATRPct,
+		"EstimatedFee":  c.CostSummary.EstimatedFee,
+		"EstSlippage":   c.CostSummary.EstimatedSlippage,
+		"TotalCost":     c.CostSummary.TotalCost,
+		"CostBps":       c.CostSummary.CostBps,
+	}
+
+	for name, val := range fields {
+		if val != 0 {
+			t.Errorf("expected %s=0 after sanitize, got %v", name, val)
+		}
+	}
+
+	// Verify JSON marshal succeeds after sanitization
+	_, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("json.Marshal failed after sanitize: %v", err)
 	}
 }
 
