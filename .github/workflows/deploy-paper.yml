@@ -122,8 +122,8 @@ jobs:
           . /etc/botsurv/paper.env
           set +a
 
-          ./bot config validate --config "$APP_DIR/configs/paper.vps.yaml"
-          ./bot init --config "$APP_DIR/configs/paper.vps.yaml" --migrations-dir "$APP_DIR/migrations"
+          ./bot config validate --config "$APP_DIR/configs/paper.deepseek.yaml"
+          ./bot init --config "$APP_DIR/configs/paper.deepseek.yaml" --migrations-dir "$APP_DIR/migrations"
 
           systemctl restart botsurv-paper.service
           systemctl --no-pager --full status botsurv-paper.service
