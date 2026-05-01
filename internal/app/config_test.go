@@ -195,7 +195,7 @@ portfolio_risk:
 sizing:
   method: fixed_margin
   margin_per_trade_usd: 100
-  max_leverage: 10
+  max_leverage: 5
 llm:
   enabled: false
 alerts:
@@ -498,5 +498,18 @@ func TestConfigValidate_TargetNotionalPositive(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "target notional must be > 0") {
 		t.Errorf("expected target notional error, got: %v", err)
+	}
+}
+
+func TestConfig_RejectLeverageMismatch(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Sizing.MaxLeverage = 5
+	cfg.Broker.Paper.DefaultLeverage = 10
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected leverage mismatch validation error")
+	}
+	if !strings.Contains(err.Error(), "sizing.max_leverage") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

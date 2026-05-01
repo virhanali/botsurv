@@ -267,6 +267,22 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 }
 
 func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (string, error) {
+	if !isFinitePositive(cand.ProposedEntry) {
+		return "", fmt.Errorf("invalid proposed entry: %v", cand.ProposedEntry)
+	}
+	if !isFinitePositive(cand.ProposedStopLoss) {
+		return "", fmt.Errorf("invalid stop loss: %v", cand.ProposedStopLoss)
+	}
+	if cand.ProposedTakeProfit > 0 && !isFinite(cand.ProposedTakeProfit) {
+		return "", fmt.Errorf("invalid take profit: %v", cand.ProposedTakeProfit)
+	}
+	if !isFiniteNonNegative(cand.SetupScore) {
+		return "", fmt.Errorf("invalid setup score: %v", cand.SetupScore)
+	}
+	if !isFiniteNonNegative(cand.ExpectedMove) {
+		return "", fmt.Errorf("invalid expected move: %v", cand.ExpectedMove)
+	}
+
 	targetNotional := s.cfg.ComputeTargetNotional()
 	var ob domain.OrderBookSummary
 	if targetNotional > 0 {
@@ -280,6 +296,15 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 	candles1H, _ := s.md.GetCandles(ctx, cand.Symbol, "1H", 210)
 	atr := strategy.ATR(candles1H, s.cfg.Strategy.Indicators.ATRPeriod)
 	ema200 := strategy.EMA(candles1H, 200)
+	if !isFiniteNonNegative(atr) {
+		return "", fmt.Errorf("invalid ATR: %v", atr)
+	}
+	if ema200 > 0 && !isFinitePositive(ema200) {
+		return "", fmt.Errorf("invalid EMA200: %v", ema200)
+	}
+	if price > 0 && !isFinitePositive(price) {
+		return "", fmt.Errorf("invalid latest price: %v", price)
+	}
 
 	ctxObj := CandidateContext{
 		Symbol:        cand.Symbol,
@@ -393,6 +418,10 @@ func sanitizeFloat(v float64) float64 {
 // helpers
 
 func computeScoresFromOB(ob domain.OrderBookSummary, atr, price float64) (liq, exec, vol float64) {
+	if math.IsNaN(ob.SpreadBps) || math.IsInf(ob.SpreadBps, 0) {
+		return 0, 0, 0
+	}
+
 	depth := ob.BidDepth + ob.AskDepth
 	liq = 30.0
 	if ob.SpreadBps > 0 {
@@ -439,6 +468,12 @@ func evaluateLLMEligibility(
 	}
 
 	reasons := []string{}
+	if math.IsNaN(cand.CandidateScore) || math.IsInf(cand.CandidateScore, 0) {
+		reasons = append(reasons, "candidate_score_non_finite")
+		cand.LLMEligible = false
+		cand.LLMRoutingReasonCodes = reasons
+		return cand
+	}
 	if cand.CandidateScore < minScore {
 		reasons = append(reasons, "candidate_score_below_threshold")
 	}
@@ -465,6 +500,18 @@ func evaluateLLMEligibility(
 	cand.LLMEligible = len(reasons) == 0
 	cand.LLMRoutingReasonCodes = reasons
 	return cand
+}
+
+func isFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+func isFinitePositive(v float64) bool {
+	return isFinite(v) && v > 0
+}
+
+func isFiniteNonNegative(v float64) bool {
+	return isFinite(v) && v >= 0
 }
 
 func clamp(v, minV, maxV float64) float64 {

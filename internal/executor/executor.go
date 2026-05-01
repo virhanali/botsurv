@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/virhan/botsurv/internal/broker"
 	"github.com/virhan/botsurv/internal/domain"
@@ -40,8 +41,14 @@ func (e *Executor) Execute(ctx context.Context, cand domain.Candidate, decision 
 	}
 
 	qty := riskOut.FinalPositionNotional / cand.ProposedEntry
-	if qty <= 0 {
-		result.Error = "computed quantity is zero"
+	if math.IsNaN(qty) || math.IsInf(qty, 0) || qty <= 0 {
+		result.Error = fmt.Sprintf("invalid quantity: %v", qty)
+		e.log.Error("invalid quantity", map[string]any{
+			"qty":      qty,
+			"notional": riskOut.FinalPositionNotional,
+			"entry":    cand.ProposedEntry,
+			"symbol":   cand.Symbol,
+		})
 		return result
 	}
 

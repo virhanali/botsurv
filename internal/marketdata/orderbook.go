@@ -46,11 +46,17 @@ func (s *orderBookStore) reset(symbol string, updateID, seq int64, bids, asks []
 		lastUpdate: time.Now().UTC(),
 	}
 	for _, l := range bids {
+		if l.Price <= 0 || l.Size < 0 || math.IsNaN(l.Price) || math.IsInf(l.Price, 0) || math.IsNaN(l.Size) || math.IsInf(l.Size, 0) {
+			continue
+		}
 		if l.Size > 0 {
 			ob.bids[formatPrice(l.Price)] = l.Size
 		}
 	}
 	for _, l := range asks {
+		if l.Price <= 0 || l.Size < 0 || math.IsNaN(l.Price) || math.IsInf(l.Price, 0) || math.IsNaN(l.Size) || math.IsInf(l.Size, 0) {
+			continue
+		}
 		if l.Size > 0 {
 			ob.asks[formatPrice(l.Price)] = l.Size
 		}
@@ -83,6 +89,9 @@ func (s *orderBookStore) applyDelta(symbol string, updateID, seq int64, bids, as
 	}
 
 	for _, l := range bids {
+		if l.Price <= 0 || l.Size < 0 || math.IsNaN(l.Price) || math.IsInf(l.Price, 0) || math.IsNaN(l.Size) || math.IsInf(l.Size, 0) {
+			continue
+		}
 		key := formatPrice(l.Price)
 		if l.Size == 0 {
 			delete(ob.bids, key)
@@ -91,6 +100,9 @@ func (s *orderBookStore) applyDelta(symbol string, updateID, seq int64, bids, as
 		}
 	}
 	for _, l := range asks {
+		if l.Price <= 0 || l.Size < 0 || math.IsNaN(l.Price) || math.IsInf(l.Price, 0) || math.IsNaN(l.Size) || math.IsInf(l.Size, 0) {
+			continue
+		}
 		key := formatPrice(l.Price)
 		if l.Size == 0 {
 			delete(ob.asks, key)
@@ -138,11 +150,23 @@ func (s *orderBookStore) summary(symbol string, targetNotional float64, side str
 	if bestBid > 0 && bestAsk > 0 && bestAsk > bestBid {
 		spreadBps = (bestAsk - bestBid) / ((bestAsk + bestBid) / 2) * 10000
 	}
+	if math.IsNaN(spreadBps) || math.IsInf(spreadBps, 0) || spreadBps < 0 {
+		return domain.OrderBookSummary{
+			Symbol:     symbol,
+			BestBid:    bestBid,
+			BestAsk:    bestAsk,
+			LastUpdate: ob.lastUpdate,
+			Stale:      true,
+		}
+	}
 
 	bidDepth := sumDepth(bidLevels)
 	askDepth := sumDepth(askLevels)
 
 	estSlippageBps := estimateSlippage(bestBid, bestAsk, bidLevels, askLevels, targetNotional, side)
+	if math.IsNaN(estSlippageBps) {
+		estSlippageBps = 0
+	}
 
 	depthToPosRatio := 0.0
 	if targetNotional > 0 {

@@ -1,6 +1,7 @@
 package risk
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -494,4 +495,26 @@ func TestValidate_AcceptsConfidenceAtThreshold(t *testing.T) {
 	if !output.Approved {
 		t.Errorf("expected approved at confidence 0.6, got rejected: %v", output.ReasonCodes)
 	}
+}
+
+func TestRiskEngine_RejectNaNEquity(t *testing.T) {
+	e := NewEngine(defaultConfig())
+	input := validInput()
+	input.AccountState.Equity = math.NaN()
+	output := e.Validate(input)
+	if output.Approved {
+		t.Fatal("expected rejection for NaN equity")
+	}
+	assertContainsReason(t, output.ReasonCodes, "INVALID_EQUITY")
+}
+
+func TestRiskEngine_RejectZeroEntry(t *testing.T) {
+	e := NewEngine(defaultConfig())
+	input := validInput()
+	input.ProposedTrade.ProposedEntry = 0
+	output := e.Validate(input)
+	if output.Approved {
+		t.Fatal("expected rejection for zero entry")
+	}
+	assertContainsReason(t, output.ReasonCodes, "INVALID_ENTRY")
 }

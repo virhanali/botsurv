@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -243,8 +244,40 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		// Risk validation with real market data
 		monitorStatus := s.monitor.Status(ctx)
 		targetNotional := s.cfg.ComputeTargetNotional()
-		ob, _ := s.md.GetOrderBookSummary(ctx, cand.Symbol, targetNotional, string(cand.Side))
-		marketPrice, _ := s.md.GetLatestPrice(ctx, cand.Symbol)
+		ob, err := s.md.GetOrderBookSummary(ctx, cand.Symbol, targetNotional, string(cand.Side))
+		if err != nil {
+			s.log.Warn("orderbook unavailable", map[string]any{
+				"symbol": cand.Symbol,
+				"error":  err.Error(),
+			})
+			riskOut := risk.ValidateOutput{
+				Approved:    false,
+				ReasonCodes: []string{"MARKET_DATA_UNAVAILABLE"},
+			}
+			s.saveRiskDecision(ctx, riskOut, candID, cycleID)
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "RISK_REJECTED"})
+			continue
+		}
+
+		marketPrice, err := s.md.GetLatestPrice(ctx, cand.Symbol)
+		if err != nil || marketPrice <= 0 || math.IsNaN(marketPrice) || math.IsInf(marketPrice, 0) {
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			}
+			s.log.Warn("price unavailable", map[string]any{
+				"symbol": cand.Symbol,
+				"error":  errMsg,
+				"price":  marketPrice,
+			})
+			riskOut := risk.ValidateOutput{
+				Approved:    false,
+				ReasonCodes: []string{"PRICE_UNAVAILABLE"},
+			}
+			s.saveRiskDecision(ctx, riskOut, candID, cycleID)
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "RISK_REJECTED"})
+			continue
+		}
 
 		riskInput := risk.ValidateInput{
 			ProposedTrade: cand.ProposedTrade,

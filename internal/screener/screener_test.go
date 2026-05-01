@@ -92,6 +92,40 @@ func TestEvaluateLLMEligibility_ScoreTooLow(t *testing.T) {
 	}
 }
 
+func TestScreener_RejectNaNScore(t *testing.T) {
+	cand := domain.Candidate{
+		ProposedTrade: domain.ProposedTrade{
+			RR:                 2.5,
+			ExpectedMove:       100,
+			EstimatedTotalCost: 10,
+		},
+		CandidateScore: math.NaN(),
+	}
+	ob := domain.OrderBookSummary{
+		SpreadBps:                10,
+		EstimatedSlippageBps:     5,
+		DepthToPositionSizeRatio: 0.5,
+	}
+
+	cfg := defaultTestConfig()
+	result := evaluateLLMEligibility(cand, ob, cfg.Universe.Filters, cfg.LLMRouting, cfg.Strategy)
+	if result.LLMEligible {
+		t.Fatal("expected non-finite score candidate to be rejected")
+	}
+}
+
+func TestComputeScoresFromOB_InvalidSpreadReturnsZero(t *testing.T) {
+	ob := domain.OrderBookSummary{
+		SpreadBps: math.NaN(),
+		BidDepth:  100,
+		AskDepth:  100,
+	}
+	liq, exec, vol := computeScoresFromOB(ob, 100, 10000)
+	if liq != 0 || exec != 0 || vol != 0 {
+		t.Fatalf("expected zero scores for invalid spread, got %.2f %.2f %.2f", liq, exec, vol)
+	}
+}
+
 func TestCandidateContext_JSON(t *testing.T) {
 	ctx := CandidateContext{
 		Symbol:        "BTCUSDT",

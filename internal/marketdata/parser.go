@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -235,6 +236,9 @@ func getFloat(m map[string]interface{}, key string) (float64, error) {
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("invalid %s: non-finite value %v", key, f)
 	}
 	return f, nil
 }

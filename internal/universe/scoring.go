@@ -9,6 +9,10 @@ import (
 
 // computeScores calculates liquidity, execution, and volatility scores from market data.
 func computeScores(ob domain.OrderBookSummary, atr, price float64) (liquidity, execution, volatility float64) {
+	if math.IsNaN(ob.SpreadBps) || math.IsInf(ob.SpreadBps, 0) {
+		return 0, 0, 0
+	}
+
 	// Liquidity score: higher depth, lower spread = higher score
 	depth := ob.BidDepth + ob.AskDepth
 	liquidity = 30.0 // base
@@ -76,6 +80,12 @@ func evaluateLLMEligibility(
 	}
 
 	reasons := []string{}
+	if math.IsNaN(cand.CandidateScore) || math.IsInf(cand.CandidateScore, 0) {
+		reasons = append(reasons, "candidate_score_non_finite")
+		cand.LLMEligible = false
+		cand.LLMRoutingReasonCodes = reasons
+		return cand
+	}
 
 	if cand.CandidateScore < minScore {
 		reasons = append(reasons, "candidate_score_below_threshold")

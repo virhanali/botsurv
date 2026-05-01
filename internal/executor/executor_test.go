@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/virhan/botsurv/internal/app"
@@ -177,5 +178,33 @@ func TestExecute_InsufficientBalance(t *testing.T) {
 	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut)
 	if result.Success {
 		t.Error("expected failure for insufficient balance")
+	}
+}
+
+func TestExecutor_RejectNaNQuantity(t *testing.T) {
+	ex, pb := newTestExecutor()
+	pb.UpdatePrice("BTCUSDT", 65000)
+
+	cand := domain.Candidate{
+		ProposedTrade: domain.ProposedTrade{
+			Symbol:             "BTCUSDT",
+			Side:               domain.SideLong,
+			EntryType:          domain.EntryTypeMarket,
+			ProposedEntry:      math.NaN(),
+			ProposedStopLoss:   64000,
+			ProposedTakeProfit: 67000,
+		},
+	}
+	riskOut := risk.ValidateOutput{
+		Approved:              true,
+		FinalPositionNotional: 100,
+	}
+
+	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut)
+	if result.Success {
+		t.Fatal("expected rejection for NaN quantity")
+	}
+	if result.Error == "" {
+		t.Fatal("expected error message for invalid quantity")
 	}
 }

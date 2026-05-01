@@ -170,9 +170,9 @@ func TestCandleCloseDetection(t *testing.T) {
 func TestCandleCacheUpdate(t *testing.T) {
 	cache := newCandleCache()
 
-	c1 := domain.Candle{Symbol: "BTCUSDT", Timeframe: "15m", OpenTime: 100, Close: 100}
-	c2 := domain.Candle{Symbol: "BTCUSDT", Timeframe: "15m", OpenTime: 200, Close: 200}
-	c3 := domain.Candle{Symbol: "BTCUSDT", Timeframe: "15m", OpenTime: 100, Close: 101} // update c1
+	c1 := domain.Candle{Symbol: "BTCUSDT", Timeframe: "15m", OpenTime: 100, Open: 99, High: 101, Low: 98, Close: 100, Volume: 1}
+	c2 := domain.Candle{Symbol: "BTCUSDT", Timeframe: "15m", OpenTime: 200, Open: 199, High: 201, Low: 198, Close: 200, Volume: 1}
+	c3 := domain.Candle{Symbol: "BTCUSDT", Timeframe: "15m", OpenTime: 100, Open: 100, High: 102, Low: 99, Close: 101, Volume: 1} // update c1
 
 	cache.update("BTCUSDT", "15m", c2)
 	cache.update("BTCUSDT", "15m", c1)
@@ -203,7 +203,11 @@ func TestCandleCacheBounded(t *testing.T) {
 			Symbol:    "BTCUSDT",
 			Timeframe: "15m",
 			OpenTime:  int64(i),
+			Open:      float64(i + 1),
+			High:      float64(i + 2),
+			Low:       float64(i + 1),
 			Close:     float64(i),
+			Volume:    1,
 		})
 	}
 
@@ -310,7 +314,11 @@ func TestIsHealthyRequiresConfiguredTimeframes(t *testing.T) {
 		Symbol:    "BTCUSDT",
 		Timeframe: "15m",
 		OpenTime:  1,
+		Open:      99,
+		High:      101,
+		Low:       98,
 		Close:     100,
+		Volume:    1,
 	})
 
 	if svc.IsHealthy("BTCUSDT") {
@@ -321,7 +329,11 @@ func TestIsHealthyRequiresConfiguredTimeframes(t *testing.T) {
 		Symbol:    "BTCUSDT",
 		Timeframe: "1H",
 		OpenTime:  1,
+		Open:      99,
+		High:      101,
+		Low:       98,
 		Close:     100,
+		Volume:    1,
 	})
 	if !svc.IsHealthy("BTCUSDT") {
 		t.Fatal("expected healthy with price and all configured timeframes fresh")

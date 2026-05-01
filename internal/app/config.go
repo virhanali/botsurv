@@ -310,6 +310,12 @@ func (c *UserConfig) Validate() error {
 	if err := c.Broker.Paper.validate(); err != nil {
 		return err
 	}
+	if c.Sizing.MaxLeverage > 0 && c.Broker.Paper.DefaultLeverage > 0 {
+		if c.Sizing.MaxLeverage != c.Broker.Paper.DefaultLeverage {
+			return fmt.Errorf("sizing.max_leverage (%.1f) must equal broker.paper.default_leverage (%.1f)",
+				c.Sizing.MaxLeverage, c.Broker.Paper.DefaultLeverage)
+		}
+	}
 	if c.ComputeTargetNotional() <= 0 {
 		return errors.New("target notional must be > 0: set sizing.margin_per_trade_usd and sizing.max_leverage (or portfolio_risk equivalents)")
 	}

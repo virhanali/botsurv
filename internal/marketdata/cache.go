@@ -1,6 +1,7 @@
 package marketdata
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -32,6 +33,17 @@ func newCandleCache() *candleCache {
 // update adds or replaces a candle in the cache. It keeps candles sorted by OpenTime
 // and trims the oldest entries when the per-key cap is exceeded.
 func (c *candleCache) update(symbol, timeframe string, candle domain.Candle) {
+	if candle.Open <= 0 || candle.High <= 0 || candle.Low <= 0 || candle.Close <= 0 || candle.Volume < 0 {
+		return
+	}
+	if math.IsNaN(candle.Open) || math.IsInf(candle.Open, 0) ||
+		math.IsNaN(candle.High) || math.IsInf(candle.High, 0) ||
+		math.IsNaN(candle.Low) || math.IsInf(candle.Low, 0) ||
+		math.IsNaN(candle.Close) || math.IsInf(candle.Close, 0) ||
+		math.IsNaN(candle.Volume) || math.IsInf(candle.Volume, 0) {
+		return
+	}
+
 	key := candleKey(symbol, timeframe)
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -43,6 +43,7 @@ func NewEngine(cfg app.UserConfig) *Engine {
 // ValidateInput holds all inputs for risk validation.
 type ValidateInput struct {
 	ProposedTrade domain.ProposedTrade
+	SymbolInfo    domain.SymbolInfo
 	LLMDecision   domain.LLMDecision
 	AccountState  domain.AccountState
 	MarketState   MarketState
@@ -64,6 +65,40 @@ type ValidateOutput struct {
 // Validate performs all risk checks and returns APPROVED or REJECTED.
 func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 	var reasons []string
+
+	if !isFinitePositive(input.AccountState.Equity) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_EQUITY"}}
+	}
+	if !isFinitePositive(input.ProposedTrade.ProposedEntry) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_ENTRY"}}
+	}
+	if input.ProposedTrade.ProposedStopLoss <= 0 {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"SL_MISSING"}}
+	}
+	if !isFinitePositive(input.ProposedTrade.ProposedStopLoss) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_STOP_LOSS"}}
+	}
+	if !isFiniteNonNegative(input.ProposedTrade.SetupScore) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_SETUP_SCORE"}}
+	}
+	if !isFiniteNonNegative(input.ProposedTrade.ExpectedMove) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_EXPECTED_MOVE"}}
+	}
+	if !isFiniteNonNegative(input.ProposedTrade.EstimatedTotalCost) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_ESTIMATED_COST"}}
+	}
+	if !isFiniteNonNegative(input.MarketState.SpreadBps) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_SPREAD"}}
+	}
+	if !isFiniteNonNegative(input.MarketState.SlippageBps) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_SLIPPAGE"}}
+	}
+	if !isFiniteNonNegative(input.MarketState.DepthRatio) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_DEPTH"}}
+	}
+	if !isFinitePositive(input.MarketState.Price) {
+		return ValidateOutput{Approved: false, ReasonCodes: []string{"INVALID_MARKET_PRICE"}}
+	}
 
 	// 0. LLM decision validation (Risk Engine is final authority)
 	if !isValidLLMDecision(input.LLMDecision) {
@@ -240,9 +275,15 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 	if leverage <= 0 {
 		leverage = e.cfg.Broker.Paper.DefaultLeverage
 	}
-	symbolMaxLev := 100.0 // would come from symbol info
+	symbolMaxLev := input.SymbolInfo.MaxLeverage
+	if symbolMaxLev <= 0 {
+		symbolMaxLev = 100.0
+	}
 	if leverage > symbolMaxLev {
 		reasons = append(reasons, "LEVERAGE_EXCEEDS_MAX")
+	}
+	if leverage <= 0 {
+		reasons = append(reasons, "INVALID_LEVERAGE")
 	}
 
 	// Sizing
@@ -254,7 +295,10 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 		finalNotional = baseNotional * input.LLMDecision.SizeMultiplier
 	}
 
-	margin := finalNotional / leverage
+	margin := 0.0
+	if leverage > 0 {
+		margin = finalNotional / leverage
+	}
 	slPct := e.stopLossPercent(input.ProposedTrade)
 	estimatedLoss := finalNotional * slPct / 100
 
@@ -329,13 +373,23 @@ func (e *Engine) estimateNotional(input ValidateInput) float64 {
 }
 
 func (e *Engine) computeBaseNotional(input ValidateInput) float64 {
+	if !isFinitePositive(input.ProposedTrade.ProposedEntry) || !isFinitePositive(input.ProposedTrade.ProposedStopLoss) {
+		return 0
+	}
+
 	leverage := e.cfg.Sizing.MaxLeverage
 	if leverage <= 0 {
 		leverage = e.cfg.Broker.Paper.DefaultLeverage
 	}
+	if !isFinitePositive(leverage) {
+		return 0
+	}
 	marginPerTrade := e.cfg.Sizing.MarginPerTradeUSD
 	if marginPerTrade <= 0 {
 		marginPerTrade = e.cfg.PortfolioRisk.MarginPerTradeUSD
+	}
+	if !isFinitePositive(marginPerTrade) {
+		return 0
 	}
 
 	positionByMargin := marginPerTrade * leverage
@@ -350,8 +404,11 @@ func (e *Engine) computeBaseNotional(input ValidateInput) float64 {
 	if slPct > 0 {
 		positionByRisk = riskAmount / (slPct / 100)
 	}
-
-	return math.Min(positionByMargin, positionByRisk)
+	out := math.Min(positionByMargin, positionByRisk)
+	if math.IsNaN(out) || math.IsInf(out, 0) || out < 0 {
+		return 0
+	}
+	return out
 }
 
 func (e *Engine) stopLossPercent(pt domain.ProposedTrade) float64 {
@@ -370,6 +427,14 @@ func isValidLLMDecision(d domain.LLMDecision) bool {
 		"REDUCE_SIZE": true, "BLOCK": true,
 	}
 	return valid[d.Decision]
+}
+
+func isFinitePositive(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0
+}
+
+func isFiniteNonNegative(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0
 }
 
 // GetRejectionReason returns a human-readable rejection reason for a code.

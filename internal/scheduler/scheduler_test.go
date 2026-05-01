@@ -73,10 +73,16 @@ func (m *mockCandleRepo) GetBySymbolTimeframe(ctx context.Context, symbol, timef
 }
 
 type mockMarketData struct {
-	candles map[string][]domain.Candle
+	candles      map[string][]domain.Candle
+	orderbookErr error
+	priceErr     error
+	price        float64
 }
 
 func (m *mockMarketData) GetOrderBookSummary(ctx context.Context, symbol string, targetNotional float64, side string) (domain.OrderBookSummary, error) {
+	if m.orderbookErr != nil {
+		return domain.OrderBookSummary{}, m.orderbookErr
+	}
 	return domain.OrderBookSummary{BestBid: 100, BestAsk: 101, SpreadBps: 1, BidDepth: 100, AskDepth: 100, EstimatedSlippageBps: 5, DepthToPositionSizeRatio: 10}, nil
 }
 func (m *mockMarketData) GetCandles(ctx context.Context, symbol, timeframe string, limit int) ([]domain.Candle, error) {
@@ -137,6 +143,12 @@ func (m *mockMarketData) GetCandles(ctx context.Context, symbol, timeframe strin
 	return candles, nil
 }
 func (m *mockMarketData) GetLatestPrice(ctx context.Context, symbol string) (float64, error) {
+	if m.priceErr != nil {
+		return 0, m.priceErr
+	}
+	if m.price > 0 {
+		return m.price, nil
+	}
 	return 65000, nil
 }
 func (m *mockMarketData) IsHealthy(symbol string) bool { return true }
@@ -658,6 +670,120 @@ func TestScheduler_RunOnce_CallsGetOrderBookSummaryWithTargetNotional(t *testing
 	}
 	if md.lastSide == "" {
 		t.Error("expected non-empty side passed to GetOrderBookSummary")
+	}
+}
+
+func TestScheduler_SkipZeroPrice(t *testing.T) {
+	cycleRepo := &mockCycleRepo{}
+	candidateRepo := &mockCandidateRepo{}
+	riskDecisionRepo := &mockRiskDecisionRepo{}
+	universeRepo := &mockUniverseRepo{
+		symbols: []domain.UniverseSymbol{
+			{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT", Status: "Trading", QuoteAsset: "USDT", MinNotional: 10}},
+		},
+	}
+
+	log := logger.New(nil, logger.LevelDebug)
+	cfg := app.UserConfig{
+		App: app.AppConfig{
+			Mode:                 "paper",
+			CycleIntervalSeconds: 900,
+		},
+		Universe: app.UniverseConfig{
+			Mode: "all_usdt_perpetual",
+		},
+		Strategy: app.StrategyConfig{
+			Enabled: true,
+			Timeframes: app.TimeframesConfig{
+				Context:   "1H",
+				Setup:     "15m",
+				Execution: "15m",
+			},
+			Indicators: app.IndicatorsConfig{
+				ATRPeriod:                  14,
+				EMA200Period:               200,
+				VolumeSMAPeriod:            20,
+				RangeCandles:               20,
+				MinVolumeRatio:             1.0,
+				MaxBreakoutExtensionATR:    2.0,
+				MaxDistanceFromBreakoutATR: 1.0,
+				MinRR:                      1.5,
+			},
+			Regime: app.RegimeConfig{
+				TrendUpMinDistanceFromEMAPct:   1.0,
+				TrendDownMaxDistanceFromEMAPct: -1.0,
+				RangeMaxDistanceFromEMAPct:     0.5,
+			},
+		},
+		LLMRouting: app.LLMRoutingConfig{
+			Mode:              "off",
+			MinCandidateScore: 1.0,
+		},
+		PortfolioRisk: app.PortfolioRiskConfig{
+			MaxOpenPositions:          5,
+			MaxRiskPerTradePct:        1.0,
+			MaxDailyLossPct:           3.0,
+			MaxTotalExposureUSD:       100000,
+			MaxTotalMarginUsedPct:     50.0,
+			MaxLeverage:               10.0,
+			MinNotionalUSD:            10.0,
+			MarginPerTradeUSD:         100.0,
+			MaxNewPositionsPerCycle:   2,
+			MaxSameDirectionPositions: 5,
+		},
+		Sizing: app.SizingConfig{
+			Method:             "fixed_margin",
+			MarginPerTradeUSD:  100.0,
+			MaxLeverage:        10.0,
+			MaxRiskPerTradePct: 1.0,
+		},
+	}
+
+	md := &mockMarketData{priceErr: errors.New("price unavailable")}
+	universeScanner := universe.NewScanner(cfg.Universe, cfg.Strategy, cfg.LLMRouting, "", md, universeRepo, &mockCandleRepo{}, log, cfg.ComputeTargetNotional())
+	screenerSvc := screener.NewScreener(cfg, universeScanner, md, log)
+
+	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
+	riskEng := risk.NewEngine(cfg)
+	exec := executor.NewExecutor(pb, log)
+	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
+
+	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, mon, md, log)
+	sched.SetCycleRepo(cycleRepo)
+	sched.SetCandidateRepo(candidateRepo)
+	sched.SetRiskDecisionRepo(riskDecisionRepo)
+
+	result, err := sched.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Skips) == 0 {
+		t.Fatal("expected skipped candidate due to unavailable price")
+	}
+	foundSkip := false
+	for _, sk := range result.Skips {
+		if sk.Reason == "RISK_REJECTED" {
+			foundSkip = true
+			break
+		}
+	}
+	if !foundSkip {
+		t.Fatalf("expected RISK_REJECTED skip, got %v", result.Skips)
+	}
+	if len(riskDecisionRepo.decisions) == 0 {
+		t.Fatal("expected risk decision persisted")
+	}
+	foundReason := false
+	for _, rec := range riskDecisionRepo.decisions {
+		for _, reason := range rec.decision.ReasonCodes {
+			if reason == "PRICE_UNAVAILABLE" {
+				foundReason = true
+				break
+			}
+		}
+	}
+	if !foundReason {
+		t.Fatalf("expected PRICE_UNAVAILABLE reason in risk decisions, got %+v", riskDecisionRepo.decisions)
 	}
 }
 
