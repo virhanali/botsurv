@@ -18,9 +18,8 @@ database:
 market_data:
   provider: bybit_ws
   symbols:
-    mode: explicit
-    explicit_list:
-      - BTCUSDT
+    mode: all_usdt_perpetual
+    explicit_list: []
   ws_url: "wss://stream.bybit.com/v5/public/linear"
   rest_url: "https://api.bybit.com"
   reconnect_interval_seconds: 5
@@ -47,15 +46,13 @@ broker:
     default_leverage: 5
 
 universe:
-  mode: hybrid
+  mode: all_usdt_perpetual
   refresh_interval_minutes: 60
   light_scan_max_symbols: 100
   quality_filter_max_symbols: 30
   setup_scan_max_symbols: 10
-  core_symbols:
-    - BTCUSDT
-  force_include_symbols:
-    - BTCUSDT
+  core_symbols: []
+  force_include_symbols: []
   blacklist: []
   external_signal_watchlist:
     enabled: true
