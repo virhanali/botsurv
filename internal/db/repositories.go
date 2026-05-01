@@ -55,6 +55,7 @@ type OrderRepository interface {
 type ExecutionRepository interface {
 	Insert(ctx context.Context, e domain.Execution) (int64, error)
 	GetByOrder(ctx context.Context, orderID int64) ([]domain.Execution, error)
+	GetAll(ctx context.Context, since time.Time) ([]domain.Execution, error)
 }
 
 // AccountSnapshotRepository persists account snapshots.
@@ -62,11 +63,25 @@ type AccountSnapshotRepository interface {
 	Insert(ctx context.Context, a domain.AccountState) (int64, error)
 	GetLatest(ctx context.Context) (*domain.AccountState, error)
 	GetLatestBefore(ctx context.Context, before time.Time) (*domain.AccountState, error)
+	GetAll(ctx context.Context, since time.Time) ([]domain.AccountState, error)
 }
 
 // LLMDecisionRepository persists LLM decisions.
 type LLMDecisionRepository interface {
 	Insert(ctx context.Context, d domain.LLMDecision, candidateID int64, cycleID string) (int64, error)
+	GetByCycle(ctx context.Context, cycleID string) ([]domain.LLMDecision, error)
+}
+
+// RiskDecisionRepository persists deterministic risk decisions.
+type RiskDecisionRepository interface {
+	Insert(ctx context.Context, d domain.RiskDecision, candidateID int64, cycleID string) (int64, error)
+	GetByCycle(ctx context.Context, cycleID string) ([]domain.RiskDecision, error)
+}
+
+// LLMUsageRepository persists daily LLM usage counters.
+type LLMUsageRepository interface {
+	Get(ctx context.Context, usageDate time.Time) (*domain.LLMUsageState, error)
+	IncrementCalls(ctx context.Context, usageDate time.Time, calls int) error
 }
 
 // Repositories aggregates all repository interfaces.
@@ -80,4 +95,6 @@ type Repositories struct {
 	ExecutionRepository       ExecutionRepository
 	AccountSnapshotRepository AccountSnapshotRepository
 	LLMDecisionRepository     LLMDecisionRepository
+	RiskDecisionRepository    RiskDecisionRepository
+	LLMUsageRepository        LLMUsageRepository
 }

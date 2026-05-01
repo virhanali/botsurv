@@ -15,14 +15,8 @@ import (
 
 // PaperBroker simulates futures trading in paper mode.
 //
-// Restart recovery gap: state is entirely in-memory. On restart, open positions,
-// orders, and account state must be rehydrated from DB to prevent orphaned
-// positions or incorrect balance. Required before production paper mode:
-// - Rehydrate balance/usedMargin/realizedPnL from latest account_snapshot
-// - Reload open positions from positions table (status='open')
-// - Reload open orders from orders table (status='pending')
-// - Re-sync price cache if needed
-// - Rebuild nextOrderID/nextPositionID/nextExecID counters from DB sequences
+// Rehydrate reloads persisted paper state on restart so open positions and
+// protective orders remain active after a service restart.
 type PaperBroker struct {
 	mu sync.RWMutex
 
@@ -127,6 +121,124 @@ func (pb *PaperBroker) SetAccountSnapshotRepo(repo AccountSnapshotRepository) { 
 
 // SetAlertSender sets an optional alert sender.
 func (pb *PaperBroker) SetAlertSender(svc alert.Service) { pb.alert = svc }
+
+// Rehydrate reloads open paper positions, open orders, and the latest account
+// snapshot from persistence. If a persisted open position has an SL price but
+// no active STOP_MARKET order, the paper broker repairs the missing protective
+// order before accepting new entries.
+func (pb *PaperBroker) Rehydrate(ctx context.Context) error {
+	if pb.posRepo == nil || pb.ordRepo == nil {
+		return nil
+	}
+
+	positions, err := pb.posRepo.GetOpen(ctx)
+	if err != nil {
+		return fmt.Errorf("load open positions: %w", err)
+	}
+	orders, err := pb.ordRepo.GetOpen(ctx)
+	if err != nil {
+		return fmt.Errorf("load open orders: %w", err)
+	}
+
+	var snapshot *domain.AccountState
+	if pb.snapRepo != nil {
+		snapshot, err = pb.snapRepo.GetLatest(ctx)
+		if err != nil {
+			return fmt.Errorf("load latest account snapshot: %w", err)
+		}
+	}
+
+	openPositions := make(map[string]*domain.Position, len(positions))
+	openOrders := make(map[string]*domain.Order, len(orders))
+	var ordersToUpdate []domain.Order
+	nextOrderID := int64(1)
+	nextPositionID := int64(1)
+	usedMargin := 0.0
+
+	for _, p := range positions {
+		if p.ID >= nextPositionID {
+			nextPositionID = p.ID + 1
+		}
+		if p.StopLoss <= 0 {
+			pb.SetHalted(fmt.Sprintf("persisted open position %s has no stop loss", p.Symbol))
+			return fmt.Errorf("persisted open position %s has no stop loss", p.Symbol)
+		}
+		if err := validatePositionStopLoss(p); err != nil {
+			pb.SetHalted(err.Error())
+			return err
+		}
+		cp := p
+		openPositions[p.Symbol] = &cp
+		usedMargin += p.Margin
+	}
+
+	for _, o := range orders {
+		if o.ID >= nextOrderID {
+			nextOrderID = o.ID + 1
+		}
+		if o.BrokerOrderID == "" {
+			o.BrokerOrderID = fmt.Sprintf("paper-db-%d", o.ID)
+			ordersToUpdate = append(ordersToUpdate, o)
+		}
+		if o.OrderType == domain.OrderTypeLimit && o.IntendedSL <= 0 {
+			o.Status = domain.OrderStatusCancelled
+			o.UpdatedAt = time.Now()
+			ordersToUpdate = append(ordersToUpdate, o)
+			pb.log.Warn("cancelled rehydrated LIMIT order without intended SL", map[string]any{
+				"symbol": o.Symbol,
+				"order":  o.BrokerOrderID,
+			})
+			continue
+		}
+		co := o
+		openOrders[o.BrokerOrderID] = &co
+	}
+
+	for _, o := range ordersToUpdate {
+		if err := pb.ordRepo.Update(ctx, o); err != nil {
+			return fmt.Errorf("update rehydrated order %s: %w", o.BrokerOrderID, err)
+		}
+	}
+
+	pb.mu.Lock()
+	if snapshot != nil {
+		pb.balance = snapshot.Balance
+		pb.realizedPnL = snapshot.RealizedPnL
+		pb.unrealizedPnL = snapshot.UnrealizedPnL
+		pb.totalFees = snapshot.TotalFees
+		pb.totalSlippage = snapshot.TotalSlippage
+		pb.dailyLoss = snapshot.DailyLoss
+	}
+	pb.usedMargin = usedMargin
+	pb.openPositions = openPositions
+	pb.openOrders = openOrders
+	pb.nextOrderID = maxInt64(nextOrderID, pb.nextOrderID)
+	pb.nextPositionID = maxInt64(nextPositionID, pb.nextPositionID)
+
+	repaired := 0
+	for _, pos := range pb.openPositions {
+		if pb.hasOpenStopOrderLocked(pos.Symbol) {
+			continue
+		}
+		if !pb.createProtectiveOrdersForPosition(pos, pos.StopLoss, pos.TakeProfit) {
+			pb.mu.Unlock()
+			pb.SetHalted(fmt.Sprintf("failed to repair protective stop for %s", pos.Symbol))
+			return fmt.Errorf("failed to repair protective stop for %s", pos.Symbol)
+		}
+		pb.saveProtectiveOrdersForPosition(pos)
+		pb.updatePositionInDB(pos)
+		repaired++
+	}
+	pb.mu.Unlock()
+
+	pb.log.Info("paper broker rehydrated", map[string]any{
+		"open_positions": len(positions),
+		"open_orders":    len(openOrders),
+		"used_margin":    usedMargin,
+		"repaired_sl":    repaired,
+	})
+	return nil
+}
 
 // GetAccountState returns the current account state.
 func (pb *PaperBroker) GetAccountState(_ context.Context) (domain.AccountState, error) {
@@ -658,6 +770,32 @@ func derefInt64(p *int64) int64 {
 		return -1
 	}
 	return *p
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func validatePositionStopLoss(pos domain.Position) error {
+	if pos.Side == domain.SideLong && pos.StopLoss >= pos.EntryPrice {
+		return fmt.Errorf("persisted LONG position %s has stop loss %.8f >= entry %.8f", pos.Symbol, pos.StopLoss, pos.EntryPrice)
+	}
+	if pos.Side == domain.SideShort && pos.StopLoss <= pos.EntryPrice {
+		return fmt.Errorf("persisted SHORT position %s has stop loss %.8f <= entry %.8f", pos.Symbol, pos.StopLoss, pos.EntryPrice)
+	}
+	return nil
+}
+
+func (pb *PaperBroker) hasOpenStopOrderLocked(symbol string) bool {
+	for _, order := range pb.openOrders {
+		if order.Symbol == symbol && order.OrderType == domain.OrderTypeStopMarket && order.Status == domain.OrderStatusPending {
+			return true
+		}
+	}
+	return false
 }
 
 func (pb *PaperBroker) sideFromOrderSide(os domain.OrderSide) domain.Side {

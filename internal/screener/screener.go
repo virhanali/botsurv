@@ -208,8 +208,15 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		return domain.Candidate{}, fmt.Errorf("no setup: %v", setup.ReasonCodes)
 	}
 
-	// Get orderbook for scoring
-	ob, obErr := s.md.GetOrderBookSummary(ctx, sym.Symbol, 0, "")
+	// Get orderbook for scoring (skip if target notional is not configured)
+	targetNotional := s.cfg.ComputeTargetNotional()
+	var ob domain.OrderBookSummary
+	var obErr error
+	if targetNotional > 0 {
+		ob, obErr = s.md.GetOrderBookSummary(ctx, sym.Symbol, targetNotional, string(setup.Side))
+	} else {
+		obErr = fmt.Errorf("target notional is zero")
+	}
 	price, _ := s.md.GetLatestPrice(ctx, sym.Symbol)
 
 	// Compute scores
@@ -259,7 +266,11 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 }
 
 func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (string, error) {
-	ob, _ := s.md.GetOrderBookSummary(ctx, cand.Symbol, 0, "")
+	targetNotional := s.cfg.ComputeTargetNotional()
+	var ob domain.OrderBookSummary
+	if targetNotional > 0 {
+		ob, _ = s.md.GetOrderBookSummary(ctx, cand.Symbol, targetNotional, string(cand.Side))
+	}
 	tf, _ := s.md.GetTradeFlow(ctx, cand.Symbol)
 	price, _ := s.md.GetLatestPrice(ctx, cand.Symbol)
 
@@ -381,13 +392,15 @@ func evaluateLLMEligibility(
 	if cand.CandidateScore < minScore {
 		reasons = append(reasons, "candidate_score_below_threshold")
 	}
-	if filters.MaxSpreadBps > 0 && ob.SpreadBps > filters.MaxSpreadBps {
-		reasons = append(reasons, "spread_too_wide")
+	if llmConfig.RequireExecutionOk {
+		if filters.MaxSpreadBps > 0 && ob.SpreadBps > filters.MaxSpreadBps {
+			reasons = append(reasons, "spread_too_wide")
+		}
+		if ob.EstimatedSlippageBps >= 100 {
+			reasons = append(reasons, "slippage_too_high")
+		}
 	}
-	if ob.EstimatedSlippageBps >= 100 {
-		reasons = append(reasons, "slippage_too_high")
-	}
-	if ob.DepthToPositionSizeRatio <= 0 {
+	if llmConfig.RequireLiquidityOk && ob.DepthToPositionSizeRatio <= 0 {
 		reasons = append(reasons, "insufficient_depth")
 	}
 	if cand.RR > 0 && cand.RR < minRR {

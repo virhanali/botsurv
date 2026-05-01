@@ -80,13 +80,15 @@ func evaluateLLMEligibility(
 	if cand.CandidateScore < minScore {
 		reasons = append(reasons, "candidate_score_below_threshold")
 	}
-	if filters.MaxSpreadBps > 0 && ob.SpreadBps > filters.MaxSpreadBps {
-		reasons = append(reasons, "spread_too_wide")
+	if llmConfig.RequireExecutionOk {
+		if filters.MaxSpreadBps > 0 && ob.SpreadBps > filters.MaxSpreadBps {
+			reasons = append(reasons, "spread_too_wide")
+		}
+		if ob.EstimatedSlippageBps >= 100 {
+			reasons = append(reasons, "slippage_too_high")
+		}
 	}
-	if ob.EstimatedSlippageBps >= 100 {
-		reasons = append(reasons, "slippage_too_high")
-	}
-	if ob.DepthToPositionSizeRatio <= 0 {
+	if llmConfig.RequireLiquidityOk && ob.DepthToPositionSizeRatio <= 0 {
 		reasons = append(reasons, "insufficient_depth")
 	}
 	if cand.RR > 0 && cand.RR < minRR {

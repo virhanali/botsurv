@@ -42,6 +42,7 @@ func buildScanner(cfg *app.UserConfig) (*universe.Scanner, func(), error) {
 		repos.UniverseRepository,
 		repos.CandleRepository,
 		log,
+		cfg.ComputeTargetNotional(),
 	)
 	cleanup := func() { database.Close() }
 	return scanner, cleanup, nil

@@ -69,7 +69,13 @@ func (m *mockOrderRepo) Update(ctx context.Context, o domain.Order) error {
 }
 
 func (m *mockOrderRepo) GetOpen(ctx context.Context) ([]domain.Order, error) {
-	return nil, nil
+	var open []domain.Order
+	for _, o := range m.orders {
+		if o.Status == domain.OrderStatusPending || o.Status == domain.OrderStatusPartiallyFilled {
+			open = append(open, o)
+		}
+	}
+	return open, nil
 }
 
 func (m *mockOrderRepo) GetBySymbol(ctx context.Context, symbol string) ([]domain.Order, error) {
@@ -98,7 +104,12 @@ func (m *mockAcctSnapRepo) Insert(ctx context.Context, a domain.AccountState) (i
 	return int64(len(m.snapshots)), nil
 }
 
-func (m *mockAcctSnapRepo) GetLatest(ctx context.Context) (*domain.AccountState, error) { return nil, nil }
+func (m *mockAcctSnapRepo) GetLatest(ctx context.Context) (*domain.AccountState, error) {
+	if len(m.snapshots) == 0 {
+		return nil, nil
+	}
+	return &m.snapshots[len(m.snapshots)-1], nil
+}
 func (m *mockAcctSnapRepo) GetLatestBefore(ctx context.Context, before time.Time) (*domain.AccountState, error) {
 	return nil, nil
 }
@@ -129,6 +140,102 @@ func TestGetAccountState_InitialBalance(t *testing.T) {
 	}
 	if state.UsedMargin != 0 {
 		t.Errorf("expected margin 0, got %.2f", state.UsedMargin)
+	}
+}
+
+func TestPaperBroker_RehydrateRepairsMissingProtectiveStop(t *testing.T) {
+	pb := newTestBroker()
+	posRepo := &mockPositionRepo{positions: []domain.Position{
+		{
+			ID:         42,
+			Symbol:     "BTCUSDT",
+			Side:       domain.SideLong,
+			EntryPrice: 100,
+			Size:       1,
+			Leverage:   5,
+			Margin:     20,
+			StopLoss:   90,
+			TakeProfit: 120,
+			Status:     domain.PositionStatusOpen,
+			Source:     "paper",
+			OpenedAt:   time.Now(),
+		},
+	}}
+	orderRepo := &mockOrderRepo{}
+	snapRepo := &mockAcctSnapRepo{snapshots: []domain.AccountState{
+		{Balance: 999, UsedMargin: 0, RealizedPnL: -1, TotalFees: 1, RecordedAt: time.Now()},
+	}}
+	pb.SetPositionRepo(posRepo)
+	pb.SetOrderRepo(orderRepo)
+	pb.SetAccountSnapshotRepo(snapRepo)
+
+	if err := pb.Rehydrate(context.Background()); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+
+	positions, err := pb.GetOpenPositions(context.Background())
+	if err != nil {
+		t.Fatalf("get positions: %v", err)
+	}
+	if len(positions) != 1 {
+		t.Fatalf("expected 1 open position, got %d", len(positions))
+	}
+	if positions[0].StopLoss != 90 {
+		t.Fatalf("expected stop loss 90, got %.2f", positions[0].StopLoss)
+	}
+
+	orders, err := pb.GetOpenOrders(context.Background())
+	if err != nil {
+		t.Fatalf("get orders: %v", err)
+	}
+	var hasSL, hasTP bool
+	for _, o := range orders {
+		if o.OrderType == domain.OrderTypeStopMarket {
+			hasSL = true
+		}
+		if o.OrderType == domain.OrderTypeTakeProfitMarket {
+			hasTP = true
+		}
+	}
+	if !hasSL {
+		t.Fatal("expected missing STOP_MARKET order to be repaired")
+	}
+	if !hasTP {
+		t.Fatal("expected TAKE_PROFIT_MARKET order to be repaired")
+	}
+
+	state, err := pb.GetAccountState(context.Background())
+	if err != nil {
+		t.Fatalf("get account state: %v", err)
+	}
+	if state.Balance != 999 {
+		t.Fatalf("expected balance from latest snapshot, got %.2f", state.Balance)
+	}
+	if state.UsedMargin != 20 {
+		t.Fatalf("expected used margin rebuilt from positions, got %.2f", state.UsedMargin)
+	}
+}
+
+func TestPaperBroker_RehydrateRejectsOpenPositionWithoutStopLoss(t *testing.T) {
+	pb := newTestBroker()
+	pb.SetPositionRepo(&mockPositionRepo{positions: []domain.Position{
+		{
+			ID:         1,
+			Symbol:     "BTCUSDT",
+			Side:       domain.SideLong,
+			EntryPrice: 100,
+			Size:       1,
+			Margin:     20,
+			Status:     domain.PositionStatusOpen,
+		},
+	}})
+	pb.SetOrderRepo(&mockOrderRepo{})
+
+	if err := pb.Rehydrate(context.Background()); err == nil {
+		t.Fatal("expected rehydrate to fail closed for open position without SL")
+	}
+	if !pb.IsHalted() {
+		t.Fatal("expected broker to be halted after unsafe persisted state")
 	}
 }
 
@@ -1619,7 +1726,7 @@ func (m *offsetOrderRepo) Insert(ctx context.Context, o domain.Order) (int64, er
 	m.orders = append(m.orders, o)
 	return int64(len(m.orders)) + m.offset, nil
 }
-func (m *offsetOrderRepo) Update(ctx context.Context, o domain.Order) error { return nil }
+func (m *offsetOrderRepo) Update(ctx context.Context, o domain.Order) error    { return nil }
 func (m *offsetOrderRepo) GetOpen(ctx context.Context) ([]domain.Order, error) { return nil, nil }
 func (m *offsetOrderRepo) GetBySymbol(ctx context.Context, symbol string) ([]domain.Order, error) {
 	return nil, nil

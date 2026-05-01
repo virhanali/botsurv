@@ -171,7 +171,7 @@ func TestScanAll_FiltersByStatusAndQuote(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log, 0)
 	result, err := scanner.ScanAll(context.Background())
 	if err != nil {
 		t.Fatalf("ScanAll: %v", err)
@@ -215,7 +215,7 @@ func TestScanAll_FiltersByVolume(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log, 0)
 	result, err := scanner.ScanAll(context.Background())
 	if err != nil {
 		t.Fatalf("ScanAll: %v", err)
@@ -252,7 +252,7 @@ func TestScanAll_BlacklistFiltering(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log, 0)
 	result, err := scanner.ScanAll(context.Background())
 	if err != nil {
 		t.Fatalf("ScanAll: %v", err)
@@ -284,7 +284,7 @@ func TestScanAll_ForceIncludeBypassesVolume(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log, 0)
 	result, err := scanner.ScanAll(context.Background())
 	if err != nil {
 		t.Fatalf("ScanAll: %v", err)
@@ -322,7 +322,7 @@ func TestScanAll_SpreadFilter(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, candleRepo, log, 0)
 	result, err := scanner.ScanAll(context.Background())
 	if err != nil {
 		t.Fatalf("ScanAll: %v", err)
@@ -351,7 +351,7 @@ func TestFilterQuality_PassesGoodSymbols(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", md, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", md, universeRepo, candleRepo, log, 1000)
 
 	input := []domain.UniverseSymbol{
 		{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT", Status: "Trading"}},
@@ -389,7 +389,7 @@ func TestFilterQuality_RejectsStaleOrderbook(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", md, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", md, universeRepo, candleRepo, log, 1000)
 
 	input := []domain.UniverseSymbol{
 		{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT"}},
@@ -420,7 +420,7 @@ func TestFilterQuality_ForceIncludeBypassesSpread(t *testing.T) {
 	candleRepo := &mockCandleRepo{}
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", md, universeRepo, candleRepo, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", md, universeRepo, candleRepo, log, 1000)
 
 	input := []domain.UniverseSymbol{
 		{SymbolInfo: domain.SymbolInfo{Symbol: "WIDEUSDT"}, ForceInclude: true},
@@ -573,7 +573,7 @@ func TestExternalWatchlist_TTLExpiry(t *testing.T) {
 	cfg, strategy, llmRoute := defaultTestConfig()
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, nil, nil, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, nil, nil, log, 0)
 
 	// Add with very short TTL
 	scanner.AddExternalSignal("BTCUSDT", 0) // 0 -> defaults to 48h
@@ -599,7 +599,7 @@ func TestAddForceInclude_PersistsToDB(t *testing.T) {
 	cfg, strategy, llmRoute := defaultTestConfig()
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, universeRepo, nil, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, universeRepo, nil, log, 0)
 
 	err := scanner.AddForceInclude(context.Background(), "NEWUSDT")
 	if err != nil {
@@ -627,7 +627,7 @@ func TestRemoveSymbol_SetsBlacklist(t *testing.T) {
 	cfg, strategy, llmRoute := defaultTestConfig()
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, universeRepo, nil, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, universeRepo, nil, log, 0)
 
 	err := scanner.RemoveSymbol(context.Background(), "BTCUSDT")
 	if err != nil {
@@ -648,7 +648,7 @@ func TestRemoveSymbol_NotInDB(t *testing.T) {
 	cfg, strategy, llmRoute := defaultTestConfig()
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, universeRepo, nil, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", nil, universeRepo, nil, log, 0)
 
 	err := scanner.RemoveSymbol(context.Background(), "UNKNOWNUSDT")
 	if err != nil {
@@ -729,7 +729,7 @@ func TestRefreshUniverse_PersistsSymbols(t *testing.T) {
 	cfg, strategy, llmRoute := defaultTestConfig()
 	log := defaultTestLogger()
 
-	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, nil, log)
+	scanner := NewScanner(cfg, strategy, llmRoute, server.URL, nil, universeRepo, nil, log, 0)
 
 	err := scanner.RefreshUniverse(context.Background())
 	if err != nil {
@@ -745,5 +745,62 @@ func TestRefreshUniverse_PersistsSymbols(t *testing.T) {
 	}
 	if syms[0].LastScanAt.IsZero() {
 		t.Error("LastScanAt should be set")
+	}
+}
+
+// recordingMockMarketData records GetOrderBookSummary arguments.
+type recordingMockMarketData struct {
+	mockMarketData
+	lastTargetNotional float64
+	lastSide           string
+	callCount          int
+}
+
+func (m *recordingMockMarketData) GetOrderBookSummary(_ context.Context, symbol string, targetNotional float64, side string) (domain.OrderBookSummary, error) {
+	m.lastTargetNotional = targetNotional
+	m.lastSide = side
+	m.callCount++
+	return m.mockMarketData.GetOrderBookSummary(nil, symbol, targetNotional, side)
+}
+
+func TestFilterQuality_CallsGetOrderBookSummaryWithTargetNotional(t *testing.T) {
+	md := &recordingMockMarketData{
+		mockMarketData: mockMarketData{
+			orderbooks: map[string]*domain.OrderBookSummary{
+				"BTCUSDT": {
+					BestBid: 65000, BestAsk: 65001, SpreadBps: 1.5,
+					BidDepth: 50000, AskDepth: 50000, DepthToPositionSizeRatio: 0.5,
+					EstimatedSlippageBps: 5, Stale: false,
+				},
+			},
+			prices: map[string]float64{"BTCUSDT": 65000},
+		},
+	}
+	cfg, strategy, llmRoute := defaultTestConfig()
+	universeRepo := newMockUniverseRepo()
+	candleRepo := &mockCandleRepo{}
+	log := defaultTestLogger()
+
+	scanner := NewScanner(cfg, strategy, llmRoute, "http://unused", md, universeRepo, candleRepo, log, 500)
+
+	input := []domain.UniverseSymbol{
+		{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT", Status: "Trading"}},
+	}
+
+	candidates, err := scanner.FilterQuality(context.Background(), input)
+	if err != nil {
+		t.Fatalf("FilterQuality: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	if md.callCount == 0 {
+		t.Fatal("expected at least one GetOrderBookSummary call")
+	}
+	if md.lastTargetNotional <= 0 {
+		t.Errorf("expected targetNotional > 0, got %f", md.lastTargetNotional)
+	}
+	if md.lastSide == "" {
+		t.Error("expected non-empty side passed to GetOrderBookSummary")
 	}
 }

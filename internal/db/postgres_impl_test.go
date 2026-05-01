@@ -562,3 +562,126 @@ func TestPostgresCandidateRepository_GetByCycle_Empty(t *testing.T) {
 		t.Fatalf("expected 0 candidates, got %d", len(candidates))
 	}
 }
+
+func TestPostgresOrderRepository_TakeProfitMarket(t *testing.T) {
+	database := setupTestPostgres(t)
+	if err := Migrate(database, "../../migrations"); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	repos := NewPostgresRepositories(database)
+	ctx := context.Background()
+
+	o := domain.Order{
+		Symbol:     "BTCUSDT",
+		Side:       domain.OrderSideBuy,
+		OrderType:  domain.OrderTypeTakeProfitMarket,
+		Qty:        0.001,
+		StopPrice:  floatPtr(70000),
+		Status:     domain.OrderStatusPending,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+		IntendedSL: 64000,
+		IntendedTP: 70000,
+	}
+
+	id, err := repos.OrderRepository.Insert(ctx, o)
+	if err != nil {
+		t.Fatalf("insert TAKE_PROFIT_MARKET order: %v", err)
+	}
+	if id == 0 {
+		t.Fatal("expected non-zero id")
+	}
+
+	// Verify round-trip
+	all, err := repos.OrderRepository.GetAll(ctx, time.Time{})
+	if err != nil {
+		t.Fatalf("get all orders: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("expected 1 order, got %d", len(all))
+	}
+	if all[0].OrderType != domain.OrderTypeTakeProfitMarket {
+		t.Errorf("expected order_type TAKE_PROFIT_MARKET, got %s", all[0].OrderType)
+	}
+	if all[0].IntendedSL != 64000 || all[0].IntendedTP != 70000 {
+		t.Errorf("expected intended SL/TP round-trip, got %.2f/%.2f", all[0].IntendedSL, all[0].IntendedTP)
+	}
+}
+
+func TestPostgresRiskDecisionRepository(t *testing.T) {
+	database := setupTestPostgres(t)
+	if err := Migrate(database, "../../migrations"); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	repos := NewPostgresRepositories(database)
+	ctx := context.Background()
+
+	id, err := repos.RiskDecisionRepository.Insert(ctx, domain.RiskDecision{
+		Approved:              false,
+		FinalPositionNotional: 50,
+		RequiredMargin:        10,
+		EstimatedLoss:         1,
+		ReasonCodes:           []string{"PORTFOLIO_RISK_LIMIT"},
+		PortfolioRank:         0,
+		PortfolioRejectReason: "PORTFOLIO_RISK_LIMIT",
+	}, 123, "cycle-risk")
+	if err != nil {
+		t.Fatalf("insert risk decision: %v", err)
+	}
+	if id == 0 {
+		t.Fatal("expected non-zero id")
+	}
+
+	decisions, err := repos.RiskDecisionRepository.GetByCycle(ctx, "cycle-risk")
+	if err != nil {
+		t.Fatalf("get risk decisions: %v", err)
+	}
+	if len(decisions) != 1 {
+		t.Fatalf("expected 1 risk decision, got %d", len(decisions))
+	}
+	got := decisions[0]
+	if got.CandidateID != 123 {
+		t.Fatalf("expected candidate_id 123, got %d", got.CandidateID)
+	}
+	if got.Approved {
+		t.Fatal("expected rejected risk decision")
+	}
+	if got.PortfolioRejectReason != "PORTFOLIO_RISK_LIMIT" {
+		t.Fatalf("expected portfolio reject reason, got %s", got.PortfolioRejectReason)
+	}
+	if len(got.ReasonCodes) != 1 || got.ReasonCodes[0] != "PORTFOLIO_RISK_LIMIT" {
+		t.Fatalf("expected reason code round-trip, got %v", got.ReasonCodes)
+	}
+}
+
+func TestPostgresLLMUsageRepository(t *testing.T) {
+	database := setupTestPostgres(t)
+	if err := Migrate(database, "../../migrations"); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	repos := NewPostgresRepositories(database)
+	ctx := context.Background()
+	usageDate := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+
+	if err := repos.LLMUsageRepository.IncrementCalls(ctx, usageDate, 1); err != nil {
+		t.Fatalf("increment usage: %v", err)
+	}
+	if err := repos.LLMUsageRepository.IncrementCalls(ctx, usageDate, 2); err != nil {
+		t.Fatalf("increment usage second time: %v", err)
+	}
+
+	state, err := repos.LLMUsageRepository.Get(ctx, usageDate)
+	if err != nil {
+		t.Fatalf("get usage: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected usage state")
+	}
+	if state.Calls != 3 {
+		t.Fatalf("expected 3 calls, got %d", state.Calls)
+	}
+}
+
+func floatPtr(f float64) *float64 {
+	return &f
+}

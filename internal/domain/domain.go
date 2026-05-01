@@ -96,10 +96,14 @@ type LLMDecision struct {
 	Notes            string   `json:"notes"`
 	RawResponse      string   `json:"-"`
 	ValidationStatus string   `json:"-"`
+	CandidateID      int64    `json:"-"` // populated by repository on read
 }
 
 // RiskDecision is the output of the Risk Engine.
 type RiskDecision struct {
+	ID                    int64
+	CandidateID           int64
+	CycleID               string
 	Approved              bool
 	FinalPositionNotional float64
 	RequiredMargin        float64
@@ -107,6 +111,7 @@ type RiskDecision struct {
 	ReasonCodes           []string
 	PortfolioRank         int
 	PortfolioRejectReason string
+	CreatedAt             time.Time
 }
 
 // OrderSide represents the side of an order.
@@ -155,6 +160,14 @@ type Order struct {
 	// Intended protective order levels (for Limit orders, applied on fill)
 	IntendedSL float64
 	IntendedTP float64
+}
+
+// LLMUsageState tracks persisted daily LLM usage caps.
+type LLMUsageState struct {
+	UsageDate time.Time
+	Calls     int
+	CostUSD   float64
+	UpdatedAt time.Time
 }
 
 // PositionStatus represents the state of a position.

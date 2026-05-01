@@ -178,6 +178,64 @@ func (m *mockLLMDecisionRepo) Insert(ctx context.Context, d domain.LLMDecision, 
 	return int64(len(m.decisions)), nil
 }
 
+func (m *mockLLMDecisionRepo) GetByCycle(ctx context.Context, cycleID string) ([]domain.LLMDecision, error) {
+	var out []domain.LLMDecision
+	for _, rec := range m.decisions {
+		if rec.cycleID == cycleID {
+			d := rec.decision
+			d.CandidateID = rec.candidateID
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+type riskDecisionRecord struct {
+	decision    domain.RiskDecision
+	candidateID int64
+	cycleID     string
+}
+
+type mockRiskDecisionRepo struct {
+	decisions []riskDecisionRecord
+}
+
+func (m *mockRiskDecisionRepo) Insert(ctx context.Context, d domain.RiskDecision, candidateID int64, cycleID string) (int64, error) {
+	m.decisions = append(m.decisions, riskDecisionRecord{decision: d, candidateID: candidateID, cycleID: cycleID})
+	return int64(len(m.decisions)), nil
+}
+
+func (m *mockRiskDecisionRepo) GetByCycle(ctx context.Context, cycleID string) ([]domain.RiskDecision, error) {
+	var out []domain.RiskDecision
+	for _, rec := range m.decisions {
+		if rec.cycleID == cycleID {
+			d := rec.decision
+			d.CandidateID = rec.candidateID
+			d.CycleID = rec.cycleID
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+type mockLLMUsageRepo struct {
+	calls int
+	date  string
+}
+
+func (m *mockLLMUsageRepo) Get(ctx context.Context, usageDate time.Time) (*domain.LLMUsageState, error) {
+	if m.date != usageDate.Format("2006-01-02") {
+		return nil, nil
+	}
+	return &domain.LLMUsageState{UsageDate: usageDate, Calls: m.calls}, nil
+}
+
+func (m *mockLLMUsageRepo) IncrementCalls(ctx context.Context, usageDate time.Time, calls int) error {
+	m.date = usageDate.Format("2006-01-02")
+	m.calls += calls
+	return nil
+}
+
 func newTestScheduler(universeRepo db.UniverseRepository, cycleRepo db.CycleRepository) *Scheduler {
 	log := logger.New(nil, logger.LevelDebug)
 	cfg := app.UserConfig{
@@ -216,15 +274,16 @@ func newTestScheduler(universeRepo db.UniverseRepository, cycleRepo db.CycleRepo
 			MinCandidateScore: 1.0,
 		},
 		PortfolioRisk: app.PortfolioRiskConfig{
-			MaxOpenPositions:        5,
-			MaxRiskPerTradePct:      1.0,
-			MaxDailyLossPct:         3.0,
-			MaxTotalExposureUSD:     100000,
-			MaxTotalMarginUsedPct:   50.0,
-			MaxLeverage:             10.0,
-			MinNotionalUSD:          10.0,
-			MarginPerTradeUSD:       100.0,
-			MaxNewPositionsPerCycle: 2,
+			MaxOpenPositions:          5,
+			MaxRiskPerTradePct:        1.0,
+			MaxDailyLossPct:           3.0,
+			MaxTotalExposureUSD:       100000,
+			MaxTotalMarginUsedPct:     50.0,
+			MaxLeverage:               10.0,
+			MinNotionalUSD:            10.0,
+			MarginPerTradeUSD:         100.0,
+			MaxNewPositionsPerCycle:   2,
+			MaxSameDirectionPositions: 5,
 		},
 		Sizing: app.SizingConfig{
 			Method:             "fixed_margin",
@@ -235,7 +294,7 @@ func newTestScheduler(universeRepo db.UniverseRepository, cycleRepo db.CycleRepo
 	}
 
 	md := &mockMarketData{}
-	universeScanner := universe.NewScanner(cfg.Universe, cfg.Strategy, cfg.LLMRouting, "", md, universeRepo, &mockCandleRepo{}, log)
+	universeScanner := universe.NewScanner(cfg.Universe, cfg.Strategy, cfg.LLMRouting, "", md, universeRepo, &mockCandleRepo{}, log, cfg.ComputeTargetNotional())
 	screenerSvc := screener.NewScreener(cfg, universeScanner, md, log)
 
 	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
@@ -420,4 +479,369 @@ func TestScheduler_RunOnce_LLMDecisionUsesCandidateID(t *testing.T) {
 	if result != nil && rec.cycleID != result.CycleID {
 		t.Errorf("expected cycleID=%s, got %s", result.CycleID, rec.cycleID)
 	}
+}
+
+func TestScheduler_RunOnce_RiskDecisionPersisted(t *testing.T) {
+	cycleRepo := &mockCycleRepo{}
+	candidateRepo := &mockCandidateRepo{}
+	riskDecisionRepo := &mockRiskDecisionRepo{}
+	universeRepo := &mockUniverseRepo{
+		symbols: []domain.UniverseSymbol{
+			{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT", Status: "Trading", QuoteAsset: "USDT", MinNotional: 10}},
+		},
+	}
+	sched := newTestScheduler(universeRepo, cycleRepo)
+	sched.SetCandidateRepo(candidateRepo)
+	sched.SetRiskDecisionRepo(riskDecisionRepo)
+
+	result, err := sched.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(riskDecisionRepo.decisions) == 0 {
+		t.Fatal("expected risk decisions to be persisted")
+	}
+	rec := riskDecisionRepo.decisions[0]
+	if rec.candidateID <= 0 {
+		t.Fatalf("expected positive candidateID, got %d", rec.candidateID)
+	}
+	if rec.cycleID != result.CycleID {
+		t.Fatalf("expected cycleID=%s, got %s", result.CycleID, rec.cycleID)
+	}
+}
+
+func TestScheduler_RunOnce_PortfolioRankingPersistsRejectedCandidates(t *testing.T) {
+	cycleRepo := &mockCycleRepo{}
+	candidateRepo := &mockCandidateRepo{}
+	riskDecisionRepo := &mockRiskDecisionRepo{}
+	universeRepo := &mockUniverseRepo{
+		symbols: []domain.UniverseSymbol{
+			{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT", Status: "Trading", QuoteAsset: "USDT", MinNotional: 10}},
+			{SymbolInfo: domain.SymbolInfo{Symbol: "ETHUSDT", Status: "Trading", QuoteAsset: "USDT", MinNotional: 10}},
+		},
+	}
+	sched := newTestScheduler(universeRepo, cycleRepo)
+	sched.cfg.PortfolioRisk.MaxNewPositionsPerCycle = 1
+	sched.SetCandidateRepo(candidateRepo)
+	sched.SetRiskDecisionRepo(riskDecisionRepo)
+
+	result, err := sched.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(riskDecisionRepo.decisions) < 2 {
+		t.Fatalf("expected at least 2 risk decisions, got %d", len(riskDecisionRepo.decisions))
+	}
+	approved := 0
+	portfolioRejected := 0
+	for _, rec := range riskDecisionRepo.decisions {
+		if rec.decision.Approved {
+			approved++
+		}
+		if rec.decision.PortfolioRejectReason == "PORTFOLIO_RISK_LIMIT" {
+			portfolioRejected++
+		}
+	}
+	if approved != 1 {
+		t.Fatalf("expected exactly 1 approved decision, got %d", approved)
+	}
+	if portfolioRejected == 0 {
+		t.Fatal("expected at least one portfolio risk rejection")
+	}
+	if !skipContains(result.Skips, "PORTFOLIO_RISK_LIMIT") {
+		t.Fatalf("expected PORTFOLIO_RISK_LIMIT skip, got %v", result.Skips)
+	}
+}
+
+// recordingMockMarketData records the arguments passed to GetOrderBookSummary.
+type recordingMockMarketData struct {
+	mockMarketData
+	lastTargetNotional float64
+	lastSide           string
+	callCount          int
+}
+
+func (m *recordingMockMarketData) GetOrderBookSummary(ctx context.Context, symbol string, targetNotional float64, side string) (domain.OrderBookSummary, error) {
+	m.lastTargetNotional = targetNotional
+	m.lastSide = side
+	m.callCount++
+	return domain.OrderBookSummary{BestBid: 100, BestAsk: 101, SpreadBps: 1, BidDepth: 100, AskDepth: 100, EstimatedSlippageBps: 5, DepthToPositionSizeRatio: 10}, nil
+}
+
+func TestScheduler_RunOnce_CallsGetOrderBookSummaryWithTargetNotional(t *testing.T) {
+	cycleRepo := &mockCycleRepo{}
+	candidateRepo := &mockCandidateRepo{}
+	universeRepo := &mockUniverseRepo{
+		symbols: []domain.UniverseSymbol{
+			{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT", Status: "Trading", QuoteAsset: "USDT", MinNotional: 10}},
+		},
+	}
+
+	log := logger.New(nil, logger.LevelDebug)
+	cfg := app.UserConfig{
+		App: app.AppConfig{
+			Mode:                 "paper",
+			CycleIntervalSeconds: 900,
+		},
+		Universe: app.UniverseConfig{
+			Mode: "all_usdt_perpetual",
+		},
+		Strategy: app.StrategyConfig{
+			Enabled: true,
+			Timeframes: app.TimeframesConfig{
+				Context:   "1H",
+				Setup:     "15m",
+				Execution: "15m",
+			},
+			Indicators: app.IndicatorsConfig{
+				ATRPeriod:                  14,
+				EMA200Period:               200,
+				VolumeSMAPeriod:            20,
+				RangeCandles:               20,
+				MinVolumeRatio:             1.0,
+				MaxBreakoutExtensionATR:    2.0,
+				MaxDistanceFromBreakoutATR: 1.0,
+				MinRR:                      1.5,
+			},
+			Regime: app.RegimeConfig{
+				TrendUpMinDistanceFromEMAPct:   1.0,
+				TrendDownMaxDistanceFromEMAPct: -1.0,
+				RangeMaxDistanceFromEMAPct:     0.5,
+			},
+		},
+		LLMRouting: app.LLMRoutingConfig{
+			Mode:              "off",
+			MinCandidateScore: 1.0,
+		},
+		PortfolioRisk: app.PortfolioRiskConfig{
+			MaxOpenPositions:        5,
+			MaxRiskPerTradePct:      1.0,
+			MaxDailyLossPct:         3.0,
+			MaxTotalExposureUSD:     100000,
+			MaxTotalMarginUsedPct:   50.0,
+			MaxLeverage:             10.0,
+			MinNotionalUSD:          10.0,
+			MarginPerTradeUSD:       100.0,
+			MaxNewPositionsPerCycle: 2,
+		},
+		Sizing: app.SizingConfig{
+			Method:             "fixed_margin",
+			MarginPerTradeUSD:  100.0,
+			MaxLeverage:        10.0,
+			MaxRiskPerTradePct: 1.0,
+		},
+	}
+
+	md := &recordingMockMarketData{}
+	universeScanner := universe.NewScanner(cfg.Universe, cfg.Strategy, cfg.LLMRouting, "", md, universeRepo, &mockCandleRepo{}, log, cfg.ComputeTargetNotional())
+	screenerSvc := screener.NewScreener(cfg, universeScanner, md, log)
+
+	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
+	riskEng := risk.NewEngine(cfg)
+	exec := executor.NewExecutor(pb, log)
+	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
+
+	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, mon, md, log)
+	sched.SetCycleRepo(cycleRepo)
+	sched.SetCandidateRepo(candidateRepo)
+
+	_, err := sched.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if md.callCount == 0 {
+		t.Fatal("expected at least one GetOrderBookSummary call")
+	}
+	if md.lastTargetNotional <= 0 {
+		t.Errorf("expected targetNotional > 0, got %f", md.lastTargetNotional)
+	}
+	if md.lastSide == "" {
+		t.Error("expected non-empty side passed to GetOrderBookSummary")
+	}
+}
+
+func TestApplyLLMCaps_HardCap(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	sched := &Scheduler{cfg: app.UserConfig{LLMRouting: app.LLMRoutingConfig{HardCapCandidatesPerCycle: 2}}, log: log}
+
+	candidates := []domain.Candidate{
+		{ProposedTrade: domain.ProposedTrade{Symbol: "A"}, CandidateScore: 90},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "B"}, CandidateScore: 80},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "C"}, CandidateScore: 70},
+	}
+
+	kept, skips := sched.applyLLMCaps(candidates)
+	if len(kept) != 2 {
+		t.Fatalf("expected 2 kept, got %d", len(kept))
+	}
+	if kept[0].Symbol != "A" || kept[1].Symbol != "B" {
+		t.Errorf("expected A,B kept, got %v", kept)
+	}
+	if len(skips) != 1 || skips[0].Symbol != "C" || skips[0].Reason != "LLM_HARD_CAP" {
+		t.Errorf("expected C skipped with LLM_HARD_CAP, got %v", skips)
+	}
+}
+
+func TestApplyLLMCaps_DailyCapReached(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	sched := &Scheduler{
+		cfg: app.UserConfig{LLMRouting: app.LLMRoutingConfig{MaxCallsPerDay: 5}},
+		log: log,
+	}
+	sched.llmCallsDate = time.Now().Format("2006-01-02")
+	sched.llmCallsToday = 5
+
+	candidates := []domain.Candidate{{ProposedTrade: domain.ProposedTrade{Symbol: "A"}, CandidateScore: 90}}
+	kept, skips := sched.applyLLMCaps(candidates)
+	if len(kept) != 0 {
+		t.Fatalf("expected 0 kept, got %d", len(kept))
+	}
+	if len(skips) != 1 || skips[0].Reason != "LLM_CALL_CAP_PER_DAY" {
+		t.Errorf("expected daily cap skip, got %v", skips)
+	}
+}
+
+func TestApplyLLMCaps_DailyCapRestrictsHardCap(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	sched := &Scheduler{
+		cfg: app.UserConfig{LLMRouting: app.LLMRoutingConfig{HardCapCandidatesPerCycle: 5, MaxCallsPerDay: 3}},
+		log: log,
+	}
+	sched.llmCallsDate = time.Now().Format("2006-01-02")
+	sched.llmCallsToday = 1
+
+	candidates := []domain.Candidate{
+		{ProposedTrade: domain.ProposedTrade{Symbol: "A"}, CandidateScore: 90},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "B"}, CandidateScore: 80},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "C"}, CandidateScore: 70},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "D"}, CandidateScore: 60},
+	}
+
+	kept, skips := sched.applyLLMCaps(candidates)
+	// remaining today = 2, so hard cap is reduced to 2
+	if len(kept) != 2 {
+		t.Fatalf("expected 2 kept, got %d", len(kept))
+	}
+	if len(skips) != 2 {
+		t.Fatalf("expected 2 skips, got %d", len(skips))
+	}
+	for _, sk := range skips {
+		if sk.Reason != "LLM_CALL_CAP_PER_DAY" {
+			t.Errorf("expected skip reason LLM_CALL_CAP_PER_DAY, got %s", sk.Reason)
+		}
+	}
+}
+
+func TestApplyLLMCaps_ZeroMeansUnlimited(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	sched := &Scheduler{
+		cfg: app.UserConfig{LLMRouting: app.LLMRoutingConfig{HardCapCandidatesPerCycle: 0, MaxCallsPerDay: 0}},
+		log: log,
+	}
+
+	candidates := []domain.Candidate{
+		{ProposedTrade: domain.ProposedTrade{Symbol: "A"}, CandidateScore: 90},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "B"}, CandidateScore: 80},
+	}
+
+	kept, skips := sched.applyLLMCaps(candidates)
+	if len(kept) != 2 {
+		t.Fatalf("expected 2 kept, got %d", len(kept))
+	}
+	if len(skips) != 0 {
+		t.Fatalf("expected 0 skips, got %d", len(skips))
+	}
+}
+
+func TestApplyLLMCaps_MaxCallsPerCycle(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	sched := &Scheduler{
+		cfg: app.UserConfig{LLMRouting: app.LLMRoutingConfig{MaxCallsPerCycle: 1}},
+		log: log,
+	}
+
+	candidates := []domain.Candidate{
+		{ProposedTrade: domain.ProposedTrade{Symbol: "A"}, CandidateScore: 90},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "B"}, CandidateScore: 80},
+		{ProposedTrade: domain.ProposedTrade{Symbol: "C"}, CandidateScore: 70},
+	}
+
+	kept, skips := sched.applyLLMCaps(candidates)
+	if len(kept) != 1 {
+		t.Fatalf("expected 1 kept, got %d", len(kept))
+	}
+	if kept[0].Symbol != "A" {
+		t.Errorf("expected highest-score candidate A, got %s", kept[0].Symbol)
+	}
+	if len(skips) != 2 {
+		t.Fatalf("expected 2 skips, got %d", len(skips))
+	}
+	for _, sk := range skips {
+		if sk.Reason != "LLM_CALL_CAP_PER_CYCLE" {
+			t.Errorf("expected skip reason LLM_CALL_CAP_PER_CYCLE, got %s", sk.Reason)
+		}
+	}
+}
+
+func TestTrackLLMCall_ResetsOnNewDay(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	sched := &Scheduler{log: log}
+	sched.llmCallsDate = "2020-01-01"
+	sched.llmCallsToday = 5
+
+	sched.trackLLMCall(context.Background())
+
+	if sched.llmCallsToday != 1 {
+		t.Errorf("expected calls today reset to 1, got %d", sched.llmCallsToday)
+	}
+	if sched.llmCallsDate != time.Now().Format("2006-01-02") {
+		t.Errorf("expected date updated to today")
+	}
+}
+
+func TestLLMUsageRepo_LoadsPersistedDailyCap(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	today := time.Now().Format("2006-01-02")
+	usageRepo := &mockLLMUsageRepo{date: today, calls: 5}
+	sched := &Scheduler{
+		cfg:          app.UserConfig{LLMRouting: app.LLMRoutingConfig{MaxCallsPerDay: 5}},
+		log:          log,
+		llmUsageRepo: usageRepo,
+	}
+	sched.loadLLMUsage(context.Background())
+
+	kept, skips := sched.applyLLMCaps([]domain.Candidate{
+		{ProposedTrade: domain.ProposedTrade{Symbol: "BTCUSDT"}, CandidateScore: 90},
+	})
+	if len(kept) != 0 {
+		t.Fatalf("expected no kept candidates after persisted cap, got %d", len(kept))
+	}
+	if len(skips) != 1 || skips[0].Reason != "LLM_CALL_CAP_PER_DAY" {
+		t.Fatalf("expected daily cap skip, got %v", skips)
+	}
+}
+
+func TestTrackLLMCall_PersistsUsage(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	usageRepo := &mockLLMUsageRepo{}
+	sched := &Scheduler{log: log, llmUsageRepo: usageRepo}
+
+	sched.trackLLMCall(context.Background())
+
+	if usageRepo.calls != 1 {
+		t.Fatalf("expected persisted calls=1, got %d", usageRepo.calls)
+	}
+	if sched.llmCallsToday != 1 {
+		t.Fatalf("expected in-memory calls=1, got %d", sched.llmCallsToday)
+	}
+}
+
+func skipContains(skips []SkipReason, reason string) bool {
+	for _, sk := range skips {
+		if sk.Reason == reason {
+			return true
+		}
+	}
+	return false
 }

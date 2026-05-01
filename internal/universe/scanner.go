@@ -24,15 +24,16 @@ type MarketDataReadonly interface {
 
 // Scanner implements funnel-based universe scanning.
 type Scanner struct {
-	cfg      app.UniverseConfig
-	strategy app.StrategyConfig
-	llmRoute app.LLMRoutingConfig
-	restURL  string
-	md       MarketDataReadonly
-	universe db.UniverseRepository
-	candles  db.CandleRepository
-	log      *logger.Logger
-	bybit    *bybitClient
+	cfg            app.UniverseConfig
+	strategy       app.StrategyConfig
+	llmRoute       app.LLMRoutingConfig
+	restURL        string
+	md             MarketDataReadonly
+	universe       db.UniverseRepository
+	candles        db.CandleRepository
+	log            *logger.Logger
+	bybit          *bybitClient
+	targetNotional float64
 
 	mu        sync.RWMutex
 	watchlist map[string]time.Time // external signal symbols with expiry
@@ -48,18 +49,20 @@ func NewScanner(
 	universe db.UniverseRepository,
 	candles db.CandleRepository,
 	log *logger.Logger,
+	targetNotional float64,
 ) *Scanner {
 	return &Scanner{
-		cfg:       cfg,
-		strategy:  strategy,
-		llmRoute:  llmRoute,
-		restURL:   restURL,
-		md:        md,
-		universe:  universe,
-		candles:   candles,
-		log:       log,
-		bybit:     newBybitClient(restURL),
-		watchlist: make(map[string]time.Time),
+		cfg:            cfg,
+		strategy:       strategy,
+		llmRoute:       llmRoute,
+		restURL:        restURL,
+		md:             md,
+		universe:       universe,
+		candles:        candles,
+		log:            log,
+		bybit:          newBybitClient(restURL),
+		watchlist:      make(map[string]time.Time),
+		targetNotional: targetNotional,
 	}
 }
 
@@ -201,7 +204,12 @@ func (s *Scanner) FilterQuality(ctx context.Context, symbols []domain.UniverseSy
 			break
 		}
 
-		ob, err := s.md.GetOrderBookSummary(ctx, sym.Symbol, 0, "")
+		side := string(domain.SideLong) // safe default for Layer 2 when no trade side exists yet
+		if s.targetNotional <= 0 {
+			s.log.Debug("skip symbol: target notional is zero", map[string]any{"symbol": sym.Symbol})
+			continue
+		}
+		ob, err := s.md.GetOrderBookSummary(ctx, sym.Symbol, s.targetNotional, side)
 		if err != nil {
 			s.log.Debug("skip symbol: no orderbook", map[string]any{"symbol": sym.Symbol, "error": err.Error()})
 			continue

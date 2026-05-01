@@ -22,6 +22,8 @@ func NewPostgresRepositories(db *sql.DB) *Repositories {
 		ExecutionRepository:       &postgresExecutionRepository{db: db},
 		AccountSnapshotRepository: &postgresAccountSnapshotRepository{db: db},
 		LLMDecisionRepository:     &postgresLLMDecisionRepository{db: db},
+		RiskDecisionRepository:    &postgresRiskDecisionRepository{db: db},
+		LLMUsageRepository:        &postgresLLMUsageRepository{db: db},
 	}
 }
 
@@ -481,12 +483,12 @@ type postgresOrderRepository struct {
 func (r *postgresOrderRepository) Insert(ctx context.Context, o domain.Order) (int64, error) {
 	var id int64
 	err := r.db.QueryRowContext(ctx,
-		`INSERT INTO orders (broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`INSERT INTO orders (broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at, intended_stop_loss, intended_take_profit)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		 RETURNING id`,
 		o.BrokerOrderID, nullableInt64Ptr(o.PositionID), o.Symbol, string(o.Side), string(o.OrderType),
 		o.Qty, nullableFloat64Ptr(o.Price), nullableFloat64Ptr(o.StopPrice),
-		string(o.Status), o.CreatedAt, o.UpdatedAt).Scan(&id)
+		string(o.Status), o.CreatedAt, o.UpdatedAt, o.IntendedSL, o.IntendedTP).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert order: %w", err)
 	}
@@ -496,11 +498,12 @@ func (r *postgresOrderRepository) Insert(ctx context.Context, o domain.Order) (i
 func (r *postgresOrderRepository) Update(ctx context.Context, o domain.Order) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE orders SET broker_order_id=$1, position_id=$2, symbol=$3, side=$4, order_type=$5,
-		 qty=$6, price=$7, stop_price=$8, status=$9, updated_at=$10
-		 WHERE id=$11`,
+		 qty=$6, price=$7, stop_price=$8, status=$9, updated_at=$10,
+		 intended_stop_loss=$11, intended_take_profit=$12
+		 WHERE id=$13`,
 		o.BrokerOrderID, nullableInt64Ptr(o.PositionID), o.Symbol, string(o.Side), string(o.OrderType),
 		o.Qty, nullableFloat64Ptr(o.Price), nullableFloat64Ptr(o.StopPrice),
-		string(o.Status), o.UpdatedAt, o.ID)
+		string(o.Status), o.UpdatedAt, o.IntendedSL, o.IntendedTP, o.ID)
 	if err != nil {
 		return fmt.Errorf("update order: %w", err)
 	}
@@ -509,7 +512,7 @@ func (r *postgresOrderRepository) Update(ctx context.Context, o domain.Order) er
 
 func (r *postgresOrderRepository) GetOpen(ctx context.Context) ([]domain.Order, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at
+		`SELECT id, broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at, intended_stop_loss, intended_take_profit
 		 FROM orders WHERE status IN ('pending', 'partially_filled') ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("query open orders: %w", err)
@@ -520,7 +523,7 @@ func (r *postgresOrderRepository) GetOpen(ctx context.Context) ([]domain.Order, 
 
 func (r *postgresOrderRepository) GetBySymbol(ctx context.Context, symbol string) ([]domain.Order, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at
+		`SELECT id, broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at, intended_stop_loss, intended_take_profit
 		 FROM orders WHERE symbol = $1 AND status IN ('pending', 'partially_filled') ORDER BY created_at DESC`, symbol)
 	if err != nil {
 		return nil, fmt.Errorf("query orders by symbol: %w", err)
@@ -530,7 +533,7 @@ func (r *postgresOrderRepository) GetBySymbol(ctx context.Context, symbol string
 }
 
 func (r *postgresOrderRepository) GetAll(ctx context.Context, since time.Time) ([]domain.Order, error) {
-	query := `SELECT id, broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at
+	query := `SELECT id, broker_order_id, position_id, symbol, side, order_type, qty, price, stop_price, status, created_at, updated_at, intended_stop_loss, intended_take_profit
 		 FROM orders WHERE created_at >= $1 OR updated_at >= $1 ORDER BY created_at DESC`
 	rows, err := r.db.QueryContext(ctx, query, since)
 	if err != nil {
@@ -548,7 +551,7 @@ func scanOrders(rows *sql.Rows) ([]domain.Order, error) {
 		var positionID sql.NullInt64
 		var price, stopPrice sql.NullFloat64
 		if err := rows.Scan(&o.ID, &o.BrokerOrderID, &positionID, &o.Symbol, &side, &orderType,
-			&o.Qty, &price, &stopPrice, &status, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			&o.Qty, &price, &stopPrice, &status, &o.CreatedAt, &o.UpdatedAt, &o.IntendedSL, &o.IntendedTP); err != nil {
 			return nil, fmt.Errorf("scan order: %w", err)
 		}
 		o.Side = domain.OrderSide(side)
@@ -697,4 +700,216 @@ func (r *postgresLLMDecisionRepository) Insert(ctx context.Context, d domain.LLM
 		return 0, fmt.Errorf("insert llm decision: %w", err)
 	}
 	return id, nil
+}
+
+func (r *postgresLLMDecisionRepository) GetByCycle(ctx context.Context, cycleID string) ([]domain.LLMDecision, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT candidate_id, raw_response, decision, confidence, size_multiplier, regime, reason_codes, risk_flags, notes, validation_status
+		 FROM llm_decisions WHERE cycle_id = $1 ORDER BY created_at`, cycleID)
+	if err != nil {
+		return nil, fmt.Errorf("query llm decisions: %w", err)
+	}
+	defer rows.Close()
+
+	var decisions []domain.LLMDecision
+	for rows.Next() {
+		var d domain.LLMDecision
+		var reasonCodesJSON, riskFlagsJSON string
+		var candidateID sql.NullInt64
+		if err := rows.Scan(&candidateID, &d.RawResponse, &d.Decision, &d.Confidence, &d.SizeMultiplier,
+			&d.Regime, &reasonCodesJSON, &riskFlagsJSON, &d.Notes, &d.ValidationStatus); err != nil {
+			return nil, fmt.Errorf("scan llm decision: %w", err)
+		}
+		if candidateID.Valid {
+			d.CandidateID = candidateID.Int64
+		}
+		d.ReasonCodes, err = unmarshalStringSlice(reasonCodesJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode reason codes: %w", err)
+		}
+		d.RiskFlags, err = unmarshalStringSlice(riskFlagsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode risk flags: %w", err)
+		}
+		decisions = append(decisions, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate llm decisions: %w", err)
+	}
+	return decisions, nil
+}
+
+// --- RiskDecisionRepository ---
+
+type postgresRiskDecisionRepository struct {
+	db *sql.DB
+}
+
+func (r *postgresRiskDecisionRepository) Insert(ctx context.Context, d domain.RiskDecision, candidateID int64, cycleID string) (int64, error) {
+	reasonCodesJSON, err := marshalStringSlice(d.ReasonCodes)
+	if err != nil {
+		return 0, err
+	}
+	var candidateIDVal any
+	if candidateID > 0 {
+		candidateIDVal = candidateID
+	}
+	var id int64
+	err = r.db.QueryRowContext(ctx,
+		`INSERT INTO risk_decisions (candidate_id, cycle_id, approved, final_position_notional, required_margin, estimated_loss, reason_codes, portfolio_rank, portfolio_reject_reason)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 RETURNING id`,
+		candidateIDVal, cycleID, d.Approved, d.FinalPositionNotional, d.RequiredMargin, d.EstimatedLoss,
+		reasonCodesJSON, d.PortfolioRank, d.PortfolioRejectReason).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("insert risk decision: %w", err)
+	}
+	return id, nil
+}
+
+func (r *postgresRiskDecisionRepository) GetByCycle(ctx context.Context, cycleID string) ([]domain.RiskDecision, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, candidate_id, cycle_id, approved, final_position_notional, required_margin, estimated_loss, reason_codes, portfolio_rank, portfolio_reject_reason, created_at
+		 FROM risk_decisions WHERE cycle_id = $1 ORDER BY created_at, id`, cycleID)
+	if err != nil {
+		return nil, fmt.Errorf("query risk decisions: %w", err)
+	}
+	defer rows.Close()
+
+	var decisions []domain.RiskDecision
+	for rows.Next() {
+		var d domain.RiskDecision
+		var candidateID sql.NullInt64
+		var reasonCodesJSON string
+		if err := rows.Scan(&d.ID, &candidateID, &d.CycleID, &d.Approved, &d.FinalPositionNotional,
+			&d.RequiredMargin, &d.EstimatedLoss, &reasonCodesJSON, &d.PortfolioRank,
+			&d.PortfolioRejectReason, &d.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan risk decision: %w", err)
+		}
+		if candidateID.Valid {
+			d.CandidateID = candidateID.Int64
+		}
+		d.ReasonCodes, err = unmarshalStringSlice(reasonCodesJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode risk reason codes: %w", err)
+		}
+		decisions = append(decisions, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate risk decisions: %w", err)
+	}
+	return decisions, nil
+}
+
+// --- LLMUsageRepository ---
+
+type postgresLLMUsageRepository struct {
+	db *sql.DB
+}
+
+func (r *postgresLLMUsageRepository) Get(ctx context.Context, usageDate time.Time) (*domain.LLMUsageState, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT usage_date, calls, cost_usd, updated_at FROM llm_usage_daily WHERE usage_date = $1`,
+		usageDate.Format("2006-01-02"))
+	var state domain.LLMUsageState
+	err := row.Scan(&state.UsageDate, &state.Calls, &state.CostUSD, &state.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get llm usage: %w", err)
+	}
+	return &state, nil
+}
+
+func (r *postgresLLMUsageRepository) IncrementCalls(ctx context.Context, usageDate time.Time, calls int) error {
+	if calls <= 0 {
+		return nil
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO llm_usage_daily (usage_date, calls, updated_at)
+		 VALUES ($1, $2, NOW())
+		 ON CONFLICT (usage_date) DO UPDATE SET
+		 calls = llm_usage_daily.calls + EXCLUDED.calls,
+		 updated_at = NOW()`,
+		usageDate.Format("2006-01-02"), calls)
+	if err != nil {
+		return fmt.Errorf("increment llm usage: %w", err)
+	}
+	return nil
+}
+
+func (r *postgresExecutionRepository) GetAll(ctx context.Context, since time.Time) ([]domain.Execution, error) {
+	query := `SELECT id, order_id, symbol, side, qty, price, fee, slippage, executed_at
+		 FROM executions WHERE executed_at >= $1 ORDER BY executed_at DESC`
+	if since.IsZero() {
+		query = `SELECT id, order_id, symbol, side, qty, price, fee, slippage, executed_at
+			 FROM executions ORDER BY executed_at DESC`
+		rows, err := r.db.QueryContext(ctx, query)
+		if err != nil {
+			return nil, fmt.Errorf("query executions: %w", err)
+		}
+		defer rows.Close()
+		return scanExecutions(rows)
+	}
+	rows, err := r.db.QueryContext(ctx, query, since)
+	if err != nil {
+		return nil, fmt.Errorf("query executions: %w", err)
+	}
+	defer rows.Close()
+	return scanExecutions(rows)
+}
+
+func scanExecutions(rows *sql.Rows) ([]domain.Execution, error) {
+	var executions []domain.Execution
+	for rows.Next() {
+		var e domain.Execution
+		var side string
+		if err := rows.Scan(&e.ID, &e.OrderID, &e.Symbol, &side, &e.Qty, &e.Price, &e.Fee, &e.Slippage, &e.ExecutedAt); err != nil {
+			return nil, fmt.Errorf("scan execution: %w", err)
+		}
+		e.Side = domain.OrderSide(side)
+		executions = append(executions, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate executions: %w", err)
+	}
+	return executions, nil
+}
+
+func (r *postgresAccountSnapshotRepository) GetAll(ctx context.Context, since time.Time) ([]domain.AccountState, error) {
+	query := `SELECT id, balance, available_balance, used_margin, equity, realized_pnl, unrealized_pnl, total_fees, total_slippage, daily_loss, recorded_at
+		 FROM account_snapshots WHERE recorded_at >= $1 ORDER BY recorded_at DESC`
+	if since.IsZero() {
+		query = `SELECT id, balance, available_balance, used_margin, equity, realized_pnl, unrealized_pnl, total_fees, total_slippage, daily_loss, recorded_at
+			 FROM account_snapshots ORDER BY recorded_at DESC`
+		rows, err := r.db.QueryContext(ctx, query)
+		if err != nil {
+			return nil, fmt.Errorf("query account snapshots: %w", err)
+		}
+		defer rows.Close()
+		return scanAccountSnapshots(rows)
+	}
+	rows, err := r.db.QueryContext(ctx, query, since)
+	if err != nil {
+		return nil, fmt.Errorf("query account snapshots: %w", err)
+	}
+	defer rows.Close()
+	return scanAccountSnapshots(rows)
+}
+
+func scanAccountSnapshots(rows *sql.Rows) ([]domain.AccountState, error) {
+	var snapshots []domain.AccountState
+	for rows.Next() {
+		var a domain.AccountState
+		if err := rows.Scan(&a.ID, &a.Balance, &a.AvailableBalance, &a.UsedMargin, &a.Equity,
+			&a.RealizedPnL, &a.UnrealizedPnL, &a.TotalFees, &a.TotalSlippage, &a.DailyLoss, &a.RecordedAt); err != nil {
+			return nil, fmt.Errorf("scan account snapshot: %w", err)
+		}
+		snapshots = append(snapshots, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate account snapshots: %w", err)
+	}
+	return snapshots, nil
 }

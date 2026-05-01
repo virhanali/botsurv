@@ -310,6 +310,9 @@ func (c *UserConfig) Validate() error {
 	if err := c.Broker.Paper.validate(); err != nil {
 		return err
 	}
+	if c.ComputeTargetNotional() <= 0 {
+		return errors.New("target notional must be > 0: set sizing.margin_per_trade_usd and sizing.max_leverage (or portfolio_risk equivalents)")
+	}
 	if err := c.Strategy.validate(); err != nil {
 		return err
 	}
@@ -495,8 +498,8 @@ func (c *LLMConfig) Validate() error {
 	if !c.Enabled {
 		return nil
 	}
-	if c.Provider != "openrouter" {
-		return errors.New("provider must be 'openrouter'")
+	if c.Provider != "openrouter" && c.Provider != "deepseek" {
+		return errors.New("provider must be 'openrouter' or 'deepseek'")
 	}
 	if c.BaseURL == "" {
 		return errors.New("base_url is required when LLM is enabled")
@@ -504,14 +507,25 @@ func (c *LLMConfig) Validate() error {
 	if c.Model == "" {
 		return errors.New("model is required when LLM is enabled")
 	}
-	if c.Temperature != 0 {
-		return errors.New("temperature must be 0")
+	if c.Provider == "openrouter" && c.Temperature != 0 {
+		return errors.New("temperature must be 0 for openrouter")
 	}
 	if c.TimeoutSeconds <= 0 {
 		return errors.New("timeout_seconds must be > 0")
 	}
 	if c.MaxTokens <= 0 {
 		return errors.New("max_tokens must be > 0")
+	}
+	// Fail-fast API key validation
+	switch c.Provider {
+	case "openrouter":
+		if os.Getenv("OPENROUTER_API_KEY") == "" {
+			return errors.New("OPENROUTER_API_KEY environment variable is required when llm.provider=openrouter")
+		}
+	case "deepseek":
+		if os.Getenv("DEEPSEEK_API_KEY") == "" {
+			return errors.New("DEEPSEEK_API_KEY environment variable is required when llm.provider=deepseek")
+		}
 	}
 	return nil
 }
@@ -522,4 +536,25 @@ func LoadEnv() error {
 		return nil
 	}
 	return godotenv.Load(".env")
+}
+
+// ComputeTargetNotional calculates the target notional for orderbook depth/slippage
+// estimation based on config sizing. It tries sizing config first, then portfolio risk,
+// then broker paper default leverage. It returns 0 only if no valid config exists.
+func (c *UserConfig) ComputeTargetNotional() float64 {
+	margin := c.Sizing.MarginPerTradeUSD
+	if margin <= 0 {
+		margin = c.PortfolioRisk.MarginPerTradeUSD
+	}
+	leverage := c.Sizing.MaxLeverage
+	if leverage <= 0 {
+		leverage = c.PortfolioRisk.MaxLeverage
+	}
+	if leverage <= 0 {
+		leverage = c.Broker.Paper.DefaultLeverage
+	}
+	if margin > 0 && leverage > 0 {
+		return margin * leverage
+	}
+	return 0
 }

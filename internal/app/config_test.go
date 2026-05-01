@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+func TestMain(m *testing.M) {
+	os.Setenv("OPENROUTER_API_KEY", "test-key")
+	os.Setenv("DEEPSEEK_API_KEY", "test-key")
+	code := m.Run()
+	os.Exit(code)
+}
+
 func minimalValidConfig() *UserConfig {
 	return &UserConfig{
 		App: AppConfig{
@@ -185,6 +192,10 @@ portfolio_risk:
   max_daily_loss_pct: 3
   max_leverage: 5
   min_notional_usd: 5
+sizing:
+  method: fixed_margin
+  margin_per_trade_usd: 100
+  max_leverage: 10
 llm:
   enabled: false
 alerts:
@@ -460,5 +471,32 @@ func TestLLMConfigValidate(t *testing.T) {
 	disabled := LLMConfig{Enabled: false}
 	if err := disabled.Validate(); err != nil {
 		t.Errorf("expected no error when disabled, got %v", err)
+	}
+
+	deepseekValid := LLMConfig{Enabled: true, Provider: "deepseek", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-pro", TimeoutSeconds: 30, MaxTokens: 512}
+	if err := deepseekValid.Validate(); err != nil {
+		t.Errorf("expected deepseek valid, got %v", err)
+	}
+
+	invalidProvider := LLMConfig{Enabled: true, Provider: "unknown", BaseURL: "https://example.com", Model: "test", Temperature: 0, TimeoutSeconds: 30, MaxTokens: 512}
+	if err := invalidProvider.Validate(); err == nil {
+		t.Error("expected error for invalid provider")
+	}
+}
+
+func TestConfigValidate_TargetNotionalPositive(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Sizing.MarginPerTradeUSD = 0
+	cfg.Sizing.MaxLeverage = 0
+	cfg.PortfolioRisk.MarginPerTradeUSD = 0
+	cfg.PortfolioRisk.MaxLeverage = 0
+	// Broker.Paper.DefaultLeverage remains positive from minimalValidConfig,
+	// but margin is zero so target notional should still be zero.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for zero target notional")
+	}
+	if !strings.Contains(err.Error(), "target notional must be > 0") {
+		t.Errorf("expected target notional error, got: %v", err)
 	}
 }

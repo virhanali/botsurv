@@ -129,6 +129,10 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 	pb.SetOrderRepo(repos.OrderRepository)
 	pb.SetExecutionRepo(repos.ExecutionRepository)
 	pb.SetAccountSnapshotRepo(repos.AccountSnapshotRepository)
+	if err := pb.Rehydrate(context.Background()); err != nil {
+		_ = database.Close()
+		return nil, nil, fmt.Errorf("rehydrate paper broker: %w", err)
+	}
 
 	// Create alert service
 	var alertSvc alert.Service
@@ -154,6 +158,7 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 		cfg.Universe, cfg.Strategy, cfg.LLMRouting,
 		cfg.MarketData.RESTURL, mdSvc,
 		repos.UniverseRepository, repos.CandleRepository, log,
+		cfg.ComputeTargetNotional(),
 	)
 
 	screenerSvc := screener.NewScreener(*cfg, universeScanner, mdSvc, log)
@@ -161,7 +166,12 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 	// Create LLM client (conditionally)
 	var llmClient llm.Client
 	if cfg.LLM.Enabled {
-		llmClient = llm.NewOpenRouterClient(cfg.LLM, log)
+		switch cfg.LLM.Provider {
+		case "deepseek":
+			llmClient = llm.NewDeepSeekClient(cfg.LLM, log)
+		default:
+			llmClient = llm.NewOpenRouterClient(cfg.LLM, log)
+		}
 	} else {
 		llmClient = llm.NewMockClient(domain.LLMDecision{
 			Decision:       "ALLOW_MARKET",
@@ -181,6 +191,8 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 	sched := scheduler.NewScheduler(*cfg, screenerSvc, llmClient, riskEng, exec, mon, mdSvc, log)
 	sched.SetAlertService(alertSvc)
 	sched.SetLLMDecisionRepo(repos.LLMDecisionRepository)
+	sched.SetRiskDecisionRepo(repos.RiskDecisionRepository)
+	sched.SetLLMUsageRepo(repos.LLMUsageRepository)
 	sched.SetCycleRepo(repos.CycleRepository)
 	sched.SetCandidateRepo(repos.CandidateRepository)
 

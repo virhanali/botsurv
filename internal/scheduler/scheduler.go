@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -33,10 +34,16 @@ type Scheduler struct {
 	running  bool
 	cycleSeq int
 
-	alertSvc        alert.Service
-	llmDecisionRepo db.LLMDecisionRepository
-	cycleRepo       db.CycleRepository
-	candidateRepo   db.CandidateRepository
+	alertSvc         alert.Service
+	llmDecisionRepo  db.LLMDecisionRepository
+	riskDecisionRepo db.RiskDecisionRepository
+	llmUsageRepo     db.LLMUsageRepository
+	cycleRepo        db.CycleRepository
+	candidateRepo    db.CandidateRepository
+
+	// LLM daily call tracking. Persisted when llmUsageRepo is wired.
+	llmCallsToday int
+	llmCallsDate  string // YYYY-MM-DD
 }
 
 // NewScheduler creates a new Scheduler.
@@ -68,6 +75,12 @@ func (s *Scheduler) SetAlertService(svc alert.Service) { s.alertSvc = svc }
 // SetLLMDecisionRepo sets the LLM decision repository for persistence.
 func (s *Scheduler) SetLLMDecisionRepo(repo db.LLMDecisionRepository) { s.llmDecisionRepo = repo }
 
+// SetRiskDecisionRepo sets the risk decision repository for persistence.
+func (s *Scheduler) SetRiskDecisionRepo(repo db.RiskDecisionRepository) { s.riskDecisionRepo = repo }
+
+// SetLLMUsageRepo sets the daily LLM usage repository for persistence.
+func (s *Scheduler) SetLLMUsageRepo(repo db.LLMUsageRepository) { s.llmUsageRepo = repo }
+
 // SetCycleRepo sets the cycle repository for persistence.
 func (s *Scheduler) SetCycleRepo(repo db.CycleRepository) { s.cycleRepo = repo }
 
@@ -89,6 +102,13 @@ type CycleResult struct {
 type SkipReason struct {
 	Symbol string
 	Reason string
+}
+
+type riskCandidate struct {
+	candidate   domain.Candidate
+	decision    domain.LLMDecision
+	output      risk.ValidateOutput
+	candidateID int64
 }
 
 // RunOnce executes a single trading cycle.
@@ -167,11 +187,30 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		return result, nil
 	}
 
-	// 4. For each eligible candidate: LLM veto -> risk -> execute
-	for _, cand := range screenResult.Candidates {
+	// 4. Apply LLM call caps.
+	s.loadLLMUsage(ctx)
+	cappedCandidates, skippedByCap := s.applyLLMCaps(screenResult.Candidates)
+	for _, sk := range skippedByCap {
+		result.Skips = append(result.Skips, sk)
+	}
+
+	// 5. For each capped eligible candidate: LLM veto -> risk validation.
+	var approvedForPortfolio []riskCandidate
+	for _, cand := range cappedCandidates {
 		ctxJSON, ok := screenResult.LLMContexts[cand.Symbol]
 		if !ok {
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "NO_CONTEXT"})
+			continue
+		}
+
+		// Per-cycle call cap check
+		if s.cfg.LLMRouting.MaxCallsPerCycle > 0 && result.LLMCalls >= s.cfg.LLMRouting.MaxCallsPerCycle {
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_CALL_CAP_PER_CYCLE"})
+			s.log.Info("candidate skipped: LLM call cap per cycle reached", map[string]any{
+				"symbol":    cand.Symbol,
+				"llm_calls": result.LLMCalls,
+				"max_calls": s.cfg.LLMRouting.MaxCallsPerCycle,
+			})
 			continue
 		}
 
@@ -182,6 +221,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			continue
 		}
 		result.LLMCalls++
+		s.trackLLMCall(ctx)
 
 		// Persist LLM decision with real candidate_id
 		candID := candidateIDs[cand.Symbol]
@@ -202,7 +242,8 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 		// Risk validation with real market data
 		monitorStatus := s.monitor.Status(ctx)
-		ob, _ := s.md.GetOrderBookSummary(ctx, cand.Symbol, 0, "")
+		targetNotional := s.cfg.ComputeTargetNotional()
+		ob, _ := s.md.GetOrderBookSummary(ctx, cand.Symbol, targetNotional, string(cand.Side))
 		marketPrice, _ := s.md.GetLatestPrice(ctx, cand.Symbol)
 
 		riskInput := risk.ValidateInput{
@@ -228,6 +269,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 		riskOutput := s.riskEng.Validate(riskInput)
 		if !riskOutput.Approved {
+			s.saveRiskDecision(ctx, riskOutput, candID, cycleID)
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "RISK_REJECTED"})
 			s.log.Info("candidate rejected by risk", map[string]any{
 				"symbol":  cand.Symbol,
@@ -236,7 +278,49 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			continue
 		}
 
-		// Execute
+		approvedForPortfolio = append(approvedForPortfolio, riskCandidate{
+			candidate:   cand,
+			decision:    llmDecision,
+			output:      riskOutput,
+			candidateID: candID,
+		})
+	}
+
+	// 6. Rank all risk-approved candidates before execution. This prevents
+	// sequential candidate order from deciding portfolio allocation.
+	sort.SliceStable(approvedForPortfolio, func(i, j int) bool {
+		return approvedForPortfolio[i].candidate.CandidateScore > approvedForPortfolio[j].candidate.CandidateScore
+	})
+	maxNew := s.cfg.PortfolioRisk.MaxNewPositionsPerCycle
+	if maxNew <= 0 {
+		maxNew = len(approvedForPortfolio)
+	}
+	remainingNew := maxNew - result.Executions
+	if remainingNew < 0 {
+		remainingNew = 0
+	}
+
+	for i, item := range approvedForPortfolio {
+		cand := item.candidate
+		llmDecision := item.decision
+		riskOutput := item.output
+		if i >= remainingNew {
+			riskOutput.Approved = false
+			riskOutput.PortfolioRejectReason = "PORTFOLIO_RISK_LIMIT"
+			riskOutput.ReasonCodes = append(riskOutput.ReasonCodes, "PORTFOLIO_RISK_LIMIT")
+			s.saveRiskDecision(ctx, riskOutput, item.candidateID, cycleID)
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "PORTFOLIO_RISK_LIMIT"})
+			s.log.Info("candidate rejected by portfolio ranking", map[string]any{
+				"symbol": cand.Symbol,
+				"score":  cand.CandidateScore,
+			})
+			continue
+		}
+
+		riskOutput.PortfolioRank = i + 1
+		s.saveRiskDecision(ctx, riskOutput, item.candidateID, cycleID)
+
+		// Execute only after final portfolio selection.
 		execResult := s.executor.Execute(ctx, cand, llmDecision, riskOutput)
 		if execResult.Success {
 			result.Executions++
@@ -354,6 +438,24 @@ func (s *Scheduler) saveLLMDecision(ctx context.Context, d domain.LLMDecision, c
 	}
 }
 
+func (s *Scheduler) saveRiskDecision(ctx context.Context, d risk.ValidateOutput, candidateID int64, cycleID string) {
+	if s.riskDecisionRepo == nil {
+		return
+	}
+	decision := domain.RiskDecision{
+		Approved:              d.Approved,
+		FinalPositionNotional: d.FinalPositionNotional,
+		RequiredMargin:        d.RequiredMargin,
+		EstimatedLoss:         d.EstimatedLoss,
+		ReasonCodes:           d.ReasonCodes,
+		PortfolioRank:         d.PortfolioRank,
+		PortfolioRejectReason: d.PortfolioRejectReason,
+	}
+	if _, err := s.riskDecisionRepo.Insert(ctx, decision, candidateID, cycleID); err != nil {
+		s.log.Error("failed to save risk decision", map[string]any{"error": err.Error()})
+	}
+}
+
 func (s *Scheduler) insertCycleRunning(ctx context.Context, cycleID string, startedAt time.Time) {
 	if s.cycleRepo == nil {
 		return
@@ -409,4 +511,156 @@ func containsAny(haystack []string, needles []string) bool {
 // RefreshUniverse exposes universe refresh for CLI.
 func (s *Scheduler) RefreshUniverse(ctx context.Context) error {
 	return s.screener.RefreshUniverse(ctx)
+}
+
+// applyLLMCaps enforces the strictest positive cap among:
+//   - hard_cap_candidates_per_cycle
+//   - max_calls_per_cycle
+//   - remaining max_calls_per_day
+//
+// 0 means unlimited for each field.
+// Candidates are sorted by candidate_score descending before truncation.
+func (s *Scheduler) applyLLMCaps(candidates []domain.Candidate) ([]domain.Candidate, []SkipReason) {
+	if len(candidates) == 0 {
+		return candidates, nil
+	}
+
+	// Ensure daily counter is on the correct date.
+	today := time.Now().Format("2006-01-02")
+	if s.llmCallsDate != today {
+		s.llmCallsDate = today
+		s.llmCallsToday = 0
+	}
+
+	// Check daily cap first — if exhausted, block everything.
+	if s.cfg.LLMRouting.MaxCallsPerDay > 0 && s.llmCallsToday >= s.cfg.LLMRouting.MaxCallsPerDay {
+		var skips []SkipReason
+		for _, c := range candidates {
+			skips = append(skips, SkipReason{Symbol: c.Symbol, Reason: "LLM_CALL_CAP_PER_DAY"})
+		}
+		s.log.Warn("LLM daily call cap reached", map[string]any{
+			"llm_calls_today": s.llmCallsToday,
+			"max_calls_day":   s.cfg.LLMRouting.MaxCallsPerDay,
+		})
+		return nil, skips
+	}
+
+	// Determine the strictest positive effective cap and keep the reason tied to
+	// the cap that actually limited the candidate set.
+	effectiveCap := 0
+	capReason := "LLM_HARD_CAP"
+
+	setCap := func(candidateCap int, reason string) {
+		if candidateCap > 0 {
+			if effectiveCap == 0 || candidateCap < effectiveCap {
+				effectiveCap = candidateCap
+				capReason = reason
+			}
+		}
+	}
+
+	setCap(s.cfg.LLMRouting.HardCapCandidatesPerCycle, "LLM_HARD_CAP")
+	setCap(s.cfg.LLMRouting.MaxCallsPerCycle, "LLM_CALL_CAP_PER_CYCLE")
+
+	if s.cfg.LLMRouting.MaxCallsPerDay > 0 {
+		remainingToday := s.cfg.LLMRouting.MaxCallsPerDay - s.llmCallsToday
+		if remainingToday > 0 {
+			setCap(remainingToday, "LLM_CALL_CAP_PER_DAY")
+		} else {
+			// Should have been caught above, but guard anyway.
+			var skips []SkipReason
+			for _, c := range candidates {
+				skips = append(skips, SkipReason{Symbol: c.Symbol, Reason: "LLM_CALL_CAP_PER_DAY"})
+			}
+			return nil, skips
+		}
+	}
+
+	// No cap configured — return all candidates.
+	if effectiveCap <= 0 {
+		return candidates, nil
+	}
+
+	// Sort by candidate_score descending (bubble sort is fine for small N).
+	sorted := make([]domain.Candidate, len(candidates))
+	copy(sorted, candidates)
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j].CandidateScore > sorted[i].CandidateScore {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+
+	if len(sorted) <= effectiveCap {
+		return sorted, nil
+	}
+
+	kept := sorted[:effectiveCap]
+	dropped := sorted[effectiveCap:]
+	var skips []SkipReason
+	for _, c := range dropped {
+		skips = append(skips, SkipReason{Symbol: c.Symbol, Reason: capReason})
+	}
+
+	s.log.Info("LLM cap applied", map[string]any{
+		"eligible_before": len(candidates),
+		"eligible_after":  len(kept),
+		"effective_cap":   effectiveCap,
+		"hard_cap":        s.cfg.LLMRouting.HardCapCandidatesPerCycle,
+		"call_cap":        s.cfg.LLMRouting.MaxCallsPerCycle,
+		"daily_remaining": s.cfg.LLMRouting.MaxCallsPerDay - s.llmCallsToday,
+	})
+
+	return kept, skips
+}
+
+func (s *Scheduler) loadLLMUsage(ctx context.Context) {
+	today := time.Now().Format("2006-01-02")
+	if s.llmUsageRepo == nil {
+		if s.llmCallsDate != today {
+			s.llmCallsDate = today
+			s.llmCallsToday = 0
+		}
+		return
+	}
+
+	usageDate, err := time.Parse("2006-01-02", today)
+	if err != nil {
+		return
+	}
+	state, err := s.llmUsageRepo.Get(ctx, usageDate)
+	if err != nil {
+		s.log.Warn("failed to load LLM usage state", map[string]any{"error": err.Error()})
+		if s.llmCallsDate != today {
+			s.llmCallsDate = today
+			s.llmCallsToday = 0
+		}
+		return
+	}
+	s.llmCallsDate = today
+	if state == nil {
+		s.llmCallsToday = 0
+		return
+	}
+	s.llmCallsToday = state.Calls
+}
+
+func (s *Scheduler) trackLLMCall(ctx context.Context) {
+	today := time.Now().Format("2006-01-02")
+	if s.llmCallsDate != today {
+		s.llmCallsDate = today
+		s.llmCallsToday = 0
+	}
+	s.llmCallsToday++
+	if s.llmUsageRepo == nil {
+		return
+	}
+	usageDate, err := time.Parse("2006-01-02", today)
+	if err != nil {
+		return
+	}
+	if err := s.llmUsageRepo.IncrementCalls(ctx, usageDate, 1); err != nil {
+		s.log.Error("failed to persist LLM usage", map[string]any{"error": err.Error()})
+	}
 }

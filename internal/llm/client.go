@@ -51,35 +51,42 @@ func (m *MockClient) VetoRequest(_ context.Context, _ string) (domain.LLMDecisio
 func (m *MockClient) DailyCost() float64 { return m.cost }
 func (m *MockClient) ResetDailyCost()    { m.cost = 0 }
 
-// OpenRouterClient calls the OpenRouter Chat Completions API.
-type OpenRouterClient struct {
+// openAIClient is a provider-agnostic OpenAI-compatible chat completions client.
+// It supports OpenRouter and DeepSeek via provider-specific request/response handling.
+type openAIClient struct {
 	cfg       app.LLMConfig
 	budget    app.LLMBudgetConfig
 	log       *logger.Logger
 	client    *http.Client
 	dailyCost float64
+	provider  string // "openrouter" or "deepseek"
 }
 
+// OpenRouterClient is kept for backward compatibility with existing callers and tests.
+type OpenRouterClient = openAIClient
+
 // NewOpenRouterClient creates a new OpenRouter LLM client.
-func NewOpenRouterClient(cfg app.LLMConfig, log *logger.Logger) *OpenRouterClient {
+func NewOpenRouterClient(cfg app.LLMConfig, log *logger.Logger) *openAIClient {
+	return newOpenAIClient(cfg, log, "openrouter")
+}
+
+// NewDeepSeekClient creates a new DeepSeek LLM client.
+func NewDeepSeekClient(cfg app.LLMConfig, log *logger.Logger) *openAIClient {
+	return newOpenAIClient(cfg, log, "deepseek")
+}
+
+func newOpenAIClient(cfg app.LLMConfig, log *logger.Logger, provider string) *openAIClient {
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	return &OpenRouterClient{
-		cfg:    cfg,
-		budget: cfg.Budget,
-		log:    log,
-		client: &http.Client{Timeout: timeout},
+	return &openAIClient{
+		cfg:      cfg,
+		budget:   cfg.Budget,
+		log:      log,
+		client:   &http.Client{Timeout: timeout},
+		provider: provider,
 	}
-}
-
-type chatRequest struct {
-	Model          string          `json:"model"`
-	Messages       []chatMessage   `json:"messages"`
-	Temperature    float64         `json:"temperature"`
-	MaxTokens      int             `json:"max_tokens"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 }
 
 type chatMessage struct {
@@ -91,11 +98,37 @@ type responseFormat struct {
 	Type string `json:"type"`
 }
 
+// deepSeekChatRequest extends the base request with DeepSeek-specific fields.
+type deepSeekChatRequest struct {
+	Model           string        `json:"model"`
+	Messages        []chatMessage `json:"messages"`
+	MaxTokens       int           `json:"max_tokens"`
+	ReasoningEffort string        `json:"reasoning_effort"`
+	Thinking        *thinkingCfg  `json:"thinking,omitempty"`
+}
+
+type thinkingCfg struct {
+	Type string `json:"type"`
+}
+
+// openRouterChatRequest is the request shape for OpenRouter.
+type openRouterChatRequest struct {
+	Model          string          `json:"model"`
+	Messages       []chatMessage   `json:"messages"`
+	Temperature    float64         `json:"temperature"`
+	MaxTokens      int             `json:"max_tokens"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+}
+
+// chatMessageResponse models a single choice message, including optional reasoning_content.
+type chatMessageResponse struct {
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content"`
+}
+
 type chatResponse struct {
 	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
+		Message chatMessageResponse `json:"message"`
 	} `json:"choices"`
 	Usage *struct {
 		TotalTokens int `json:"total_tokens"`
@@ -106,14 +139,28 @@ type chatResponse struct {
 }
 
 // VetoRequest sends a context to the LLM and returns a parsed decision.
-func (c *OpenRouterClient) VetoRequest(ctx context.Context, contextJSON string) (domain.LLMDecision, error) {
+func (c *openAIClient) VetoRequest(ctx context.Context, contextJSON string) (domain.LLMDecision, error) {
 	// Budget check
 	if c.budget.MaxCostUSDPerDay > 0 && c.dailyCost >= c.budget.MaxCostUSDPerDay {
 		c.log.Warn("LLM budget exceeded", map[string]any{
 			"daily_cost": c.dailyCost,
 			"max":        c.budget.MaxCostUSDPerDay,
 		})
-		return c.fallbackDecision("BLOCK", "LLM_BUDGET_EXCEEDED"), nil
+		return c.fallbackDecision("BLOCK", "LLM_BUDGET_EXCEEDED", ""), nil
+	}
+
+	// API key check — fail fast with fallback BLOCK if missing.
+	switch c.provider {
+	case "deepseek":
+		if os.Getenv("DEEPSEEK_API_KEY") == "" {
+			c.log.Error("DEEPSEEK_API_KEY not set", nil)
+			return c.fallbackDecision("BLOCK", "MISSING_API_KEY", ""), nil
+		}
+	default: // openrouter
+		if os.Getenv("OPENROUTER_API_KEY") == "" {
+			c.log.Error("OPENROUTER_API_KEY not set", nil)
+			return c.fallbackDecision("BLOCK", "MISSING_API_KEY", ""), nil
+		}
 	}
 
 	systemPrompt := `You are a crypto trading veto agent. Analyze the candidate context and respond with ONLY a JSON object. No markdown, no explanation.
@@ -131,35 +178,67 @@ Required JSON format:
   "notes": "brief explanation"
 }`
 
-	reqBody := chatRequest{
-		Model: c.cfg.Model,
-		Messages: []chatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: contextJSON},
-		},
-		Temperature:    0,
-		MaxTokens:      c.cfg.MaxTokens,
-		ResponseFormat: &responseFormat{Type: "json_object"},
-	}
+	var body []byte
+	var err error
+	var apiKey string
+	var headers map[string]string
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return c.fallbackDecision("BLOCK", "REQUEST_MARSHAL_ERROR"), nil
+	switch c.provider {
+	case "deepseek":
+		reqBody := deepSeekChatRequest{
+			Model: c.cfg.Model,
+			Messages: []chatMessage{
+				{Role: "system", Content: systemPrompt},
+				{Role: "user", Content: contextJSON},
+			},
+			MaxTokens:       c.cfg.MaxTokens,
+			ReasoningEffort: "max",
+			Thinking:        &thinkingCfg{Type: "enabled"},
+		}
+		body, err = json.Marshal(reqBody)
+		if err != nil {
+			return c.fallbackDecision("BLOCK", "REQUEST_MARSHAL_ERROR", ""), nil
+		}
+		apiKey = os.Getenv("DEEPSEEK_API_KEY")
+		headers = map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer " + apiKey,
+		}
+
+	default: // openrouter
+		reqBody := openRouterChatRequest{
+			Model: c.cfg.Model,
+			Messages: []chatMessage{
+				{Role: "system", Content: systemPrompt},
+				{Role: "user", Content: contextJSON},
+			},
+			Temperature:    0,
+			MaxTokens:      c.cfg.MaxTokens,
+			ResponseFormat: &responseFormat{Type: "json_object"},
+		}
+		body, err = json.Marshal(reqBody)
+		if err != nil {
+			return c.fallbackDecision("BLOCK", "REQUEST_MARSHAL_ERROR", ""), nil
+		}
+		apiKey = os.Getenv("OPENROUTER_API_KEY")
+		headers = map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer " + apiKey,
+		}
+		if siteURL := os.Getenv("OPENROUTER_SITE_URL"); siteURL != "" {
+			headers["HTTP-Referer"] = siteURL
+		}
+		if appName := os.Getenv("OPENROUTER_APP_NAME"); appName != "" {
+			headers["X-Title"] = appName
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return c.fallbackDecision("BLOCK", "REQUEST_CREATE_ERROR"), nil
+		return c.fallbackDecision("BLOCK", "REQUEST_CREATE_ERROR", ""), nil
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("OPENROUTER_API_KEY"))
-
-	if siteURL := os.Getenv("OPENROUTER_SITE_URL"); siteURL != "" {
-		req.Header.Set("HTTP-Referer", siteURL)
-	}
-	if appName := os.Getenv("OPENROUTER_APP_NAME"); appName != "" {
-		req.Header.Set("X-Title", appName)
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 
 	// Retry loop for transient failures (5xx, timeout) with exponential backoff.
@@ -174,14 +253,14 @@ Required JSON format:
 			}
 			select {
 			case <-ctx.Done():
-				return c.fallbackDecision("BLOCK", "TIMEOUT_CANCELED"), ctx.Err()
+				return c.fallbackDecision("BLOCK", "TIMEOUT_CANCELED", ""), ctx.Err()
 			case <-time.After(backoff):
 			}
 		}
 		// Recreate request for each attempt (body is consumed by Do).
 		retryReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
-			return c.fallbackDecision("BLOCK", "REQUEST_CREATE_ERROR"), nil
+			return c.fallbackDecision("BLOCK", "REQUEST_CREATE_ERROR", ""), nil
 		}
 		retryReq.Header = req.Header.Clone()
 
@@ -196,55 +275,57 @@ Required JSON format:
 	}
 	if lastErr != nil {
 		c.log.Error("LLM API error after retries", map[string]any{"error": lastErr.Error()})
-		return c.fallbackDecision("BLOCK", "API_ERROR"), nil
+		return c.fallbackDecision("BLOCK", "API_ERROR", ""), nil
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return c.fallbackDecision("BLOCK", "RESPONSE_READ_ERROR"), nil
+		return c.fallbackDecision("BLOCK", "RESPONSE_READ_ERROR", ""), nil
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		c.log.Error("LLM API non-200", map[string]any{"status": resp.StatusCode, "body": string(respBody)})
-		return c.fallbackDecision("BLOCK", fmt.Sprintf("API_STATUS_%d", resp.StatusCode)), nil
+		return c.fallbackDecision("BLOCK", fmt.Sprintf("API_STATUS_%d", resp.StatusCode), string(respBody)), nil
 	}
 
 	var chatResp chatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
 		c.log.Error("LLM response parse error", map[string]any{"body": string(respBody)})
-		return c.fallbackDecision("BLOCK", "INVALID_JSON"), nil
+		return c.fallbackDecision("BLOCK", "INVALID_JSON", string(respBody)), nil
 	}
 
 	if chatResp.Error != nil {
 		c.log.Error("LLM API error in response", map[string]any{"message": chatResp.Error.Message})
-		return c.fallbackDecision("BLOCK", "API_ERROR_IN_RESPONSE"), nil
+		return c.fallbackDecision("BLOCK", "API_ERROR_IN_RESPONSE", string(respBody)), nil
 	}
 
 	if len(chatResp.Choices) == 0 {
-		return c.fallbackDecision("BLOCK", "NO_CHOICES"), nil
+		return c.fallbackDecision("BLOCK", "NO_CHOICES", string(respBody)), nil
 	}
+
+	rawContent := chatResp.Choices[0].Message.Content
 
 	// Parse the LLM's JSON response
-	decision, err := c.parseDecision(chatResp.Choices[0].Message.Content)
+	decision, err := c.parseDecision(rawContent)
 	if err != nil {
-		c.log.Error("LLM decision parse error", map[string]any{"content": chatResp.Choices[0].Message.Content, "error": err.Error()})
-		return c.fallbackDecision("BLOCK", "INVALID_DECISION_JSON"), nil
+		c.log.Error("LLM decision parse error", map[string]any{"content": rawContent, "error": err.Error()})
+		return c.fallbackDecision("BLOCK", "INVALID_DECISION_JSON", rawContent), nil
 	}
 
-	decision.RawResponse = chatResp.Choices[0].Message.Content
+	decision.RawResponse = rawContent
 
 	// Validate decision
 	if err := c.validateDecision(decision); err != nil {
 		c.log.Warn("LLM decision validation failed", map[string]any{"error": err.Error(), "decision": decision.Decision})
-		return c.fallbackDecision("BLOCK", "VALIDATION_FAILED"), nil
+		return c.fallbackDecision("BLOCK", "VALIDATION_FAILED", rawContent), nil
 	}
 
 	// Confidence check
 	minConf := 0.6
 	if decision.Confidence < minConf {
 		c.log.Warn("LLM confidence below threshold", map[string]any{"confidence": decision.Confidence, "min": minConf})
-		return c.fallbackDecision("BLOCK", "LOW_CONFIDENCE"), nil
+		return c.fallbackDecision("BLOCK", "LOW_CONFIDENCE", rawContent), nil
 	}
 
 	// Budget tracking (rough estimate)
@@ -261,7 +342,7 @@ Required JSON format:
 	return decision, nil
 }
 
-func (c *OpenRouterClient) parseDecision(content string) (domain.LLMDecision, error) {
+func (c *openAIClient) parseDecision(content string) (domain.LLMDecision, error) {
 	var decision domain.LLMDecision
 	if err := json.Unmarshal([]byte(content), &decision); err != nil {
 		return decision, fmt.Errorf("parse decision JSON: %w", err)
@@ -269,7 +350,7 @@ func (c *OpenRouterClient) parseDecision(content string) (domain.LLMDecision, er
 	return decision, nil
 }
 
-func (c *OpenRouterClient) validateDecision(d domain.LLMDecision) error {
+func (c *openAIClient) validateDecision(d domain.LLMDecision) error {
 	validDecisions := map[string]bool{
 		"ALLOW_MARKET":       true,
 		"ALLOW_LIMIT_RETEST": true,
@@ -290,16 +371,16 @@ func (c *OpenRouterClient) validateDecision(d domain.LLMDecision) error {
 	return nil
 }
 
-func (c *OpenRouterClient) fallbackDecision(decision, reason string) domain.LLMDecision {
+func (c *openAIClient) fallbackDecision(decision, reason, rawResponse string) domain.LLMDecision {
 	return domain.LLMDecision{
 		Decision:         decision,
 		Confidence:       0,
 		SizeMultiplier:   0,
 		ReasonCodes:      []string{reason},
 		ValidationStatus: "fallback",
-		RawResponse:      "",
+		RawResponse:      rawResponse,
 	}
 }
 
-func (c *OpenRouterClient) DailyCost() float64 { return c.dailyCost }
-func (c *OpenRouterClient) ResetDailyCost()    { c.dailyCost = 0 }
+func (c *openAIClient) DailyCost() float64 { return c.dailyCost }
+func (c *openAIClient) ResetDailyCost()    { c.dailyCost = 0 }

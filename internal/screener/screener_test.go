@@ -141,6 +141,139 @@ func TestCandidateContext_JSON(t *testing.T) {
 	}
 }
 
+func TestEvaluateLLMEligibility_RequireLiquidityOkFalse_AllowsZeroDepth(t *testing.T) {
+	cand := domain.Candidate{
+		ProposedTrade: domain.ProposedTrade{
+			RR:                 2.5,
+			ExpectedMove:       100,
+			EstimatedTotalCost: 10,
+		},
+		CandidateScore: 80,
+	}
+	ob := domain.OrderBookSummary{
+		SpreadBps:                10,
+		EstimatedSlippageBps:     5,
+		DepthToPositionSizeRatio: 0,
+	}
+
+	cfg := defaultTestConfig()
+	cfg.LLMRouting.RequireLiquidityOk = false
+	result := evaluateLLMEligibility(cand, ob, cfg.Universe.Filters, cfg.LLMRouting, cfg.Strategy)
+
+	if !result.LLMEligible {
+		t.Errorf("expected eligible when require_liquidity_ok=false, reasons: %v", result.LLMRoutingReasonCodes)
+	}
+	for _, r := range result.LLMRoutingReasonCodes {
+		if r == "insufficient_depth" {
+			t.Error("should not add insufficient_depth when require_liquidity_ok=false")
+		}
+	}
+}
+
+func TestEvaluateLLMEligibility_RequireLiquidityOkTrue_BlocksZeroDepth(t *testing.T) {
+	cand := domain.Candidate{
+		ProposedTrade: domain.ProposedTrade{
+			RR:                 2.5,
+			ExpectedMove:       100,
+			EstimatedTotalCost: 10,
+		},
+		CandidateScore: 80,
+	}
+	ob := domain.OrderBookSummary{
+		SpreadBps:                10,
+		EstimatedSlippageBps:     5,
+		DepthToPositionSizeRatio: 0,
+	}
+
+	cfg := defaultTestConfig()
+	cfg.LLMRouting.RequireLiquidityOk = true
+	result := evaluateLLMEligibility(cand, ob, cfg.Universe.Filters, cfg.LLMRouting, cfg.Strategy)
+
+	if result.LLMEligible {
+		t.Error("should not be eligible when require_liquidity_ok=true and depth ratio is 0")
+	}
+	found := false
+	for _, r := range result.LLMRoutingReasonCodes {
+		if r == "insufficient_depth" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected insufficient_depth, got %v", result.LLMRoutingReasonCodes)
+	}
+}
+
+func TestEvaluateLLMEligibility_RequireExecutionOkFalse_IgnoresSpreadSlippage(t *testing.T) {
+	cand := domain.Candidate{
+		ProposedTrade: domain.ProposedTrade{
+			RR:                 2.5,
+			ExpectedMove:       100,
+			EstimatedTotalCost: 10,
+		},
+		CandidateScore: 80,
+	}
+	ob := domain.OrderBookSummary{
+		SpreadBps:                1000,
+		EstimatedSlippageBps:     500,
+		DepthToPositionSizeRatio: 0.5,
+	}
+
+	cfg := defaultTestConfig()
+	cfg.LLMRouting.RequireExecutionOk = false
+	cfg.LLMRouting.RequireLiquidityOk = false
+	result := evaluateLLMEligibility(cand, ob, cfg.Universe.Filters, cfg.LLMRouting, cfg.Strategy)
+
+	if !result.LLMEligible {
+		t.Errorf("expected eligible when require_execution_ok=false, reasons: %v", result.LLMRoutingReasonCodes)
+	}
+	for _, r := range result.LLMRoutingReasonCodes {
+		if r == "spread_too_wide" || r == "slippage_too_high" {
+			t.Errorf("should not add %s when require_execution_ok=false", r)
+		}
+	}
+}
+
+func TestEvaluateLLMEligibility_RequireExecutionOkTrue_BlocksBadSpreadSlippage(t *testing.T) {
+	cand := domain.Candidate{
+		ProposedTrade: domain.ProposedTrade{
+			RR:                 2.5,
+			ExpectedMove:       100,
+			EstimatedTotalCost: 10,
+		},
+		CandidateScore: 80,
+	}
+	ob := domain.OrderBookSummary{
+		SpreadBps:                1000,
+		EstimatedSlippageBps:     500,
+		DepthToPositionSizeRatio: 0.5,
+	}
+
+	cfg := defaultTestConfig()
+	cfg.LLMRouting.RequireExecutionOk = true
+	cfg.LLMRouting.RequireLiquidityOk = false
+	result := evaluateLLMEligibility(cand, ob, cfg.Universe.Filters, cfg.LLMRouting, cfg.Strategy)
+
+	if result.LLMEligible {
+		t.Error("should not be eligible when require_execution_ok=true and spread/slippage are bad")
+	}
+	foundSpread := false
+	foundSlippage := false
+	for _, r := range result.LLMRoutingReasonCodes {
+		if r == "spread_too_wide" {
+			foundSpread = true
+		}
+		if r == "slippage_too_high" {
+			foundSlippage = true
+		}
+	}
+	if !foundSpread {
+		t.Errorf("expected spread_too_wide, got %v", result.LLMRoutingReasonCodes)
+	}
+	if !foundSlippage {
+		t.Errorf("expected slippage_too_high, got %v", result.LLMRoutingReasonCodes)
+	}
+}
+
 func defaultTestConfig() app.UserConfig {
 	return app.UserConfig{
 		Universe: app.UniverseConfig{
