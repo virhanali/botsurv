@@ -441,16 +441,23 @@ func TestDeepSeekClient_RequestShape(t *testing.T) {
 		t.Error("deepseek request should not include temperature")
 	}
 
-	if reqMap["reasoning_effort"] != "max" {
-		t.Errorf("expected reasoning_effort=max, got %v", reqMap["reasoning_effort"])
+	if reqMap["reasoning_effort"] != nil {
+		t.Errorf("expected reasoning_effort to be omitted after thinking fix, got %v", reqMap["reasoning_effort"])
 	}
 
-	thinking, ok := reqMap["thinking"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected thinking object, got %T", reqMap["thinking"])
+	if reqMap["thinking"] != nil {
+		t.Errorf("expected thinking to be omitted after thinking fix, got %v", reqMap["thinking"])
 	}
-	if thinking["type"] != "enabled" {
-		t.Errorf("expected thinking.type=enabled, got %v", thinking["type"])
+
+	// Verify required fields
+	if reqMap["model"] == nil {
+		t.Error("expected model to be set")
+	}
+	if reqMap["messages"] == nil {
+		t.Error("expected messages to be set")
+	}
+	if reqMap["max_tokens"] == nil {
+		t.Error("expected max_tokens to be set")
 	}
 }
 

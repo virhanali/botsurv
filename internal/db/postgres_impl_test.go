@@ -25,7 +25,7 @@ func setupTestPostgres(t *testing.T) *sql.DB {
 
 	database, err := Open("postgres", dsn, 1, 1, 300)
 	if err != nil {
-		t.Fatalf("open postgres integration test database: %v\nset BOTSURV_TEST_POSTGRES_DSN to override the default DSN %q", err, defaultTestPostgresDSN)
+		t.Skipf("skip postgres integration test: %v\nset BOTSURV_TEST_POSTGRES_DSN to override the default DSN %q", err, defaultTestPostgresDSN)
 	}
 	database.SetMaxOpenConns(1)
 
