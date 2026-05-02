@@ -39,9 +39,9 @@ data_validation:
   max_data_age_seconds:
     "1m": 30
     "5m": 90
-    "15m": 180
-    "1H": 600
-    "4H": 1800
+    "15m": 900
+    "1H": 3600
+    "4H": 7200
 
 hard_blocks:
   max_spread_pct: 0.15

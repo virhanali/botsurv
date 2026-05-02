@@ -135,7 +135,7 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 
 		cand, tc, sr, rs, err := s.evaluateSymbol(ctx, sym, cycleID)
 		if err != nil {
-			s.log.Debug("skip symbol in screener", map[string]any{"symbol": sym.Symbol, "error": err.Error()})
+			s.log.Warn("skip symbol in screener", map[string]any{"symbol": sym.Symbol, "error": err.Error()})
 			continue
 		}
 		candidates = append(candidates, cand)

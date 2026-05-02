@@ -1,7 +1,7 @@
 # Paper mode + DeepSeek LLM + Bybit WS
 app:
   mode: paper
-  log_level: info
+  log_level: debug
   json_logs: true
   cycle_interval_seconds: 900
   max_cycle_overlap: false
@@ -41,9 +41,9 @@ data_validation:
   max_data_age_seconds:
     "1m": 30
     "5m": 90
-    "15m": 180
-    "1H": 600
-    "4H": 1800
+    "15m": 900
+    "1H": 3600
+    "4H": 7200
 
 hard_blocks:
   max_spread_pct: 0.15
@@ -145,13 +145,13 @@ strategy:
 
 llm_routing:
   mode: dynamic
-  min_candidate_score: 1
-  max_calls_per_cycle: 1
-  max_calls_per_day: 10
-  max_cost_usd_per_day: 3.0
+  min_candidate_score: 50
+  max_calls_per_cycle: 3
+  max_calls_per_day: 30
+  max_cost_usd_per_day: 10.0
   require_execution_ok: false
   require_liquidity_ok: false
-  hard_cap_candidates_per_cycle: 1
+  hard_cap_candidates_per_cycle: 3
 
 llm:
   enabled: true
