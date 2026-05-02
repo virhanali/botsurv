@@ -9,6 +9,7 @@ import (
 	"github.com/virhan/botsurv/internal/regime"
 	"github.com/virhan/botsurv/internal/risk"
 	"github.com/virhan/botsurv/internal/scoring"
+	"github.com/virhan/botsurv/internal/shadow"
 	"github.com/virhan/botsurv/internal/strategy"
 )
 
