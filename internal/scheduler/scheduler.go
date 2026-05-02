@@ -390,14 +390,37 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			continue
 		}
 
-		// LLM veto
-		llmDecision, err := s.llmClient.VetoRequest(ctx, ctxJSON)
-		if err != nil {
-			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_ERROR"})
-			continue
+		// Phase 1: Score-based LLM routing
+		// < 58: reject without LLM (already filtered by min_candidate_score in screener)
+		// 58-84: send to LLM veto (ambiguous)
+		// >= 85: skip LLM, high-quality candidate goes directly to risk engine
+		score := cand.CandidateScore
+		var llmDecision domain.LLMDecision
+		var llmErr error
+
+		if score >= 85 {
+			// High-quality candidate: skip LLM
+			llmDecision = domain.LLMDecision{
+				Decision:         "ALLOW_MARKET",
+				Confidence:       1.0,
+				SizeMultiplier:   1.0,
+				ReasonCodes:      []string{"HIGH_SCORE_SKIP_LLM"},
+				ValidationStatus: "high_score_skip",
+			}
+			s.log.Info("candidate skipped LLM veto (high score)", map[string]any{
+				"symbol":       cand.Symbol,
+				"score":        score,
+				"llm_decision": llmDecision.Decision,
+			})
+		} else {
+			llmDecision, llmErr = s.llmClient.VetoRequest(ctx, ctxJSON)
+			if llmErr != nil {
+				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_ERROR"})
+				continue
+			}
+			result.LLMCalls++
+			s.trackLLMCall(ctx)
 		}
-		result.LLMCalls++
-		s.trackLLMCall(ctx)
 
 		// Persist LLM decision with real candidate_id
 		candID := candidateIDs[cand.Symbol]
