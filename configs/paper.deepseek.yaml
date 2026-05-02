@@ -41,7 +41,7 @@ data_validation:
   min_candles: 250
   max_data_age_seconds:
     "1m": 30
-    "5m": 3600
+    "5m": 7200
     "15m": 1200
     "1H": 4500
     "4H": 18000
@@ -147,12 +147,12 @@ strategy:
 llm_routing:
   mode: dynamic
   min_candidate_score: 50
-  max_calls_per_cycle: 3
-  max_calls_per_day: 30
-  max_cost_usd_per_day: 10.0
+  max_calls_per_cycle: 0
+  max_calls_per_day: 200
+  max_cost_usd_per_day: 20.0
   require_execution_ok: false
   require_liquidity_ok: false
-  hard_cap_candidates_per_cycle: 3
+  hard_cap_candidates_per_cycle: 0
 
 llm:
   enabled: true

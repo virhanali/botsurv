@@ -20,11 +20,15 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 psql_one() {
-  sudo -u postgres psql -d "$DB" -X -q -t -A -c "$1" 2>/dev/null | xargs || true
+  sudo -u postgres psql -d "$DB" -X -q -t -A -c "$1" 2>/dev/null | head -1 | xargs || true
 }
 
 psql_rows() {
   sudo -u postgres psql -d "$DB" -X -q -t -A -F ' | ' -c "$1" 2>/dev/null || true
+}
+
+table_exists() {
+  sudo -u postgres psql -d "$DB" -X -q -t -A -c "SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname='public' AND tablename='$1');" 2>/dev/null | head -1 | xargs || echo false
 }
 
 add_warn() {
@@ -65,9 +69,20 @@ candles=$(psql_one "select count(*) from candles;")
 open_positions=$(psql_one "select count(*) from positions where status='open';")
 open_orders=$(psql_one "select count(*) from orders where status in ('pending','partially_filled');")
 closed_24h=$(psql_one "select count(*) from positions where status='closed' and closed_at >= now() - interval '24 hours';")
+paper_trades_24h=$(psql_one "select count(*) from paper_trades where closed_at >= now() - interval '24 hours' or (closed_at is null and opened_at >= now() - interval '24 hours');")
+paper_pnl_24h=$(psql_one "select coalesce(sum(pnl_net),0) from paper_trades where closed_at >= now() - interval '24 hours';")
 snapshots=$(psql_one "select count(*) from account_snapshots;")
+
+# LLM stats
 llm_decisions=$(psql_one "select count(*) from llm_decisions;")
-llm_calls_today=$(psql_one "select coalesce(sum(calls),0) from llm_usage_daily where usage_date = current_date;")
+llm_breakdown=$(psql_one "select string_agg(t.row, ', ') from (select decision||':'||count(*)::text as row from llm_decisions where created_at >= now() - interval '24 hours' group by decision order by count(*) desc) t;")
+if [ "$(table_exists 'public.llm_usage_daily')" = "true" ]; then
+  llm_calls_today=$(psql_one "select coalesce(sum(calls),0) from llm_usage_daily where usage_date = current_date;")
+  llm_cost_today=$(psql_one "select coalesce(sum(cost_usd),0) from llm_usage_daily where usage_date = current_date;")
+else
+  llm_calls_today=$(psql_one "select count(*) from llm_decisions where created_at >= current_date;")
+  llm_cost_today="?"
+fi
 
 # --- Safety Checks ---
 unsafe_positions=$(psql_one "select count(*) from positions where status='open' and stop_loss <= 0;")
@@ -143,8 +158,10 @@ Disk usage: ${disk_usage_pct}% | Postgres ready: $pg_isready
 Latest cycle: ${latest_cycle_id:-n/a} | ${latest_cycle_status:-n/a} | age=${latest_cycle_age:-n/a}s | at=${latest_cycle:-n/a}
 Latest candle age: ${latest_candle_age:-n/a}s | latest_open_time_ms=${latest_candle_ms:-n/a}
 DB counts: cycles=${cycles:-0}, candidates=${candidates:-0}, candles=${candles:-0}, snapshots=${snapshots:-0}
-LLM: decisions=${llm_decisions:-0}, calls_today=${llm_calls_today:-0}
+LLM: decisions=${llm_decisions:-0}, calls_today=${llm_calls_today:-0}, cost_today=\$${llm_cost_today:-0}
+LLM breakdown (24h): ${llm_breakdown:-none}
 Trading state: open_positions=${open_positions:-0}, open_orders=${open_orders:-0}, closed_24h=${closed_24h:-0}
+Paper trades 24h: ${paper_trades_24h:-0} | PnL 24h: \$${paper_pnl_24h:-0}
 Safety: unsafe_positions=${unsafe_positions:-0}, stale_pending=${stale_pending:-0}
 Journal: fatal_30m=${journal_bad:-0}, orderbook_gap_10m=${orderbook_spam:-0}, ws_disconnects_30m=${ws_disconnects:-0}
 Status: $warning_status

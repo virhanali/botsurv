@@ -93,9 +93,7 @@ func (c *reviewHTTPClient) Review(ctx context.Context, req ReviewRequest) (*Revi
 				{Role: "system", Content: systemPrompt},
 				{Role: "user", Content: string(reqJSON)},
 			},
-			MaxTokens:       c.cfg.MaxOutputTokens,
-			ReasoningEffort: "max",
-			Thinking:        &thinkingCfg{Type: "enabled"},
+			MaxTokens: c.cfg.MaxOutputTokens,
 		}
 		httpBody, err = json.Marshal(chatReq)
 	default: // openrouter

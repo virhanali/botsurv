@@ -103,7 +103,7 @@ type deepSeekChatRequest struct {
 	Model           string        `json:"model"`
 	Messages        []chatMessage `json:"messages"`
 	MaxTokens       int           `json:"max_tokens"`
-	ReasoningEffort string        `json:"reasoning_effort"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
 	Thinking        *thinkingCfg  `json:"thinking,omitempty"`
 }
 
