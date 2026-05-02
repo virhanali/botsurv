@@ -137,6 +137,16 @@ type CycleResult struct {
 	Executions  int
 	Skips       []SkipReason
 	ReasonCodes []string
+
+	// Phase 3: per-cycle breakdown
+	RejectedPreLLM     int `json:"rejected_pre_llm"`
+	LLMSkippedHighScore int `json:"llm_skipped_high_score"`
+	LLMVetoCalled     int `json:"llm_veto_called"`
+	LLMApprove        int `json:"llm_approve"`
+	LLMReject         int `json:"llm_reject"`
+	LLMReduceSize     int `json:"llm_reduce_size"`
+	RiskRejected      int `json:"risk_rejected"`
+	SafetyRejected    int `json:"safety_rejected"`
 }
 
 type SkipReason struct {
@@ -414,6 +424,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 		switch routeResult.Route {
 		case routing.RouteRejectPreLLM:
+			result.RejectedPreLLM++
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "PRE_LLM_REJECTED:" + routeResult.Reason})
 			s.log.Info("candidate rejected before LLM", map[string]any{
 				"symbol":    cand.Symbol,
@@ -424,6 +435,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			continue
 
 		case routing.RouteSkipLLM:
+			result.LLMSkippedHighScore++
 			llmDecision = domain.LLMDecision{
 				Decision:         "ALLOW_MARKET",
 				Confidence:       1.0,
@@ -439,6 +451,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			})
 
 		default: // LLM_VETO_REQUIRED
+			result.LLMVetoCalled++
 			llmDecision, llmErr = s.llmClient.VetoRequest(ctx, ctxJSON)
 			if llmErr != nil {
 				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_ERROR"})
@@ -456,6 +469,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		s.saveLLMDecision(ctx, llmDecision, candID, cycleID)
 
 		if llmDecision.Decision == "BLOCK" {
+			result.LLMReject++
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_BLOCK"})
 			s.log.Info("candidate blocked by LLM", map[string]any{
 				"symbol":   cand.Symbol,
@@ -547,6 +561,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 		riskOutput := s.riskEng.Validate(riskInput)
 		if !riskOutput.Approved {
+			result.RiskRejected++
 			s.saveRiskDecision(ctx, riskOutput, candID, cycleID)
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "RISK_REJECTED"})
 			s.log.Info("candidate rejected by risk", map[string]any{
@@ -700,6 +715,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			OpenOrders:    item.monitorStatus.OpenOrders,
 		})
 		if !safetyResult.Safe {
+			result.SafetyRejected++
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "EXECUTION_SAFETY_FAILED"})
 			s.log.Info("candidate blocked by execution safety", map[string]any{
 				"symbol":             cand.Symbol,
@@ -802,8 +818,16 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		"duration_ms": result.EndedAt.Sub(result.StartedAt).Milliseconds(),
 		"candidates":  result.Candidates,
 		"llm_calls":   result.LLMCalls,
-		"executions":  result.Executions,
-		"skips":       len(result.Skips),
+		"executions":            result.Executions,
+		"skips":                 len(result.Skips),
+		"rejected_pre_llm":     result.RejectedPreLLM,
+		"llm_skipped_hiscore":  result.LLMSkippedHighScore,
+		"llm_veto_calls":       result.LLMVetoCalled,
+		"llm_approve":          result.LLMApprove,
+		"llm_reject":           result.LLMReject,
+		"llm_reduce_size":      result.LLMReduceSize,
+		"risk_rejected":        result.RiskRejected,
+		"safety_rejected":      result.SafetyRejected,
 	})
 
 	return result, nil
