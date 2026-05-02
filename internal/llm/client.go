@@ -191,9 +191,7 @@ Required JSON format:
 				{Role: "system", Content: systemPrompt},
 				{Role: "user", Content: contextJSON},
 			},
-			MaxTokens:       c.cfg.MaxTokens,
-			ReasoningEffort: "max",
-			Thinking:        &thinkingCfg{Type: "enabled"},
+			MaxTokens: c.cfg.MaxTokens,
 		}
 		body, err = json.Marshal(reqBody)
 		if err != nil {

@@ -91,7 +91,12 @@ func (v *Validator) ValidateCandleBatch(in CandleValidationInput) (CandleValidat
 
 	latest := in.Candles[len(in.Candles)-1]
 	if in.RequireClosedLatest && !latest.Confirmed {
-		return CandleValidationResult{}, fmt.Errorf("validation failed: latest candle is in-progress but closed candle required")
+		// Strip the in-progress latest candle and use the last confirmed candle
+		if len(in.Candles) < 2 {
+			return CandleValidationResult{}, fmt.Errorf("validation failed: latest candle is in-progress but no closed candles available")
+		}
+		in.Candles = in.Candles[:len(in.Candles)-1]
+		latest = in.Candles[len(in.Candles)-1]
 	}
 
 	reference := in.Now.UTC()

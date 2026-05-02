@@ -243,12 +243,20 @@ func (s *BybitWSMarketDataService) GetCandles(ctx context.Context, symbol, timef
 }
 
 // GetLatestPrice returns the latest cached price for a symbol.
+// Falls back to latest candle close if no ticker price is available.
 func (s *BybitWSMarketDataService) GetLatestPrice(ctx context.Context, symbol string) (float64, error) {
 	price, _, ok := s.priceCache.get(symbol)
-	if !ok {
-		return 0, fmt.Errorf("no price available for %s", symbol)
+	if ok && price > 0 {
+		return price, nil
 	}
-	return price, nil
+	// Fallback: use latest 15m candle close
+	for _, tf := range []string{"15m", "1H"} {
+		candles := s.candleCache.get(symbol, tf, 1)
+		if len(candles) > 0 && candles[len(candles)-1].Close > 0 {
+			return candles[len(candles)-1].Close, nil
+		}
+	}
+	return 0, fmt.Errorf("no price available for %s", symbol)
 }
 
 // GetOrderBookSummary returns a computed orderbook summary for a symbol.

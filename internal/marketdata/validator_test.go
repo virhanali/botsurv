@@ -129,7 +129,7 @@ func TestValidateCandleBatch_ClosedVsInProgress(t *testing.T) {
 	}
 }
 
-func TestValidateCandleBatch_RequireClosedRejectsInProgress(t *testing.T) {
+func TestValidateCandleBatch_RequireClosedLatestStripsInProgress(t *testing.T) {
 	v := NewValidator(app.DataValidationConfig{
 		MinCandles:        5,
 		MaxDataAgeSeconds: map[string]int{"15m": 180},
@@ -137,17 +137,24 @@ func TestValidateCandleBatch_RequireClosedRejectsInProgress(t *testing.T) {
 	start := time.Now().Add(-45 * time.Minute).Truncate(time.Minute)
 	candles := makeCandles("BTCUSDT", "15m", 5, start, true)
 	candles[len(candles)-1].Confirmed = false
-	now := time.UnixMilli(candles[len(candles)-1].OpenTime).Add(15*time.Minute - 30*time.Second)
+	now := time.UnixMilli(candles[len(candles)-2].OpenTime).Add(16 * time.Minute) // 1m after close
 
-	_, err := v.ValidateCandleBatch(CandleValidationInput{
+	result, err := v.ValidateCandleBatch(CandleValidationInput{
 		Symbol:              "BTCUSDT",
 		Timeframe:           "15m",
 		Candles:             candles,
+		MinRequired:         4, // 5 - 1 stripped
 		RequireClosedLatest: true,
 		Now:                 now,
 	})
-	if err == nil {
-		t.Fatal("expected error when closed latest is required but latest is in-progress")
+	if err != nil {
+		t.Fatalf("expected success after stripping in-progress candle: %v", err)
+	}
+	if len(result.Candles) != 4 {
+		t.Fatalf("expected 4 candles after stripping, got %d", len(result.Candles))
+	}
+	if !result.LatestIsClosed {
+		t.Fatal("expected latest to be closed after stripping")
 	}
 }
 
