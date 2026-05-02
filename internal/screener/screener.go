@@ -109,6 +109,8 @@ type ScreenResult struct {
 	TradeCandidates map[string]strategy.TradeCandidate
 	ScoreResults    map[string]scoring.ScoreResult
 	RegimeSnapshots map[string]regime.MarketRegimeSnapshot
+	IndicatorSnapshots15m map[string]indicator.IndicatorSnapshot
+	IndicatorSnapshots1h  map[string]indicator.IndicatorSnapshot
 }
 
 // Screen runs the full screening pipeline:
@@ -142,6 +144,50 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 		tradeCandidates[sym.Symbol] = tc
 		scoreResults[sym.Symbol] = sr
 		regimeSnapshots[sym.Symbol] = rs
+	}
+
+	// Build indicator snapshots for LLM routing (from cached candle data)
+	snap15mMap := make(map[string]indicator.IndicatorSnapshot, len(candidates))
+	snap1hMap := make(map[string]indicator.IndicatorSnapshot, len(candidates))
+	setupTF := s.cfg.Strategy.Timeframes.Setup
+	if setupTF == "" {
+		setupTF = "15m"
+	}
+	contextTF := s.cfg.Strategy.Timeframes.Context
+	if contextTF == "" {
+		contextTF = "1H"
+	}
+	indCfg := s.cfg.IndicatorEngine.WithDefaults()
+	snapCfg := indicator.SnapshotConfig{
+		EMA20Period:             indCfg.EMA20Period,
+		EMA50Period:             indCfg.EMA50Period,
+		EMA200Period:            indCfg.EMA200Period,
+		RSIPeriod:               indCfg.RSIPeriod,
+		MACDFastPeriod:          indCfg.MACDFastPeriod,
+		MACDSlowPeriod:          indCfg.MACDSlowPeriod,
+		MACDSignalPeriod:        indCfg.MACDSignalPeriod,
+		ATRPeriod:               indCfg.ATRPeriod,
+		VolumeMAPeriod:          indCfg.VolumeMAPeriod,
+		SwingLookback:           indCfg.SwingLookback,
+		RecentSwingCount:        indCfg.RecentSwingCount,
+		SupportResistanceATRTol: indCfg.SupportResistanceATRTol,
+	}
+	for _, sym := range qualitySymbols {
+		if sym.Blacklist {
+			continue
+		}
+		setupCandles, _ := s.md.GetCandles(ctx, sym.Symbol, setupTF, 250)
+		if len(setupCandles) > 50 {
+			if s, err := indicator.BuildSnapshot(sym.Symbol, setupTF, setupCandles, snapCfg); err == nil {
+				snap15mMap[sym.Symbol] = s
+			}
+		}
+		ctxCandles, _ := s.md.GetCandles(ctx, sym.Symbol, contextTF, 250)
+		if len(ctxCandles) > 50 {
+			if s, err := indicator.BuildSnapshot(sym.Symbol, contextTF, ctxCandles, snapCfg); err == nil {
+				snap1hMap[sym.Symbol] = s
+			}
+		}
 	}
 
 	// Separate eligible and non-eligible
@@ -181,6 +227,8 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 		TradeCandidates: tradeCandidates,
 		ScoreResults:    scoreResults,
 		RegimeSnapshots: regimeSnapshots,
+		IndicatorSnapshots15m: snap15mMap,
+		IndicatorSnapshots1h:  snap1hMap,
 	}, nil
 }
 

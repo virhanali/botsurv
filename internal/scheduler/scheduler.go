@@ -20,6 +20,7 @@ import (
 	"github.com/virhan/botsurv/internal/monitor"
 	"github.com/virhan/botsurv/internal/regime"
 	"github.com/virhan/botsurv/internal/risk"
+	"github.com/virhan/botsurv/internal/routing"
 	"github.com/virhan/botsurv/internal/screener"
 	"github.com/virhan/botsurv/internal/shadow"
 	"github.com/virhan/botsurv/internal/strategy"
@@ -390,16 +391,39 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			continue
 		}
 
-		// Phase 1: Score-based LLM routing
-		// < 58: reject without LLM (already filtered by min_candidate_score in screener)
-		// 58-84: send to LLM veto (ambiguous)
-		// >= 85: skip LLM, high-quality candidate goes directly to risk engine
+		// Phase 2: Score-based + ambiguity flag LLM routing
 		score := cand.CandidateScore
 		var llmDecision domain.LLMDecision
 		var llmErr error
 
-		if score >= 85 {
-			// High-quality candidate: skip LLM
+		// Detect ambiguity flags
+		flags := routing.AmbiguityFlags{}
+		tc, tcOk := screenResult.TradeCandidates[cand.Symbol]
+		sr, _ := screenResult.ScoreResults[cand.Symbol]
+		rs, rsOk := screenResult.RegimeSnapshots[cand.Symbol]
+		snap15m, snap15mOk := screenResult.IndicatorSnapshots15m[cand.Symbol]
+		snap1h, snap1hOk := screenResult.IndicatorSnapshots1h[cand.Symbol]
+		if tcOk && rsOk && snap15mOk && snap1hOk {
+			flags = routing.DetectAmbiguity(snap15m, snap1h, rs, sr, tc)
+		}
+
+		// Route candidate using the routing engine
+		routingEng := routing.DefaultRoutingEngine()
+		maxLLM := s.cfg.LLMRouting.MaxCallsPerCycle
+		routeResult := routingEng.RouteCandidate(score, flags, result.LLMCalls, maxLLM)
+
+		switch routeResult.Route {
+		case routing.RouteRejectPreLLM:
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "PRE_LLM_REJECTED:" + routeResult.Reason})
+			s.log.Info("candidate rejected before LLM", map[string]any{
+				"symbol":    cand.Symbol,
+				"score":     score,
+				"flags":     routeResult.FlagCount,
+				"reason":    routeResult.Reason,
+			})
+			continue
+
+		case routing.RouteSkipLLM:
 			llmDecision = domain.LLMDecision{
 				Decision:         "ALLOW_MARKET",
 				Confidence:       1.0,
@@ -407,12 +431,14 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				ReasonCodes:      []string{"HIGH_SCORE_SKIP_LLM"},
 				ValidationStatus: "high_score_skip",
 			}
-			s.log.Info("candidate skipped LLM veto (high score)", map[string]any{
-				"symbol":       cand.Symbol,
-				"score":        score,
-				"llm_decision": llmDecision.Decision,
+			s.log.Info("candidate skipped LLM veto", map[string]any{
+				"symbol": cand.Symbol,
+				"score":  score,
+				"flags":  routeResult.FlagCount,
+				"reason": routeResult.Reason,
 			})
-		} else {
+
+		default: // LLM_VETO_REQUIRED
 			llmDecision, llmErr = s.llmClient.VetoRequest(ctx, ctxJSON)
 			if llmErr != nil {
 				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_ERROR"})
