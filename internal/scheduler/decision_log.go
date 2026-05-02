@@ -130,8 +130,12 @@ func (f *DecisionLogFields) WithLLMModeActive(active bool) {
 
 // ToDomain converts fields to a domain.DecisionLog.
 func (f *DecisionLogFields) ToDomain(cycleID, mode, symbol, timeframe string, candleCount int, action, reason string) domain.DecisionLog {
+	decisionID := f.DecisionID
+	if decisionID == "" {
+		decisionID = shadow.NewUUID()
+	}
 	return domain.DecisionLog{
-		DecisionID:            f.DecisionID,
+		DecisionID:            decisionID,
 		CycleID:               cycleID,
 		Timestamp:             time.Now(),
 		Mode:                  mode,

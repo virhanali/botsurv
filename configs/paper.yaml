@@ -38,10 +38,10 @@ data_validation:
   min_candles: 250
   max_data_age_seconds:
     "1m": 30
-    "5m": 90
-    "15m": 900
-    "1H": 3600
-    "4H": 7200
+    "5m": 600
+    "15m": 1200
+    "1H": 4500
+    "4H": 18000
 
 hard_blocks:
   max_spread_pct: 0.15
