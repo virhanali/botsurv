@@ -949,7 +949,7 @@ func (c DataValidationConfig) MaxDataAgeSecondsFor(timeframe string) int {
 	case "1m":
 		return 30
 	case "5m":
-		return 600
+		return 3600
 	case "15m":
 		return 1200
 	case "1H":

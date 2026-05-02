@@ -230,14 +230,30 @@ func (s *BybitWSMarketDataService) Stop(ctx context.Context) error {
 	}
 }
 
-// GetCandles returns candles from cache first, falling back to repository.
+// GetCandles returns candles from cache, falling back to repository and REST backfill.
 func (s *BybitWSMarketDataService) GetCandles(ctx context.Context, symbol, timeframe string, limit int) ([]domain.Candle, error) {
+	// Tier 1: in-memory cache
 	cached := s.candleCache.get(symbol, timeframe, limit)
 	if len(cached) > 0 {
 		return cached, nil
 	}
+	// Tier 2: database repository
 	if s.candleRepo != nil {
-		return s.candleRepo.GetBySymbolTimeframe(ctx, symbol, timeframe, limit)
+		dbCandles, err := s.candleRepo.GetBySymbolTimeframe(ctx, symbol, timeframe, limit)
+		if err == nil && len(dbCandles) > 0 {
+			// Warm cache with DB candles
+			for _, c := range dbCandles {
+				s.candleCache.update(symbol, timeframe, c)
+			}
+			return dbCandles, nil
+		}
+	}
+	// Tier 3: REST backfill on demand
+	if s.httpClient != nil {
+		if err := s.backfillAndWarm(ctx, symbol, timeframe, limit); err != nil {
+			return nil, err
+		}
+		return s.candleCache.get(symbol, timeframe, limit), nil
 	}
 	return nil, nil
 }

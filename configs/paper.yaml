@@ -28,6 +28,7 @@ market_data:
   timeframes:
     - 15m
     - 1H
+    - 4H
   orderbook_depth: 50
   trade_flow_windows:
     - 15

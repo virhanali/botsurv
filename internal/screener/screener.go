@@ -281,7 +281,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	})
 
 	// Regime snapshot strict placement: compute before strategy generation.
-	btc5mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", 2)
+	btc5mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", 3)
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 5m candles: %w", err)
 	}
@@ -296,7 +296,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 5m candles: %w", err)
 	}
-	btc15mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "15m", 2)
+	btc15mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "15m", 3)
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 15m candles: %w", err)
 	}

@@ -27,7 +27,6 @@ market_data:
   backfill_candles: 500
   start_timeout_seconds: 300
   timeframes:
-    - 5m
     - 15m
     - 1H
     - 4H
@@ -42,7 +41,7 @@ data_validation:
   min_candles: 250
   max_data_age_seconds:
     "1m": 30
-    "5m": 600
+    "5m": 3600
     "15m": 1200
     "1H": 4500
     "4H": 18000

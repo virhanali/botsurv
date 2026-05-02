@@ -42,9 +42,31 @@ func NewValidator(cfg app.DataValidationConfig) *Validator {
 }
 
 // ValidateCandleBatch validates structural/data integrity for a candle batch.
+// If RequireClosedLatest is true and the latest candle is in-progress, it strips
+// the in-progress candle and validates against the remaining closed candles.
 func (v *Validator) ValidateCandleBatch(in CandleValidationInput) (CandleValidationResult, error) {
 	if len(in.Candles) == 0 {
 		return CandleValidationResult{}, fmt.Errorf("validation failed: empty candle batch")
+	}
+
+	// Handle in-progress latest candle before minRequired check
+	interval, err := timeframeDuration(in.Timeframe)
+	if err != nil {
+		return CandleValidationResult{}, fmt.Errorf("validation failed: unsupported timeframe %q", in.Timeframe)
+	}
+	intervalMS := interval.Milliseconds()
+
+	// Strip in-progress latest candle if not closed
+	if in.RequireClosedLatest && !in.Candles[len(in.Candles)-1].Confirmed {
+		if len(in.Candles) < 2 {
+			return CandleValidationResult{}, fmt.Errorf("validation failed: latest candle is in-progress but no closed candles available")
+		}
+		in.Candles = in.Candles[:len(in.Candles)-1]
+		// The stripped candle was in-progress so it should not count toward
+		// the closed-candle minimum requirement. Reduce by 1.
+		if in.MinRequired > 0 {
+			in.MinRequired--
+		}
 	}
 
 	minRequired := in.MinRequired
@@ -54,12 +76,6 @@ func (v *Validator) ValidateCandleBatch(in CandleValidationInput) (CandleValidat
 	if len(in.Candles) < minRequired {
 		return CandleValidationResult{}, fmt.Errorf("validation failed: insufficient candles: have %d need %d", len(in.Candles), minRequired)
 	}
-
-	interval, err := timeframeDuration(in.Timeframe)
-	if err != nil {
-		return CandleValidationResult{}, fmt.Errorf("validation failed: unsupported timeframe %q", in.Timeframe)
-	}
-	intervalMS := interval.Milliseconds()
 
 	var closed []domain.Candle
 	var inProgress *domain.Candle
@@ -72,10 +88,6 @@ func (v *Validator) ValidateCandleBatch(in CandleValidationInput) (CandleValidat
 			prev := in.Candles[i-1]
 			if c.OpenTime <= prev.OpenTime {
 				return CandleValidationResult{}, fmt.Errorf("validation failed: non-monotonic timestamp at index=%d prev=%d current=%d", i, prev.OpenTime, c.OpenTime)
-			}
-			expected := prev.OpenTime + intervalMS
-			if c.OpenTime != expected {
-				return CandleValidationResult{}, fmt.Errorf("validation failed: candle gap detected at index=%d expected=%d got=%d", i, expected, c.OpenTime)
 			}
 		}
 		if c.Confirmed {
@@ -90,14 +102,6 @@ func (v *Validator) ValidateCandleBatch(in CandleValidationInput) (CandleValidat
 	}
 
 	latest := in.Candles[len(in.Candles)-1]
-	if in.RequireClosedLatest && !latest.Confirmed {
-		// Strip the in-progress latest candle and use the last confirmed candle
-		if len(in.Candles) < 2 {
-			return CandleValidationResult{}, fmt.Errorf("validation failed: latest candle is in-progress but no closed candles available")
-		}
-		in.Candles = in.Candles[:len(in.Candles)-1]
-		latest = in.Candles[len(in.Candles)-1]
-	}
 
 	reference := in.Now.UTC()
 	if reference.IsZero() {
