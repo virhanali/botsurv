@@ -5,10 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/indicator"
 	"github.com/virhan/botsurv/internal/logger"
+	"github.com/virhan/botsurv/internal/marketdata"
+	"github.com/virhan/botsurv/internal/regime"
+	"github.com/virhan/botsurv/internal/scoring"
 	"github.com/virhan/botsurv/internal/strategy"
 	"github.com/virhan/botsurv/internal/universe"
 )
@@ -98,9 +103,12 @@ func (s *Screener) RefreshUniverse(ctx context.Context) error {
 
 // ScreenResult holds the output of the screener.
 type ScreenResult struct {
-	Candidates  []domain.Candidate
-	LLMContexts map[string]string // symbol -> JSON context
-	NonEligible []domain.Candidate
+	Candidates      []domain.Candidate
+	LLMContexts     map[string]string // symbol -> JSON context
+	NonEligible     []domain.Candidate
+	TradeCandidates map[string]strategy.TradeCandidate
+	ScoreResults    map[string]scoring.ScoreResult
+	RegimeSnapshots map[string]regime.MarketRegimeSnapshot
 }
 
 // Screen runs the full screening pipeline:
@@ -117,17 +125,23 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 
 	// Run setup engine on each symbol
 	var candidates []domain.Candidate
+	tradeCandidates := make(map[string]strategy.TradeCandidate)
+	scoreResults := make(map[string]scoring.ScoreResult)
+	regimeSnapshots := make(map[string]regime.MarketRegimeSnapshot)
 	for _, sym := range qualitySymbols {
 		if sym.Blacklist {
 			continue
 		}
 
-		cand, err := s.evaluateSymbol(ctx, sym, cycleID)
+		cand, tc, sr, rs, err := s.evaluateSymbol(ctx, sym, cycleID)
 		if err != nil {
 			s.log.Debug("skip symbol in screener", map[string]any{"symbol": sym.Symbol, "error": err.Error()})
 			continue
 		}
 		candidates = append(candidates, cand)
+		tradeCandidates[sym.Symbol] = tc
+		scoreResults[sym.Symbol] = sr
+		regimeSnapshots[sym.Symbol] = rs
 	}
 
 	// Separate eligible and non-eligible
@@ -143,6 +157,7 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 
 	// Build contexts for eligible candidates
 	llmContexts := make(map[string]string)
+
 	for _, c := range eligible {
 		ctxJSON, err := s.buildContext(ctx, c)
 		if err != nil {
@@ -160,110 +175,407 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 	})
 
 	return &ScreenResult{
-		Candidates:  eligible,
-		LLMContexts: llmContexts,
-		NonEligible: nonEligible,
+		Candidates:      eligible,
+		LLMContexts:     llmContexts,
+		NonEligible:     nonEligible,
+		TradeCandidates: tradeCandidates,
+		ScoreResults:    scoreResults,
+		RegimeSnapshots: regimeSnapshots,
 	}, nil
 }
 
-func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol, cycleID string) (domain.Candidate, error) {
-	// Get 1H candles for regime
-	candles1H, err := s.md.GetCandles(ctx, sym.Symbol, "1H", 210)
-	if err != nil || len(candles1H) < 200 {
-		return domain.Candidate{}, fmt.Errorf("insufficient 1H candles: %d", len(candles1H))
+func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol, cycleID string) (domain.Candidate, strategy.TradeCandidate, scoring.ScoreResult, regime.MarketRegimeSnapshot, error) {
+	setupTF := s.cfg.Strategy.Timeframes.Setup
+	if setupTF == "" {
+		setupTF = "15m"
+	}
+	contextTF := s.cfg.Strategy.Timeframes.Context
+	if contextTF == "" {
+		contextTF = "1H"
 	}
 
-	// Get 15m candles for setup
-	candles15m, err := s.md.GetCandles(ctx, sym.Symbol, "15m", 25)
-	if err != nil || len(candles15m) < 21 {
-		return domain.Candidate{}, fmt.Errorf("insufficient 15m candles: %d", len(candles15m))
+	validator := marketdata.NewValidator(s.cfg.DataValidation)
+	minIndicatorCandles := maxInt(s.cfg.DataValidation.MinCandlesOrDefault(), 250)
+	minIndicatorCandles = maxInt(minIndicatorCandles, s.cfg.IndicatorEngine.WithDefaults().EMA200Period+50)
+
+	setupCandlesRaw, err := s.md.GetCandles(ctx, sym.Symbol, setupTF, minIndicatorCandles)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get %s candles: %w", setupTF, err)
+	}
+	validatedSetup, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+		Symbol:              sym.Symbol,
+		Timeframe:           setupTF,
+		Candles:             setupCandlesRaw,
+		MinRequired:         minIndicatorCandles,
+		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor(setupTF),
+		RequireClosedLatest: true,
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("setup candle validation failed: %w", err)
 	}
 
-	// Compute indicators
-	atr := strategy.ATR(candles1H, s.cfg.Strategy.Indicators.ATRPeriod)
-	ema200 := strategy.EMA(candles1H, s.cfg.Strategy.Indicators.EMA200Period)
-
-	// Detect regime
-	regimeCfg := strategy.RegimeConfig{
-		TrendUpMinDistanceFromEMAPct:   s.cfg.Strategy.Regime.TrendUpMinDistanceFromEMAPct,
-		TrendDownMaxDistanceFromEMAPct: s.cfg.Strategy.Regime.TrendDownMaxDistanceFromEMAPct,
-		RangeMaxDistanceFromEMAPct:     s.cfg.Strategy.Regime.RangeMaxDistanceFromEMAPct,
+	context1hRaw, err := s.md.GetCandles(ctx, sym.Symbol, contextTF, minIndicatorCandles)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get %s candles: %w", contextTF, err)
 	}
-	regime := strategy.DetectRegime(candles1H, ema200, regimeCfg)
-
-	// Detect setup
-	setupCfg := strategy.SetupConfig{
-		RangeCandles:               s.cfg.Strategy.Indicators.RangeCandles,
-		VolumeSMAPeriod:            s.cfg.Strategy.Indicators.VolumeSMAPeriod,
-		MinVolumeRatio:             s.cfg.Strategy.Indicators.MinVolumeRatio,
-		MaxBreakoutExtensionATR:    s.cfg.Strategy.Indicators.MaxBreakoutExtensionATR,
-		MaxDistanceFromBreakoutATR: s.cfg.Strategy.Indicators.MaxDistanceFromBreakoutATR,
-		MinRR:                      s.cfg.Strategy.Indicators.MinRR,
-		ExpectedMoveCostMultiplier: s.cfg.Strategy.Indicators.ExpectedMoveCostMultiplier,
-		MinBodyRatio:               0.3,
-		AtrPeriod:                  s.cfg.Strategy.Indicators.ATRPeriod,
-	}
-	setup := strategy.DetectSetup(candles15m, atr, ema200, regime, setupCfg)
-
-	if setup.SetupType == strategy.SetupNone {
-		return domain.Candidate{}, fmt.Errorf("no setup: %v", setup.ReasonCodes)
+	validated1H, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+		Symbol:              sym.Symbol,
+		Timeframe:           contextTF,
+		Candles:             context1hRaw,
+		MinRequired:         minIndicatorCandles,
+		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor(contextTF),
+		RequireClosedLatest: true,
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("context candle validation failed: %w", err)
 	}
 
-	// Get orderbook for scoring (skip if target notional is not configured)
+	context4hRaw, err := s.md.GetCandles(ctx, sym.Symbol, "4H", minIndicatorCandles)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get 4H candles: %w", err)
+	}
+	validated4H, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+		Symbol:              sym.Symbol,
+		Timeframe:           "4H",
+		Candles:             context4hRaw,
+		MinRequired:         minIndicatorCandles,
+		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("4H"),
+		RequireClosedLatest: true,
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("4h candle validation failed: %w", err)
+	}
+
+	indCfg := s.cfg.IndicatorEngine.WithDefaults()
+	snapCfg := indicator.SnapshotConfig{
+		EMA20Period:             indCfg.EMA20Period,
+		EMA50Period:             indCfg.EMA50Period,
+		EMA200Period:            indCfg.EMA200Period,
+		RSIPeriod:               indCfg.RSIPeriod,
+		MACDFastPeriod:          indCfg.MACDFastPeriod,
+		MACDSlowPeriod:          indCfg.MACDSlowPeriod,
+		MACDSignalPeriod:        indCfg.MACDSignalPeriod,
+		ATRPeriod:               indCfg.ATRPeriod,
+		VolumeMAPeriod:          indCfg.VolumeMAPeriod,
+		SwingLookback:           indCfg.SwingLookback,
+		RecentSwingCount:        indCfg.RecentSwingCount,
+		SupportResistanceATRTol: indCfg.SupportResistanceATRTol,
+	}
+
+	setupSnap, err := indicator.BuildSnapshot(sym.Symbol, setupTF, validatedSetup.Candles, snapCfg)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("build %s indicator snapshot: %w", setupTF, err)
+	}
+	snap1H, err := indicator.BuildSnapshot(sym.Symbol, contextTF, validated1H.Candles, snapCfg)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("build %s indicator snapshot: %w", contextTF, err)
+	}
+	snap4H, err := indicator.BuildSnapshot(sym.Symbol, "4H", validated4H.Candles, snapCfg)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("build 4H indicator snapshot: %w", err)
+	}
+	s.log.Info("indicator snapshot computed", map[string]any{
+		"symbol":             sym.Symbol,
+		"timeframe":          setupTF,
+		"indicator_snapshot": setupSnap,
+	})
+
+	// Regime snapshot strict placement: compute before strategy generation.
+	btc5mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", 2)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 5m candles: %w", err)
+	}
+	btc5m, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+		Symbol:              "BTCUSDT",
+		Timeframe:           "5m",
+		Candles:             btc5mRaw,
+		MinRequired:         2,
+		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("5m"),
+		RequireClosedLatest: true,
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 5m candles: %w", err)
+	}
+	btc15mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "15m", 2)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 15m candles: %w", err)
+	}
+	btc15m, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+		Symbol:              "BTCUSDT",
+		Timeframe:           "15m",
+		Candles:             btc15mRaw,
+		MinRequired:         2,
+		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("15m"),
+		RequireClosedLatest: true,
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 15m candles: %w", err)
+	}
+	btc1hRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "1H", minIndicatorCandles)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 1H candles: %w", err)
+	}
+	btc1H, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+		Symbol:              "BTCUSDT",
+		Timeframe:           "1H",
+		Candles:             btc1hRaw,
+		MinRequired:         minIndicatorCandles,
+		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("1H"),
+		RequireClosedLatest: true,
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 1H candles: %w", err)
+	}
+	btc4hRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "4H", minIndicatorCandles)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 4H candles: %w", err)
+	}
+	btc4H, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+		Symbol:              "BTCUSDT",
+		Timeframe:           "4H",
+		Candles:             btc4hRaw,
+		MinRequired:         minIndicatorCandles,
+		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("4H"),
+		RequireClosedLatest: true,
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 4H candles: %w", err)
+	}
+
+	btc1HSnap, err := indicator.BuildSnapshot("BTCUSDT", "1H", btc1H.Candles, snapCfg)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("build btc 1H snapshot: %w", err)
+	}
+	btc4HSnap, err := indicator.BuildSnapshot("BTCUSDT", "4H", btc4H.Candles, snapCfg)
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("build btc 4H snapshot: %w", err)
+	}
+
+	var btcd1hCandles []domain.Candle
+	var btcd1hSnap *indicator.IndicatorSnapshot
+	var btcd4hSnap *indicator.IndicatorSnapshot
+
+	if raw, e := s.md.GetCandles(ctx, "BTCD", "1H", 6); e == nil {
+		if vr, vErr := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+			Symbol:              "BTCD",
+			Timeframe:           "1H",
+			Candles:             raw,
+			MinRequired:         2,
+			MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("1H"),
+			RequireClosedLatest: true,
+		}); vErr == nil {
+			btcd1hCandles = vr.Candles
+		}
+	}
+	if raw, e := s.md.GetCandles(ctx, "BTCD", "1H", minIndicatorCandles); e == nil {
+		if vr, vErr := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+			Symbol:              "BTCD",
+			Timeframe:           "1H",
+			Candles:             raw,
+			MinRequired:         minIndicatorCandles,
+			MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("1H"),
+			RequireClosedLatest: true,
+		}); vErr == nil {
+			if snap, snapErr := indicator.BuildSnapshot("BTCD", "1H", vr.Candles, snapCfg); snapErr == nil {
+				btcd1hSnap = &snap
+			}
+		}
+	}
+	if raw, e := s.md.GetCandles(ctx, "BTCD", "4H", minIndicatorCandles); e == nil {
+		if vr, vErr := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+			Symbol:              "BTCD",
+			Timeframe:           "4H",
+			Candles:             raw,
+			MinRequired:         minIndicatorCandles,
+			MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("4H"),
+			RequireClosedLatest: true,
+		}); vErr == nil {
+			if snap, snapErr := indicator.BuildSnapshot("BTCD", "4H", vr.Candles, snapCfg); snapErr == nil {
+				btcd4hSnap = &snap
+			}
+		}
+	}
+
+	regimeCfg := s.cfg.MarketRegime.WithDefaults()
+	rsCfg := regimeCfg.RelativeStrength.WithDefaults()
+	targetRSCandles := validated1H.Candles
+	if sym.Symbol == "BTCUSDT" {
+		targetRSCandles = btc1H.Candles
+	}
+	regimeSnap, err := regime.BuildSnapshot(regime.SnapshotInput{
+		Now:             time.Now().UTC(),
+		BTC5mCandles:    btc5m.Candles,
+		BTC15mCandles:   btc15m.Candles,
+		BTC1hCandles:    btc1H.Candles,
+		BTC1hSnapshot:   btc1HSnap,
+		BTC4hSnapshot:   btc4HSnap,
+		Target1hCandles: targetRSCandles,
+		BTCD1hCandles:   btcd1hCandles,
+		BTCD1hSnapshot:  btcd1hSnap,
+		BTCD4hSnapshot:  btcd4hSnap,
+		Config: regime.Config{
+			BTCDumpShortThresholdPct:   regimeCfg.BTCDumpShortPct,
+			BTCDumpMediumThresholdPct:  regimeCfg.BTCDumpMediumPct,
+			BTCNearLevelATRBuffer:      regimeCfg.BTCNearLevelATRBuffer,
+			BTCDRisingFastThresholdPct: regimeCfg.BTCDRisingFastPct,
+			RelativeStrength: regime.RelativeStrengthConfig{
+				StrongOutperformPct:   rsCfg.StrongOutperformPct,
+				StrongUnderperformPct: rsCfg.StrongUnderperformPct,
+				NeutralBandPct:        rsCfg.NeutralBandPct,
+				SmoothedEMAPeriod:     rsCfg.SmoothedEMAPeriod,
+			},
+		},
+	})
+	if err != nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("build market regime snapshot: %w", err)
+	}
+	s.log.Info("market regime snapshot computed", map[string]any{
+		"symbol":                 sym.Symbol,
+		"market_regime_snapshot": regimeSnap,
+	})
+
+	indicatorRef := fmt.Sprintf("%s:%s:%d", sym.Symbol, setupTF, setupSnap.LastCloseTime.Unix())
+	regimeRef := fmt.Sprintf("%s:%d", sym.Symbol, regimeSnap.Timestamp.Unix())
+
+	trendCand, trendReject := strategy.GenerateTrendPullback(strategy.TrendPullbackInput{
+		Now:                  time.Now().UTC(),
+		Symbol:               sym.Symbol,
+		Timeframe:            setupTF,
+		TickSize:             sym.TickSize,
+		Candles15m:           validatedSetup.Candles,
+		Snapshot15m:          setupSnap,
+		Snapshot1h:           snap1H,
+		Snapshot4h:           snap4H,
+		IndicatorSnapshotRef: indicatorRef,
+		RegimeSnapshotRef:    regimeRef,
+	})
+	if trendReject != nil {
+		s.log.Info("rejected_candidate", map[string]any{
+			"would_have_been": trendReject.WouldHaveBeen,
+			"failed_on":       trendReject.FailedOn,
+			"near_miss":       trendReject.NearMiss,
+		})
+	}
+	breakoutCand, breakoutReject := strategy.GenerateBreakoutRetest(strategy.BreakoutRetestInput{
+		Now:                  time.Now().UTC(),
+		Symbol:               sym.Symbol,
+		Timeframe:            setupTF,
+		TickSize:             sym.TickSize,
+		Candles15m:           validatedSetup.Candles,
+		Snapshot15m:          setupSnap,
+		Snapshot1h:           snap1H,
+		IndicatorSnapshotRef: indicatorRef,
+		RegimeSnapshotRef:    regimeRef,
+	})
+	if breakoutReject != nil {
+		s.log.Info("rejected_candidate", map[string]any{
+			"would_have_been": breakoutReject.WouldHaveBeen,
+			"failed_on":       breakoutReject.FailedOn,
+			"near_miss":       breakoutReject.NearMiss,
+		})
+	}
+
+	var chosen *strategy.TradeCandidate
+	if trendCand != nil && breakoutCand != nil {
+		if trendCand.RiskRewardRatio >= breakoutCand.RiskRewardRatio {
+			chosen = trendCand
+		} else {
+			chosen = breakoutCand
+		}
+	} else if trendCand != nil {
+		chosen = trendCand
+	} else if breakoutCand != nil {
+		chosen = breakoutCand
+	}
+	if chosen == nil {
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("no phase3 setup candidate generated")
+	}
+
+	scoreCfg := s.cfg.Scoring.WithDefaults()
+	scoreRes := scoring.Score(scoring.Input{
+		Candidate:      *chosen,
+		Snapshot15m:    setupSnap,
+		Snapshot1h:     snap1H,
+		Snapshot4h:     snap4H,
+		RegimeSnapshot: regimeSnap,
+	}, scoreCfg)
+	s.log.Info("candidate score breakdown", map[string]any{
+		"symbol":          sym.Symbol,
+		"strategy":        chosen.Strategy,
+		"score_total":     scoreRes.ScoreTotal,
+		"components":      scoreRes.Components,
+		"scoring_version": scoreRes.ScoringVersion,
+		"score_action":    scoreRes.Action,
+	})
+
 	targetNotional := s.cfg.ComputeTargetNotional()
 	var ob domain.OrderBookSummary
 	var obErr error
 	if targetNotional > 0 {
-		ob, obErr = s.md.GetOrderBookSummary(ctx, sym.Symbol, targetNotional, string(setup.Side))
+		ob, obErr = s.md.GetOrderBookSummary(ctx, sym.Symbol, targetNotional, string(chosen.Side))
 	} else {
 		obErr = fmt.Errorf("target notional is zero")
 	}
 	price, _ := s.md.GetLatestPrice(ctx, sym.Symbol)
-
-	// Compute scores
 	liq, exec, vol := 50.0, 50.0, 50.0
 	if obErr == nil {
-		liq, exec, vol = computeScoresFromOB(ob, atr, price)
+		liq, exec, vol = computeScoresFromOB(ob, setupSnap.ATR14, price)
 	}
-	candScore := liq*0.25 + exec*0.25 + setup.SetupScore*0.35 + vol*0.15
 
-	// Estimate costs
-	estFee := price * 0.00055     // taker 5.5bps
-	estSlippage := price * 0.0005 // 5bps
+	entryType := domain.EntryTypeMarket
+	switch chosen.EntryType {
+	case strategy.CandidateEntryLimitRetest:
+		entryType = domain.EntryTypeLimitRetest
+	case strategy.CandidateEntryStop:
+		entryType = domain.EntryTypeMarket
+	}
+	tp1 := chosen.TakeProfits[0].Price
+	expectedMove := math.Abs(tp1 - chosen.EntryPrice)
+	estFee := chosen.EntryPrice * 0.00055
+	estSlippage := chosen.EntryPrice * 0.0005
 	totalCost := estFee + estSlippage
-	expectedMove := atr * 2
 
 	cand := domain.Candidate{
 		ProposedTrade: domain.ProposedTrade{
 			Symbol:             sym.Symbol,
-			Side:               setup.Side,
-			SetupType:          string(setup.SetupType),
-			Regime:             string(regime),
-			EntryType:          setup.EntryType,
-			ProposedEntry:      setup.ProposedEntry,
-			ProposedStopLoss:   setup.StopLoss,
-			ProposedTakeProfit: setup.TakeProfit,
-			RR:                 setup.RR,
-			SetupScore:         setup.SetupScore,
+			Side:               chosen.Side,
+			SetupType:          string(chosen.Strategy),
+			Regime:             regimeSnap.RelativeStrength.Classification,
+			EntryType:          entryType,
+			ProposedEntry:      chosen.EntryPrice,
+			ProposedStopLoss:   chosen.StopLoss,
+			ProposedTakeProfit: tp1,
+			RR:                 chosen.RiskRewardRatio,
+			InvalidationLevel:  chosen.InvalidationLevel,
+			ReasonCodes:        []string{string(scoreRes.Action), chosen.TAReasoning.Trigger},
+			SetupScore:         scoreRes.Components.SetupQuality,
 			ExpectedMove:       expectedMove,
 			EstimatedTotalCost: totalCost,
-			ReasonCodes:        setup.ReasonCodes,
 		},
 		CycleID:         cycleID,
-		CandidateScore:  candScore,
+		CandidateScore:  scoreRes.ScoreTotal,
 		LiquidityScore:  liq,
 		ExecutionScore:  exec,
 		VolatilityScore: vol,
+		LLMEligible:     scoreRes.Action != scoring.ActionReject,
 	}
-
-	// Evaluate LLM eligibility
 	if obErr == nil {
 		cand = evaluateLLMEligibility(cand, ob, s.cfg.Universe.Filters, s.cfg.LLMRouting, s.cfg.Strategy)
 	} else {
 		cand.LLMRoutingReasonCodes = []string{"no_orderbook"}
 	}
+	if scoreRes.Action == scoring.ActionReject {
+		cand.LLMEligible = false
+		cand.LLMRoutingReasonCodes = append(cand.LLMRoutingReasonCodes, "scoring_reject")
+	}
+	return cand, *chosen, scoreRes, regimeSnap, nil
+}
 
-	return cand, nil
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (string, error) {

@@ -309,3 +309,88 @@ type TradeFlow struct {
 	LastUpdate    time.Time
 	Stale         bool
 }
+
+// DecisionLog is the canonical record of every trading decision.
+type DecisionLog struct {
+	DecisionID            string
+	CycleID               string
+	Timestamp             time.Time
+	Mode                  string
+	Symbol                string
+	Timeframe             string
+	CandleCount           int
+	DataValidationResult  string
+	IndicatorSnapshot     string // JSON
+	RegimeSnapshot        string // JSON
+	StrategyAttempted     string // JSON array of strategy names
+	Candidate             string // JSON or null
+	ScoreBreakdown        string // JSON or null
+	NearMisses            string // JSON array
+	RiskValidation        string // JSON or null
+	SafetyValidation      string // JSON or null
+	OrderPlan             string // JSON or null
+	LLMReview             string // JSON or null
+	LLMModeActive         bool
+	FinalAction           string
+	FinalActionReason     string
+	EngineVersion         string
+	ScoringVersion        string
+	RiskConfigVersion     string
+	LLMPromptVersion      string
+}
+
+// CandidateOutcome tracks what happened to price after a candidate was generated.
+type CandidateOutcome struct {
+	DecisionID               string
+	Symbol                   string
+	Side                     Side
+	EntryPrice               float64
+	StopLoss                 float64
+	TakeProfits              string // JSON array of TP prices
+	PriceAt15m               *float64
+	PriceAt1h                *float64
+	PriceAt4h                *float64
+	PriceAt24h               *float64
+	MaxFavorableExcursion24h *float64
+	MaxAdverseExcursion24h   *float64
+	WouldHaveHitTP1          bool
+	WouldHaveHitSL           bool
+	WouldHaveOutcome         string
+	ResultInR                float64
+	TrackedUntil             time.Time
+	Status                   string // "tracking" | "completed"
+}
+
+// PaperTrade records a simulated trade in paper mode.
+type PaperTrade struct {
+	PaperTradeID   string
+	DecisionID     string
+	OpenedAt       time.Time
+	ClosedAt       *time.Time
+	Symbol         string
+	Side           Side
+	Qty            float64
+	Leverage       float64
+	EntryPrice     float64
+	ExitPrice      *float64
+	StopLoss       float64
+	TakeProfit     float64
+	FeesPaid       float64
+	FundingPaid    float64
+	PnLGross       *float64
+	PnLNet         *float64
+	RMultiple      *float64
+	ExitReason     string // "tp1" | "tp2" | "sl" | "manual" | "timeout"
+}
+
+// PaperAccountState persists paper account state across restarts.
+type PaperAccountState struct {
+	ID            int64
+	StartingEquity float64
+	CurrentEquity  float64
+	TotalTrades    int
+	Wins           int
+	Losses         int
+	RealizedPnL    float64
+	UpdatedAt      time.Time
+}

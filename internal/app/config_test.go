@@ -75,6 +75,21 @@ func TestLoadConfig_Success(t *testing.T) {
 	if cfg.Database.Driver != "postgres" {
 		t.Errorf("expected postgres driver, got %s", cfg.Database.Driver)
 	}
+	if cfg.DataValidation.MinCandles != 250 {
+		t.Errorf("expected data_validation.min_candles=250, got %d", cfg.DataValidation.MinCandles)
+	}
+	if got := cfg.HardBlocks.MaxSpreadPct; got != 0.15 {
+		t.Errorf("expected hard_blocks.max_spread_pct=0.15, got %.4f", got)
+	}
+	if cfg.IndicatorEngine.EMA200Period != 200 {
+		t.Errorf("expected indicator_engine.ema200_period=200, got %d", cfg.IndicatorEngine.EMA200Period)
+	}
+	if cfg.MarketRegime.RelativeStrength.NeutralBandPct != 0.5 {
+		t.Errorf("expected market_regime.relative_strength.neutral_band_pct=0.5, got %.2f", cfg.MarketRegime.RelativeStrength.NeutralBandPct)
+	}
+	if cfg.Scoring.ScoringVersion != "v0.1.0" {
+		t.Errorf("expected scoring.scoring_version=v0.1.0, got %s", cfg.Scoring.ScoringVersion)
+	}
 }
 
 func TestLoadConfig_MissingFile(t *testing.T) {
@@ -272,22 +287,30 @@ backtest:
 }
 
 func TestConfigValidate_LiveWithoutConfirmation(t *testing.T) {
+	// Live mode is now enforced by ResolveMode at startup, not config validation.
+	// Config validate only checks that mode is a valid string.
 	cfg := minimalValidConfig()
 	cfg.App.Mode = "live"
-	cfg.App.LiveConfirmed = false
+	cfg.Sizing.MarginPerTradeUSD = 100
+	cfg.Sizing.MaxLeverage = 5
+	// Should pass config validation - live enforcement happens in ResolveMode
 	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error for live mode without confirmation")
+	if err != nil {
+		t.Fatalf("expected no error for live mode in config validation (resolved at startup), got %v", err)
 	}
 }
 
 func TestConfigValidate_LiveModeNotImplemented(t *testing.T) {
+	// Live mode startup enforcement is now handled by ResolveMode.
+	// Config validation only needs valid mode string.
 	cfg := minimalValidConfig()
 	cfg.App.Mode = "live"
 	cfg.App.LiveConfirmed = true
+	cfg.Sizing.MarginPerTradeUSD = 100
+	cfg.Sizing.MaxLeverage = 5
 	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error because live mode is not implemented in phase 1")
+	if err != nil {
+		t.Fatalf("expected no error, live mode enforcement moved to ResolveMode, got %v", err)
 	}
 }
 
@@ -297,6 +320,52 @@ func TestConfigValidate_InvalidMode(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("expected error for invalid mode")
+	}
+}
+
+func TestConfigValidate_InvalidDataValidation(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.DataValidation.MinCandles = -1
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid data_validation.min_candles")
+	}
+}
+
+func TestConfigValidate_InvalidHardBlocks(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.HardBlocks.MaxSpreadPct = -0.1
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid hard_blocks.max_spread_pct")
+	}
+}
+
+func TestConfigValidate_InvalidIndicatorEngine(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.IndicatorEngine.MACDFastPeriod = 26
+	cfg.IndicatorEngine.MACDSlowPeriod = 12
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid indicator_engine macd periods")
+	}
+}
+
+func TestConfigValidate_InvalidMarketRegime(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.MarketRegime.BTCDRisingFastPct = -0.5
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid market_regime.btcd_rising_fast_pct")
+	}
+}
+
+func TestConfigValidate_InvalidScoringMode(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Scoring.Mode = "invalid"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid scoring mode")
 	}
 }
 

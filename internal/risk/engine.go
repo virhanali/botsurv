@@ -7,6 +7,7 @@ import (
 
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/regime"
 )
 
 // MarketState holds current market data for risk evaluation.
@@ -462,9 +463,232 @@ func GetRejectionReason(code string) string {
 		"BELOW_MIN_NOTIONAL":          "Position below minimum notional",
 		"LEVERAGE_EXCEEDS_MAX":        "Leverage exceeds maximum",
 		"PORTFOLIO_RISK_LIMIT":        "Portfolio risk limit reached",
+		"RISK_TOO_SMALL":              "Risk amount too small after modifiers",
+		"MAX_CORRELATED_ALT_POSITIONS": "Maximum correlated alt LONG positions reached",
+		"INVALID_QTY":                 "Invalid quantity after lot size rounding",
+		"MARGIN_EXCEEDS_AVAILABLE":    "Margin required exceeds available balance",
 	}
 	if r, ok := reasons[code]; ok {
 		return r
 	}
 	return fmt.Sprintf("Unknown reason: %s", code)
+}
+
+// --- Phase 4 Candidate Risk Validation ---
+
+// ValidateCandidate performs Phase 4 deterministic risk validation on a scored candidate.
+func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResult {
+	cfg := e.cfg.Risk.WithDefaults()
+	var reasons []string
+	var modifiers []string
+
+	cand := input.Candidate
+	acc := input.AccountState
+
+	// Basic sanity checks
+	if !isFinitePositive(acc.Equity) {
+		return RiskValidationResult{CandidateID: cand.CandidateID, Approved: false, RejectionReasons: []string{"INVALID_EQUITY"}, RiskConfigVersion: cfg.RiskConfigVersion}
+	}
+	if !isFinitePositive(cand.EntryPrice) {
+		return RiskValidationResult{CandidateID: cand.CandidateID, Approved: false, RejectionReasons: []string{"INVALID_ENTRY"}, RiskConfigVersion: cfg.RiskConfigVersion}
+	}
+	if cand.StopLoss <= 0 || !isFinitePositive(cand.StopLoss) {
+		return RiskValidationResult{CandidateID: cand.CandidateID, Approved: false, RejectionReasons: []string{"SL_MISSING"}, RiskConfigVersion: cfg.RiskConfigVersion}
+	}
+
+	// 1. Determine base risk pct (cap at max)
+	riskPct := cfg.BaseRiskPerTradePct
+	if riskPct > cfg.MaxRiskPerTradePct {
+		riskPct = cfg.MaxRiskPerTradePct
+	}
+
+	// 2. Apply modifiers in order
+	// Modifier 1: REDUCE_SIZE from scoring
+	if input.ScoreResult.Action == "REDUCE_SIZE" {
+		riskPct *= 0.5
+		modifiers = append(modifiers, "scoring_reduce_size_0.5x")
+	}
+
+	// Modifier 2: BTC bearish HTF + LONG
+	if cand.Side == domain.SideLong && hasBTCBearishHTF(input.RegimeSnapshot) {
+		riskPct *= 0.7
+		modifiers = append(modifiers, "btc_bearish_htf_0.7x")
+	}
+
+	// Modifier 3: strong_underperform + LONG
+	if cand.Side == domain.SideLong && input.RegimeSnapshot.RelativeStrength.Classification == "strong_underperform" {
+		riskPct *= 0.6
+		modifiers = append(modifiers, "strong_underperform_0.6x")
+	}
+
+	// 3. Check minimum risk after modifiers
+	if riskPct < cfg.MinRiskPerTradePct {
+		return RiskValidationResult{
+			CandidateID:       cand.CandidateID,
+			Approved:          false,
+			RejectionReasons:  []string{"RISK_TOO_SMALL"},
+			ModifiersApplied:  modifiers,
+			RiskConfigVersion: cfg.RiskConfigVersion,
+		}
+	}
+
+	// 4. Sizing
+	leverage := cfg.PreferredLeverage
+	if leverage > cfg.MaxLeverage {
+		leverage = cfg.MaxLeverage
+	}
+	if leverage > input.SymbolInfo.MaxLeverage && input.SymbolInfo.MaxLeverage > 0 {
+		leverage = input.SymbolInfo.MaxLeverage
+	}
+
+	riskAmount := acc.Equity * riskPct / 100
+	riskPerUnit := math.Abs(cand.EntryPrice - cand.StopLoss)
+	qtyRaw := riskAmount / riskPerUnit
+	qty := roundToLotSize(qtyRaw, input.SymbolInfo.LotSize)
+	positionValue := qty * cand.EntryPrice
+	marginRequired := positionValue / leverage
+
+	// 5. Validations
+	// LONG: SL below entry, TPs above entry
+	// SHORT: SL above entry, TPs below entry
+	if cand.Side == domain.SideLong {
+		if cand.StopLoss >= cand.EntryPrice {
+			reasons = append(reasons, "SL_WRONG_SIDE")
+		}
+		for _, tp := range cand.TakeProfits {
+			if tp.Price <= cand.EntryPrice {
+				reasons = append(reasons, "TP_WRONG_SIDE")
+				break
+			}
+		}
+	} else {
+		if cand.StopLoss <= cand.EntryPrice {
+			reasons = append(reasons, "SL_WRONG_SIDE")
+		}
+		for _, tp := range cand.TakeProfits {
+			if tp.Price >= cand.EntryPrice {
+				reasons = append(reasons, "TP_WRONG_SIDE")
+				break
+			}
+		}
+	}
+
+	// RR >= min_rr (against TP1)
+	if len(cand.TakeProfits) > 0 {
+		rr := cand.RiskRewardRatio
+		if rr < cfg.MinRR {
+			reasons = append(reasons, "RR_BELOW_MIN")
+		}
+	}
+
+	// Margin <= available_balance * 0.95
+	availableBalance := acc.AvailableBalance
+	if availableBalance <= 0 {
+		availableBalance = acc.Balance - acc.UsedMargin
+	}
+	if availableBalance > 0 && marginRequired > availableBalance*0.95 {
+		reasons = append(reasons, "MARGIN_EXCEEDS_AVAILABLE")
+	}
+
+	// Qty > min order size
+	if qty <= 0 || (input.SymbolInfo.LotSize > 0 && qty < input.SymbolInfo.LotSize) {
+		reasons = append(reasons, "INVALID_QTY")
+	}
+	if input.SymbolInfo.MinNotional > 0 && positionValue < input.SymbolInfo.MinNotional {
+		reasons = append(reasons, "BELOW_MIN_NOTIONAL")
+	}
+
+	// Price rounded to tick size
+	entryPrice := roundToTickSize(cand.EntryPrice, input.SymbolInfo.TickSize)
+	slPrice := roundToTickSize(cand.StopLoss, input.SymbolInfo.TickSize)
+
+	// Max open positions
+	openPosCount := 0
+	for _, p := range input.Portfolio.OpenPositions {
+		if p.Status == domain.PositionStatusOpen {
+			openPosCount++
+		}
+	}
+	if openPosCount >= cfg.MaxOpenPositions {
+		reasons = append(reasons, "MAX_OPEN_POSITIONS")
+	}
+
+	// Max correlated positions (only 1 alt LONG at a time if BTC-correlated)
+	if cand.Side == domain.SideLong && cand.Symbol != "BTCUSDT" {
+		altLongCount := 0
+		for _, p := range input.Portfolio.OpenPositions {
+			if p.Status == domain.PositionStatusOpen && p.Side == domain.SideLong && p.Symbol != "BTCUSDT" {
+				altLongCount++
+			}
+		}
+		if altLongCount >= cfg.MaxCorrelatedPositions {
+			reasons = append(reasons, "MAX_CORRELATED_ALT_POSITIONS")
+		}
+	}
+
+	// Bot state
+	if input.BotState.Halted {
+		reasons = append(reasons, "BOT_HALTED")
+	}
+
+	// Build order plan
+	var tpPlans []TakeProfitPlan
+	for _, tp := range cand.TakeProfits {
+		tpPlans = append(tpPlans, TakeProfitPlan{
+			Price: roundToTickSize(tp.Price, input.SymbolInfo.TickSize),
+			Qty:   roundToLotSize(qty*tp.SizePct/100, input.SymbolInfo.LotSize),
+		})
+	}
+
+	// Estimate fees (taker fee for entry + taker fee for exit)
+	feeRate := e.cfg.Broker.Paper.FeeTakerBps / 10000.0
+	estimatedFees := positionValue * feeRate * 2 // entry + exit
+
+	plan := &OrderPlan{
+		Symbol:         cand.Symbol,
+		Side:           cand.Side,
+		Qty:            qty,
+		EntryPrice:     entryPrice,
+		EntryType:      string(cand.EntryType),
+		StopLoss:       slPrice,
+		TakeProfits:    tpPlans,
+		Leverage:       leverage,
+		MarginRequired: marginRequired,
+		EstimatedFees:  estimatedFees,
+		RiskAmountUSD:  riskAmount,
+		RiskPctUsed:    riskPct,
+	}
+
+	approved := len(reasons) == 0
+	return RiskValidationResult{
+		CandidateID:       cand.CandidateID,
+		Approved:          approved,
+		RejectionReasons:  reasons,
+		OrderPlan:         plan,
+		ModifiersApplied:  modifiers,
+		RiskConfigVersion: cfg.RiskConfigVersion,
+	}
+}
+
+func hasBTCBearishHTF(snap regime.MarketRegimeSnapshot) bool {
+	for _, f := range snap.BTCFiltersTriggered {
+		if f == "BTCStronglyBearishHTF" {
+			return true
+		}
+	}
+	return false
+}
+
+func roundToTickSize(price, tickSize float64) float64 {
+	if tickSize <= 0 || math.IsNaN(tickSize) || math.IsInf(tickSize, 0) {
+		return price
+	}
+	return math.Round(price/tickSize) * tickSize
+}
+
+func roundToLotSize(qty, lotSize float64) float64 {
+	if lotSize <= 0 || math.IsNaN(lotSize) || math.IsInf(lotSize, 0) {
+		return qty
+	}
+	return math.Round(qty/lotSize) * lotSize
 }

@@ -47,7 +47,7 @@ func TestExecute_MarketOrder(t *testing.T) {
 		FinalPositionNotional: 100,
 	}
 
-	result := ex.Execute(context.Background(), cand, decision, riskOut)
+	result := ex.Execute(context.Background(), cand, decision, riskOut, 65000)
 	if !result.Success {
 		t.Errorf("expected success, got error: %s", result.Error)
 	}
@@ -85,7 +85,7 @@ func TestExecute_SetsProtectiveOrders(t *testing.T) {
 		FinalPositionNotional: 100,
 	}
 
-	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut)
+	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut, 65000)
 	if !result.Success {
 		t.Fatalf("expected success: %s", result.Error)
 	}
@@ -120,7 +120,7 @@ func TestExecute_ShortPosition(t *testing.T) {
 		FinalPositionNotional: 500,
 	}
 
-	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut)
+	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut, 3000)
 	if !result.Success {
 		t.Errorf("expected success: %s", result.Error)
 	}
@@ -150,7 +150,7 @@ func TestExecute_ZeroQuantity(t *testing.T) {
 		FinalPositionNotional: 100,
 	}
 
-	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut)
+	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut, 65000)
 	if result.Success {
 		t.Error("expected failure for zero quantity")
 	}
@@ -175,7 +175,7 @@ func TestExecute_InsufficientBalance(t *testing.T) {
 		FinalPositionNotional: 1000000, // way more than balance
 	}
 
-	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut)
+	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut, 65000)
 	if result.Success {
 		t.Error("expected failure for insufficient balance")
 	}
@@ -200,7 +200,7 @@ func TestExecutor_RejectNaNQuantity(t *testing.T) {
 		FinalPositionNotional: 100,
 	}
 
-	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut)
+	result := ex.Execute(context.Background(), cand, domain.LLMDecision{}, riskOut, 65000)
 	if result.Success {
 		t.Fatal("expected rejection for NaN quantity")
 	}

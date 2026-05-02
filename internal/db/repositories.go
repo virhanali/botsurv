@@ -84,17 +84,55 @@ type LLMUsageRepository interface {
 	IncrementCalls(ctx context.Context, usageDate time.Time, calls int) error
 }
 
+// DecisionLogRepository persists decision log entries.
+type DecisionLogRepository interface {
+	Insert(ctx context.Context, d domain.DecisionLog) error
+	GetByCycle(ctx context.Context, cycleID string) ([]domain.DecisionLog, error)
+	GetRecent(ctx context.Context, limit int) ([]domain.DecisionLog, error)
+	GetBySymbol(ctx context.Context, symbol string, since time.Time) ([]domain.DecisionLog, error)
+	CountByAction(ctx context.Context, action string, since time.Time) (int, error)
+}
+
+// CandidateOutcomeRepository persists counterfactual outcomes.
+type CandidateOutcomeRepository interface {
+	Insert(ctx context.Context, o domain.CandidateOutcome) error
+	Update(ctx context.Context, o domain.CandidateOutcome) error
+	GetPending(ctx context.Context) ([]domain.CandidateOutcome, error)
+	GetByDecision(ctx context.Context, decisionID string) (*domain.CandidateOutcome, error)
+	GetCompleted(ctx context.Context, since time.Time) ([]domain.CandidateOutcome, error)
+}
+
+// PaperTradeRepository persists paper mode trades.
+type PaperTradeRepository interface {
+	Insert(ctx context.Context, t domain.PaperTrade) error
+	Update(ctx context.Context, t domain.PaperTrade) error
+	GetOpen(ctx context.Context) ([]domain.PaperTrade, error)
+	GetByDecision(ctx context.Context, decisionID string) (*domain.PaperTrade, error)
+	GetAll(ctx context.Context, since time.Time) ([]domain.PaperTrade, error)
+	CountByExitReason(ctx context.Context, reason string, since time.Time) (int, error)
+}
+
+// PaperAccountStateRepository persists paper account state.
+type PaperAccountStateRepository interface {
+	Get(ctx context.Context) (*domain.PaperAccountState, error)
+	Update(ctx context.Context, s domain.PaperAccountState) error
+}
+
 // Repositories aggregates all repository interfaces.
 type Repositories struct {
-	CandleRepository          CandleRepository
-	UniverseRepository        UniverseRepository
-	CycleRepository           CycleRepository
-	CandidateRepository       CandidateRepository
-	PositionRepository        PositionRepository
-	OrderRepository           OrderRepository
-	ExecutionRepository       ExecutionRepository
-	AccountSnapshotRepository AccountSnapshotRepository
-	LLMDecisionRepository     LLMDecisionRepository
-	RiskDecisionRepository    RiskDecisionRepository
-	LLMUsageRepository        LLMUsageRepository
+	CandleRepository             CandleRepository
+	UniverseRepository           UniverseRepository
+	CycleRepository              CycleRepository
+	CandidateRepository          CandidateRepository
+	PositionRepository           PositionRepository
+	OrderRepository              OrderRepository
+	ExecutionRepository          ExecutionRepository
+	AccountSnapshotRepository    AccountSnapshotRepository
+	LLMDecisionRepository        LLMDecisionRepository
+	RiskDecisionRepository       RiskDecisionRepository
+	LLMUsageRepository           LLMUsageRepository
+	DecisionLogRepository        DecisionLogRepository
+	CandidateOutcomeRepository   CandidateOutcomeRepository
+	PaperTradeRepository         PaperTradeRepository
+	PaperAccountStateRepository  PaperAccountStateRepository
 }

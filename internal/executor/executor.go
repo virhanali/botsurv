@@ -7,6 +7,7 @@ import (
 
 	"github.com/virhan/botsurv/internal/broker"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/execution"
 	"github.com/virhan/botsurv/internal/logger"
 	"github.com/virhan/botsurv/internal/risk"
 )
@@ -31,8 +32,46 @@ func NewExecutor(broker broker.Broker, log *logger.Logger) *Executor {
 	return &Executor{broker: broker, log: log}
 }
 
+// ExecutePlan logs a validated order plan without submitting to the broker (Phase 4).
+// In Phase 5 this will be replaced with actual order submission.
+func (e *Executor) ExecutePlan(ctx context.Context, result risk.RiskValidationResult, safety execution.ExecutionSafetyResult) ExecutionResult {
+	res := ExecutionResult{Symbol: result.OrderPlan.Symbol}
+	if !result.Approved {
+		res.Error = "risk not approved"
+		return res
+	}
+	if !safety.Safe {
+		res.Error = fmt.Sprintf("execution safety failed: %v", safety.Reasons)
+		return res
+	}
+	plan := result.OrderPlan
+	res.Success = true
+	res.Actions = append(res.Actions, fmt.Sprintf("plan_logged %s %s qty=%.4f entry=%.2f sl=%.2f lev=%.1f margin=%.2f",
+		plan.Symbol, plan.Side, plan.Qty, plan.EntryPrice, plan.StopLoss, plan.Leverage, plan.MarginRequired))
+	e.log.Info("order plan validated and logged (Phase 4 — no submission)", map[string]any{
+		"symbol":          plan.Symbol,
+		"side":            plan.Side,
+		"qty":             plan.Qty,
+		"entry_price":     plan.EntryPrice,
+		"stop_loss":       plan.StopLoss,
+		"take_profits":    plan.TakeProfits,
+		"leverage":        plan.Leverage,
+		"margin_required": plan.MarginRequired,
+		"risk_amount_usd": plan.RiskAmountUSD,
+		"risk_pct_used":   plan.RiskPctUsed,
+		"modifiers":       result.ModifiersApplied,
+	})
+	return res
+}
+
 // Execute places the trade with atomic SL/TP via the Broker.
-func (e *Executor) Execute(ctx context.Context, cand domain.Candidate, decision domain.LLMDecision, riskOut risk.ValidateOutput) ExecutionResult {
+// marketPrice is the current price from the WS ticker cache, required for market orders.
+//
+// Deprecated: Execute bypasses hard blocks, Phase 4 candidate validation, execution safety,
+// and mode routing. It is preserved for backward compatibility with test harnesses but must
+// not be called from production scheduler paths. Use the scheduler's RunOnce flow for
+// production decisions.
+func (e *Executor) Execute(ctx context.Context, cand domain.Candidate, decision domain.LLMDecision, riskOut risk.ValidateOutput, marketPrice float64) ExecutionResult {
 	result := ExecutionResult{Symbol: cand.Symbol}
 
 	orderSide := domain.OrderSideBuy
@@ -50,6 +89,11 @@ func (e *Executor) Execute(ctx context.Context, cand domain.Candidate, decision 
 			"symbol":   cand.Symbol,
 		})
 		return result
+	}
+
+	// Push WS ticker price into broker cache so PlaceOrder can fill the market order.
+	if marketPrice > 0 {
+		e.broker.SetSymbolPrice(cand.Symbol, marketPrice)
 	}
 
 	orderReq := broker.OrderRequest{

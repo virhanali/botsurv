@@ -11,6 +11,7 @@ import (
 	"github.com/virhan/botsurv/internal/broker"
 	"github.com/virhan/botsurv/internal/db"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/execution"
 	"github.com/virhan/botsurv/internal/executor"
 	"github.com/virhan/botsurv/internal/llm"
 	"github.com/virhan/botsurv/internal/logger"
@@ -91,56 +92,94 @@ func (m *mockMarketData) GetCandles(ctx context.Context, symbol, timeframe strin
 			return c, nil
 		}
 	}
-	now := time.Now().Truncate(time.Hour)
+	now := time.Now().UTC()
+	if limit <= 0 {
+		limit = 25
+	}
 
-	if timeframe == "1H" {
-		// 210 trending-up 1H candles for regime detection.
-		candles := make([]domain.Candle, 210)
-		for i := 0; i < 210; i++ {
-			price := 64500.0 + float64(i)*5
-			candles[i] = domain.Candle{
+	makeSeries := func(n int, step time.Duration, base, stepPrice float64, tf string) []domain.Candle {
+		out := make([]domain.Candle, n)
+		for i := 0; i < n; i++ {
+			p := base + float64(i)*stepPrice
+			out[i] = domain.Candle{
 				Symbol:    symbol,
-				Timeframe: "1H",
-				OpenTime:  now.Add(-time.Duration(210-i) * time.Hour).UnixMilli(),
-				Open:      price,
-				High:      price + 100,
-				Low:       price - 50,
-				Close:     price + 50,
+				Timeframe: tf,
+				OpenTime:  now.Add(-time.Duration(n-i) * step).UnixMilli(),
+				Open:      p,
+				High:      p + 100,
+				Low:       p - 50,
+				Close:     p + 50,
 				Volume:    2000,
 				Confirmed: true,
 			}
 		}
-		return candles, nil
+		return out
 	}
 
-	// 15m candles: flat range with breakout on last candle.
-	candles := make([]domain.Candle, 25)
-	for i := 0; i < 24; i++ {
-		candles[i] = domain.Candle{
-			Symbol:    symbol,
-			Timeframe: "15m",
-			OpenTime:  now.Add(-time.Duration(24-i) * 15 * time.Minute).UnixMilli(),
-			Open:      65000,
-			High:      65050,
-			Low:       64950,
-			Close:     65000,
-			Volume:    1000,
-			Confirmed: true,
+	switch timeframe {
+	case "1H":
+		n := limit
+		if n < 260 {
+			n = 260
 		}
+		return makeSeries(n, time.Hour, 64500, 5, "1H"), nil
+	case "4H":
+		n := limit
+		if n < 260 {
+			n = 260
+		}
+		return makeSeries(n, 4*time.Hour, 64000, 8, "4H"), nil
+	case "5m":
+		n := limit
+		if n < 2 {
+			n = 2
+		}
+		return makeSeries(n, 5*time.Minute, 65000, 2, "5m"), nil
+	case "15m":
+		n := limit
+		if n < 25 {
+			n = 25
+		}
+		// 15m candles: trend + pullback + bullish reaction for phase-3 strategy tests.
+		candles := make([]domain.Candle, n)
+		price := 65000.0
+		for i := 0; i < n; i++ {
+			switch {
+			case i < n-40:
+				price += 0.8
+			case i < n-6:
+				price -= 0.2
+			default:
+				price += 0.35
+			}
+			open := price - 0.05
+			close := price
+			high := price + 80
+			low := price - 80
+			vol := 1000.0
+			if i == n-1 {
+				open = price - 0.03
+				close = price + 0.12
+				high = price + 85
+				low = price - 160
+				vol = 2000
+			}
+			candles[i] = domain.Candle{
+				Symbol:    symbol,
+				Timeframe: "15m",
+				OpenTime:  now.Add(-time.Duration(n-i) * 15 * time.Minute).UnixMilli(),
+				Open:      open,
+				High:      high,
+				Low:       low,
+				Close:     close,
+				Volume:    vol,
+				Confirmed: true,
+			}
+		}
+		return candles, nil
+	default:
+		return makeSeries(limit, time.Minute, 100, 1, timeframe), nil
 	}
-	// Current candle: breakout above range high with volume.
-	candles[24] = domain.Candle{
-		Symbol:    symbol,
-		Timeframe: "15m",
-		OpenTime:  now.UnixMilli(),
-		Open:      65000,
-		High:      65200,
-		Low:       64950,
-		Close:     65200,
-		Volume:    5000,
-		Confirmed: true,
-	}
-	return candles, nil
 }
 func (m *mockMarketData) GetLatestPrice(ctx context.Context, symbol string) (float64, error) {
 	if m.priceErr != nil {
@@ -258,6 +297,14 @@ func newTestScheduler(universeRepo db.UniverseRepository, cycleRepo db.CycleRepo
 		Universe: app.UniverseConfig{
 			Mode: "all_usdt_perpetual",
 		},
+		DataValidation: app.DataValidationConfig{
+			MinCandles: 25,
+			MaxDataAgeSeconds: map[string]int{
+				"1H":  7200,
+				"15m": 7200,
+				"5m":  7200,
+			},
+		},
 		Strategy: app.StrategyConfig{
 			Enabled: true,
 			Timeframes: app.TimeframesConfig{
@@ -312,9 +359,10 @@ func newTestScheduler(universeRepo db.UniverseRepository, cycleRepo db.CycleRepo
 	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
 	riskEng := risk.NewEngine(cfg)
 	exec := executor.NewExecutor(pb, log)
+	safetyEng := execution.NewSafetyEngine(cfg)
 	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
 
-	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, mon, md, log)
+	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, safetyEng, mon, md, log)
 	sched.SetCycleRepo(cycleRepo)
 	return sched
 }
@@ -598,6 +646,14 @@ func TestScheduler_RunOnce_CallsGetOrderBookSummaryWithTargetNotional(t *testing
 		Universe: app.UniverseConfig{
 			Mode: "all_usdt_perpetual",
 		},
+		DataValidation: app.DataValidationConfig{
+			MinCandles: 25,
+			MaxDataAgeSeconds: map[string]int{
+				"1H":  7200,
+				"15m": 7200,
+				"5m":  7200,
+			},
+		},
 		Strategy: app.StrategyConfig{
 			Enabled: true,
 			Timeframes: app.TimeframesConfig{
@@ -651,9 +707,10 @@ func TestScheduler_RunOnce_CallsGetOrderBookSummaryWithTargetNotional(t *testing
 	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
 	riskEng := risk.NewEngine(cfg)
 	exec := executor.NewExecutor(pb, log)
+	safetyEng := execution.NewSafetyEngine(cfg)
 	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
 
-	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, mon, md, log)
+	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, safetyEng, mon, md, log)
 	sched.SetCycleRepo(cycleRepo)
 	sched.SetCandidateRepo(candidateRepo)
 
@@ -691,6 +748,14 @@ func TestScheduler_SkipZeroPrice(t *testing.T) {
 		},
 		Universe: app.UniverseConfig{
 			Mode: "all_usdt_perpetual",
+		},
+		DataValidation: app.DataValidationConfig{
+			MinCandles: 25,
+			MaxDataAgeSeconds: map[string]int{
+				"1H":  7200,
+				"15m": 7200,
+				"5m":  7200,
+			},
 		},
 		Strategy: app.StrategyConfig{
 			Enabled: true,
@@ -746,9 +811,10 @@ func TestScheduler_SkipZeroPrice(t *testing.T) {
 	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
 	riskEng := risk.NewEngine(cfg)
 	exec := executor.NewExecutor(pb, log)
+	safetyEng := execution.NewSafetyEngine(cfg)
 	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
 
-	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, mon, md, log)
+	sched := NewScheduler(cfg, screenerSvc, llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil), riskEng, exec, safetyEng, mon, md, log)
 	sched.SetCycleRepo(cycleRepo)
 	sched.SetCandidateRepo(candidateRepo)
 	sched.SetRiskDecisionRepo(riskDecisionRepo)
@@ -762,28 +828,13 @@ func TestScheduler_SkipZeroPrice(t *testing.T) {
 	}
 	foundSkip := false
 	for _, sk := range result.Skips {
-		if sk.Reason == "RISK_REJECTED" {
+		if sk.Reason == "HARD_BLOCK" {
 			foundSkip = true
 			break
 		}
 	}
 	if !foundSkip {
-		t.Fatalf("expected RISK_REJECTED skip, got %v", result.Skips)
-	}
-	if len(riskDecisionRepo.decisions) == 0 {
-		t.Fatal("expected risk decision persisted")
-	}
-	foundReason := false
-	for _, rec := range riskDecisionRepo.decisions {
-		for _, reason := range rec.decision.ReasonCodes {
-			if reason == "PRICE_UNAVAILABLE" {
-				foundReason = true
-				break
-			}
-		}
-	}
-	if !foundReason {
-		t.Fatalf("expected PRICE_UNAVAILABLE reason in risk decisions, got %+v", riskDecisionRepo.decisions)
+		t.Fatalf("expected HARD_BLOCK skip, got %v", result.Skips)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"github.com/virhan/botsurv/internal/broker"
 	"github.com/virhan/botsurv/internal/db"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/execution"
 	"github.com/virhan/botsurv/internal/executor"
 	"github.com/virhan/botsurv/internal/llm"
 	"github.com/virhan/botsurv/internal/logger"
@@ -303,6 +304,7 @@ func TestEndToEnd_PaperTradingCycle(t *testing.T) {
 
 	riskEng := risk.NewEngine(cfg)
 	exec := executor.NewExecutor(pb, log)
+	safetyEng := execution.NewSafetyEngine(cfg)
 	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
 
 	// Mock LLM always returns ALLOW_MARKET
@@ -312,7 +314,7 @@ func TestEndToEnd_PaperTradingCycle(t *testing.T) {
 		SizeMultiplier: 1.0,
 	}, nil)
 
-	sched := NewScheduler(cfg, screenerSvc, llmClient, riskEng, exec, mon, md, log)
+	sched := NewScheduler(cfg, screenerSvc, llmClient, riskEng, exec, safetyEng, mon, md, log)
 
 	cycleRepo := &mockCycleRepo{}
 	candidateRepo := &mockCandidateRepo{}
@@ -347,52 +349,30 @@ func TestEndToEnd_PaperTradingCycle(t *testing.T) {
 		t.Fatal("expected at least one LLM call")
 	}
 
-	// 3. Execution occurred
+	// 3. Execution occurred (Phase 4: plan validated and logged, no broker submission)
 	if result.Executions == 0 {
 		t.Fatalf("expected at least one execution, skips: %v", result.Skips)
 	}
 
-	// 4. PaperBroker created position
+	// 4. Phase 4: No broker position created yet (submission is in Phase 5)
 	openPositions, _ := pb.GetOpenPositions(ctx)
-	if len(openPositions) == 0 {
-		t.Fatal("expected open position")
+	if len(openPositions) != 0 {
+		t.Fatalf("expected no open positions in Phase 4, got %d", len(openPositions))
 	}
-	pos := openPositions[0]
 
-	// 5. Protective SL/TP orders exist
+	// 5. Phase 4: No protective orders created yet
 	openOrders, _ := pb.GetOpenOrders(ctx)
-	var hasSL, hasTP bool
-	for _, o := range openOrders {
-		if o.Symbol == pos.Symbol {
-			if o.OrderType == domain.OrderTypeStopMarket {
-				hasSL = true
-			}
-			if o.OrderType == domain.OrderTypeTakeProfitMarket {
-				hasTP = true
-			}
-		}
-	}
-	if !hasSL {
-		t.Fatal("expected protective SL order to exist")
-	}
-	if !hasTP {
-		t.Fatal("expected protective TP order to exist")
+	if len(openOrders) != 0 {
+		t.Fatalf("expected no open orders in Phase 4, got %d", len(openOrders))
 	}
 
-	// 6. No position exists without SL
-	if pos.StopLoss <= 0 {
-		t.Fatal("position must have StopLoss")
+	// 6. Phase 4: No executions persisted yet
+	if len(execRepo.executions) != 0 {
+		t.Fatalf("expected no executions in Phase 4, got %d", len(execRepo.executions))
 	}
 
-	// 7. Execution persisted
-	if len(execRepo.executions) == 0 {
-		t.Fatal("expected execution to be persisted")
-	}
-
-	// 8. Account snapshot persisted
-	if len(snapRepo.snapshots) == 0 {
-		t.Fatal("expected account snapshot to be persisted")
-	}
+	// 7. Account snapshot may still be persisted by monitor
+	_ = snapRepo
 
 	// 9. Cycle persisted
 	if len(cycleRepo.cycles) == 0 {
@@ -569,6 +549,7 @@ func TestEndToEnd_Postgres(t *testing.T) {
 
 	riskEng := risk.NewEngine(cfg)
 	exec := executor.NewExecutor(pb, log)
+	safetyEng := execution.NewSafetyEngine(cfg)
 	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
 
 	llmClient := llm.NewMockClient(domain.LLMDecision{
@@ -577,7 +558,7 @@ func TestEndToEnd_Postgres(t *testing.T) {
 		SizeMultiplier: 1.0,
 	}, nil)
 
-	sched := NewScheduler(cfg, screenerSvc, llmClient, riskEng, exec, mon, md, log)
+	sched := NewScheduler(cfg, screenerSvc, llmClient, riskEng, exec, safetyEng, mon, md, log)
 	sched.SetCycleRepo(repos.CycleRepository)
 	sched.SetCandidateRepo(repos.CandidateRepository)
 	sched.SetLLMDecisionRepo(repos.LLMDecisionRepository)

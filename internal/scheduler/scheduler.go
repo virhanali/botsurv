@@ -12,28 +12,37 @@ import (
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/db"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/execution"
+	paperexec "github.com/virhan/botsurv/internal/execution/paper"
 	"github.com/virhan/botsurv/internal/executor"
 	"github.com/virhan/botsurv/internal/llm"
 	"github.com/virhan/botsurv/internal/logger"
 	"github.com/virhan/botsurv/internal/monitor"
+	"github.com/virhan/botsurv/internal/regime"
 	"github.com/virhan/botsurv/internal/risk"
 	"github.com/virhan/botsurv/internal/screener"
+	"github.com/virhan/botsurv/internal/shadow"
+	"github.com/virhan/botsurv/internal/strategy"
 )
 
 // Scheduler orchestrates the full trading cycle.
 type Scheduler struct {
-	cfg       app.UserConfig
-	screener  *screener.Screener
-	llmClient llm.Client
-	riskEng   *risk.Engine
-	executor  *executor.Executor
-	monitor   *monitor.Monitor
-	md        screener.MarketDataProvider
-	log       *logger.Logger
+	cfg        app.UserConfig
+	screener   *screener.Screener
+	llmClient  llm.Client
+	llmReviewer *llm.Reviewer
+	riskEng    *risk.Engine
+	executor   *executor.Executor
+	safetyEng  *execution.SafetyEngine
+	monitor    *monitor.Monitor
+	md         screener.MarketDataProvider
+	log        *logger.Logger
 
 	mu       sync.Mutex
 	running  bool
 	cycleSeq int
+
+	mode app.BotMode
 
 	alertSvc         alert.Service
 	llmDecisionRepo  db.LLMDecisionRepository
@@ -42,9 +51,18 @@ type Scheduler struct {
 	cycleRepo        db.CycleRepository
 	candidateRepo    db.CandidateRepository
 
+	// Phase 5
+	decisionLogRepo      db.DecisionLogRepository
+	outcomeRepo          db.CandidateOutcomeRepository
+	paperSim             *paperexec.Simulator
+	counterfactualTracker *shadow.CounterfactualTracker
+
 	// LLM daily call tracking. Persisted when llmUsageRepo is wired.
 	llmCallsToday int
 	llmCallsDate  string // YYYY-MM-DD
+
+	// Daily reset tracking.
+	lastDailyResetDay string // YYYY-MM-DD
 }
 
 // NewScheduler creates a new Scheduler.
@@ -54,6 +72,7 @@ func NewScheduler(
 	llmClient llm.Client,
 	riskEng *risk.Engine,
 	executor *executor.Executor,
+	safetyEng *execution.SafetyEngine,
 	monitor *monitor.Monitor,
 	md screener.MarketDataProvider,
 	log *logger.Logger,
@@ -64,17 +83,24 @@ func NewScheduler(
 		llmClient: llmClient,
 		riskEng:   riskEng,
 		executor:  executor,
+		safetyEng: safetyEng,
 		monitor:   monitor,
 		md:        md,
 		log:       log,
 	}
 }
 
+// SetMode sets the operational mode.
+func (s *Scheduler) SetMode(mode app.BotMode) { s.mode = mode }
+
 // SetAlertService sets the alert service for sending notifications.
 func (s *Scheduler) SetAlertService(svc alert.Service) { s.alertSvc = svc }
 
 // SetLLMDecisionRepo sets the LLM decision repository for persistence.
 func (s *Scheduler) SetLLMDecisionRepo(repo db.LLMDecisionRepository) { s.llmDecisionRepo = repo }
+
+// SetLLMReviewer sets the LLM Reviewer (Phase 6).
+func (s *Scheduler) SetLLMReviewer(reviewer *llm.Reviewer) { s.llmReviewer = reviewer }
 
 // SetRiskDecisionRepo sets the risk decision repository for persistence.
 func (s *Scheduler) SetRiskDecisionRepo(repo db.RiskDecisionRepository) { s.riskDecisionRepo = repo }
@@ -87,6 +113,18 @@ func (s *Scheduler) SetCycleRepo(repo db.CycleRepository) { s.cycleRepo = repo }
 
 // SetCandidateRepo sets the candidate repository for persistence.
 func (s *Scheduler) SetCandidateRepo(repo db.CandidateRepository) { s.candidateRepo = repo }
+
+// SetDecisionLogRepo sets the decision log repository.
+func (s *Scheduler) SetDecisionLogRepo(repo db.DecisionLogRepository) { s.decisionLogRepo = repo }
+
+// SetOutcomeRepo sets the candidate outcome repository.
+func (s *Scheduler) SetOutcomeRepo(repo db.CandidateOutcomeRepository) { s.outcomeRepo = repo }
+
+// SetPaperSimulator sets the paper mode simulator.
+func (s *Scheduler) SetPaperSimulator(sim *paperexec.Simulator) { s.paperSim = sim }
+
+// SetCounterfactualTracker sets the counterfactual tracker.
+func (s *Scheduler) SetCounterfactualTracker(t *shadow.CounterfactualTracker) { s.counterfactualTracker = t }
 
 // CycleResult holds the outcome of a trading cycle.
 type CycleResult struct {
@@ -106,10 +144,13 @@ type SkipReason struct {
 }
 
 type riskCandidate struct {
-	candidate   domain.Candidate
-	decision    domain.LLMDecision
-	output      risk.ValidateOutput
-	candidateID int64
+	candidate     domain.Candidate
+	decision      domain.LLMDecision
+	output        risk.ValidateOutput
+	candidateID   int64
+	monitorStatus monitor.MonitorStatus
+	marketPrice   float64
+	ob            domain.OrderBookSummary
 }
 
 // RunOnce executes a single trading cycle.
@@ -158,6 +199,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		return result, nil
 	}
 
+	// 1b. Check daily reset (day boundary transition)
+	s.checkDailyReset()
+
 	// 2. Refresh universe if needed
 	if refreshErr := s.refreshUniverseIfNeeded(ctx); refreshErr != nil {
 		s.log.Error("universe refresh failed", map[string]any{"error": refreshErr.Error()})
@@ -175,6 +219,27 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 	result.Candidates = len(screenResult.Candidates)
 
+	// Log decisions for non-eligible candidates
+	setupTF := s.cfg.Strategy.Timeframes.Setup
+	if setupTF == "" {
+		setupTF = "15m"
+	}
+	modeStr := s.mode.String()
+	for _, nc := range screenResult.NonEligible {
+		fields := &DecisionLogFields{}
+		fields.WithDataValidationResult("passed")
+		fields.WithCandidate(buildTradeCandidateFromDomain(nc))
+		if tc, ok := screenResult.TradeCandidates[nc.Symbol]; ok {
+			fields.WithCandidate(tc)
+			if sr, ok2 := screenResult.ScoreResults[nc.Symbol]; ok2 {
+				fields.WithScoreBreakdown(sr)
+				fields.ScoringVersion = sr.ScoringVersion
+			}
+		}
+		log := fields.ToDomain(result.CycleID, modeStr, nc.Symbol, setupTF, 0, "REJECTED_SCORE", "candidate below LLM eligibility threshold")
+		s.saveDecisionLog(ctx, log)
+	}
+
 	// Check existing positions for SL/TP before new entries.
 	s.monitor.CheckAllPositions(ctx)
 
@@ -188,6 +253,11 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		return result, nil
 	}
 
+	// Paper mode: check open positions
+	if s.mode.IsPaper() && s.paperSim != nil {
+		s.paperSim.CheckOpenPositions(ctx)
+	}
+
 	// 4. Apply LLM call caps.
 	s.loadLLMUsage(ctx)
 	cappedCandidates, skippedByCap := s.applyLLMCaps(screenResult.Candidates)
@@ -195,12 +265,117 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		result.Skips = append(result.Skips, sk)
 	}
 
-	// 5. For each capped eligible candidate: LLM veto -> risk validation.
+	// 5. Snapshot broker state once for the entire cycle to avoid races
+	// between WS-driven position closures and scheduler state reads.
+	cycleMonitorStatus := s.monitor.Status(ctx)
+
+	// 6. For each capped eligible candidate: LLM veto -> risk validation.
 	var approvedForPortfolio []riskCandidate
 	for _, cand := range cappedCandidates {
 		ctxJSON, ok := screenResult.LLMContexts[cand.Symbol]
 		if !ok {
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "NO_CONTEXT"})
+			continue
+		}
+
+		monitorStatus := cycleMonitorStatus
+		targetNotional := s.cfg.ComputeTargetNotional()
+		ob, obErr := s.md.GetOrderBookSummary(ctx, cand.Symbol, targetNotional, string(cand.Side))
+		if obErr != nil {
+			s.log.Warn("orderbook unavailable for hard blocks", map[string]any{
+				"symbol": cand.Symbol,
+				"error":  obErr.Error(),
+			})
+		}
+		marketPrice, priceErr := s.md.GetLatestPrice(ctx, cand.Symbol)
+		if priceErr != nil {
+			s.log.Warn("price unavailable for hard blocks", map[string]any{
+				"symbol": cand.Symbol,
+				"error":  priceErr.Error(),
+			})
+		}
+		setupTF := s.cfg.Strategy.Timeframes.Setup
+		if setupTF == "" {
+			setupTF = "15m"
+		}
+		minCandles := s.cfg.DataValidation.MinCandlesOrDefault()
+		candlesForBlocks, candlesErr := s.md.GetCandles(ctx, cand.Symbol, setupTF, minCandles)
+		if candlesErr != nil {
+			s.log.Warn("candles unavailable for hard blocks", map[string]any{
+				"symbol":    cand.Symbol,
+				"timeframe": setupTF,
+				"error":     candlesErr.Error(),
+			})
+		}
+		lastDataAt := ob.LastUpdate
+		if lastDataAt.IsZero() {
+			lastDataAt = latestCandleCloseTime(candlesForBlocks, setupTF)
+		}
+		btc5mReturn := s.computeBTC5mReturn(ctx)
+
+		localPositions := toPositionState(monitorStatus.OpenPositions)
+		blockEval := risk.EvaluateHardBlocks(risk.BlockEvaluationInput{
+			Symbol: cand.Symbol,
+			Price:  marketPrice,
+			Snapshot: risk.Snapshot{
+				Price:          marketPrice,
+				SpreadPct:      ob.SpreadBps / 100.0,
+				FundingRatePct: 0,
+				LastDataAt:     lastDataAt,
+			},
+			Candles:              candlesForBlocks,
+			MinRequiredCandles:   minCandles,
+			OrderBook:            ob,
+			MaxSpreadPct:         s.cfg.HardBlocks.MaxSpreadPctOrDefault(),
+			FundingRatePct:       0,
+			MaxFundingAbsPct:     s.cfg.HardBlocks.MaxFundingAbsPctOrDefault(),
+			PendingOrders:        monitorStatus.OpenOrders,
+			CurrentPositions:     monitorStatus.OpenPositions,
+			TodayPnL:             -monitorStatus.AccountState.DailyLoss,
+			DailyMaxLossPct:      s.cfg.HardBlocks.DailyMaxLossPctOrDefault(),
+			Equity:               monitorStatus.AccountState.Equity,
+			RecentTrades:         nil,
+			MaxConsecutiveLosses: s.cfg.HardBlocks.MaxConsecutiveLossesOrDefault(),
+			LastTradeTime:        nil,
+			Cooldown: risk.TradeCooldownConfig{
+				Enabled:          s.cfg.HardBlocks.CooldownAfterLossMin > 0 || s.cfg.HardBlocks.CooldownAfterWinMin > 0,
+				AfterLoss:        time.Duration(s.cfg.HardBlocks.CooldownAfterLossMin) * time.Minute,
+				AfterWin:         time.Duration(s.cfg.HardBlocks.CooldownAfterWinMin) * time.Minute,
+				LastTradeWasLoss: false,
+			},
+			EmergencyStop: risk.EmergencyStopState{
+				Active: s.monitor.IsHalted(),
+				Reason: "monitor halted",
+			},
+			BTC5mReturnPct:     btc5mReturn,
+			BTCFlashCrash5mPct: s.cfg.HardBlocks.BTCFlashCrash5mPctOrDefault(),
+			LocalPositions:     localPositions,
+			ExchangePositions:  localPositions, // exchange state not available in phase 1.
+			MaxDataAge:         time.Duration(s.cfg.DataValidation.MaxDataAgeSecondsFor(setupTF)) * time.Second,
+		})
+		if blockEval.Blocked {
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "HARD_BLOCK"})
+			s.log.Info("candidate blocked by hard block evaluator", map[string]any{
+				"symbol":            cand.Symbol,
+				"blocks_triggered":  blockEval.BlocksTriggered,
+				"first_block":       blockEval.FirstBlockReason,
+				"all_block_reasons": blockEval.AllBlockReasons,
+			})
+			// Log decision
+			fields := &DecisionLogFields{}
+			fields.WithDataValidationResult("blocks_triggered")
+			fields.WithBlocksTriggered(blockEval.BlocksTriggered)
+			if tc, ok := screenResult.TradeCandidates[cand.Symbol]; ok {
+				fields.WithCandidate(tc)
+				if sr, ok2 := screenResult.ScoreResults[cand.Symbol]; ok2 {
+					fields.WithScoreBreakdown(sr)
+					fields.ScoringVersion = sr.ScoringVersion
+				}
+			}
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, len(candlesForBlocks), "BLOCKED_HARD", blockEval.FirstBlockReason)
+			s.saveDecisionLog(ctx, dl)
+			// Track counterfactual even for blocked candidates
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			continue
 		}
 
@@ -238,17 +413,31 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				"decision": llmDecision.Decision,
 				"reasons":  llmDecision.ReasonCodes,
 			})
+			// Log decision
+			fields := &DecisionLogFields{}
+			fields.WithDataValidationResult("passed")
+			if tc, ok := screenResult.TradeCandidates[cand.Symbol]; ok {
+				fields.WithCandidate(tc)
+			}
+			if sr, ok := screenResult.ScoreResults[cand.Symbol]; ok {
+				fields.WithScoreBreakdown(sr)
+				fields.ScoringVersion = sr.ScoringVersion
+			}
+			if rs, ok := screenResult.RegimeSnapshots[cand.Symbol]; ok {
+				fields.WithRegimeSnapshot(rs)
+			}
+			llmJSON := marshalLLMDecision(llmDecision)
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, len(candlesForBlocks), "REJECTED_LLM", llmJSON)
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			continue
 		}
 
 		// Risk validation with real market data
-		monitorStatus := s.monitor.Status(ctx)
-		targetNotional := s.cfg.ComputeTargetNotional()
-		ob, err := s.md.GetOrderBookSummary(ctx, cand.Symbol, targetNotional, string(cand.Side))
-		if err != nil {
+		if obErr != nil {
 			s.log.Warn("orderbook unavailable", map[string]any{
 				"symbol": cand.Symbol,
-				"error":  err.Error(),
+				"error":  obErr.Error(),
 			})
 			riskOut := risk.ValidateOutput{
 				Approved:    false,
@@ -256,14 +445,17 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			}
 			s.saveRiskDecision(ctx, riskOut, candID, cycleID)
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "RISK_REJECTED"})
+			fields := buildBaseFields(screenResult, cand)
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, len(candlesForBlocks), "REJECTED_RISK", "MARKET_DATA_UNAVAILABLE")
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			continue
 		}
 
-		marketPrice, err := s.md.GetLatestPrice(ctx, cand.Symbol)
-		if err != nil || marketPrice <= 0 || math.IsNaN(marketPrice) || math.IsInf(marketPrice, 0) {
+		if priceErr != nil || marketPrice <= 0 || math.IsNaN(marketPrice) || math.IsInf(marketPrice, 0) {
 			errMsg := ""
-			if err != nil {
-				errMsg = err.Error()
+			if priceErr != nil {
+				errMsg = priceErr.Error()
 			}
 			s.log.Warn("price unavailable", map[string]any{
 				"symbol": cand.Symbol,
@@ -276,6 +468,10 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			}
 			s.saveRiskDecision(ctx, riskOut, candID, cycleID)
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "RISK_REJECTED"})
+			fields := buildBaseFields(screenResult, cand)
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, len(candlesForBlocks), "REJECTED_RISK", "PRICE_UNAVAILABLE")
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			continue
 		}
 
@@ -308,14 +504,54 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				"symbol":  cand.Symbol,
 				"reasons": riskOutput.ReasonCodes,
 			})
+			fields := buildBaseFields(screenResult, cand)
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, len(candlesForBlocks), "REJECTED_RISK", joinReasons(riskOutput.ReasonCodes))
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			continue
 		}
 
+		// Phase 6: LLM Reviewer (runs on every approved candidate)
+		reviewOutcome := s.runLLMReview(ctx, cand, screenResult, riskOutput, cycleID, setupTF)
+		if reviewOutcome != nil {
+			switch reviewOutcome.Action {
+			case llm.ActionReject:
+				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_REVIEW_REJECTED"})
+				s.log.Info("candidate rejected by LLM reviewer", map[string]any{
+					"symbol":           cand.Symbol,
+					"review_action":    reviewOutcome.Action,
+					"review_confidence": reviewOutcome.Confidence,
+					"review_quality":   reviewOutcome.SetupQuality,
+					"review_reason":    reviewOutcome.ReasonSummary,
+				})
+				fields := buildBaseFields(screenResult, cand)
+				fields.WithLLMReview(reviewOutcome)
+				dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, len(candlesForBlocks), "REJECTED_LLM_REVIEW", reviewOutcome.ReasonSummary)
+				s.saveDecisionLog(ctx, dl)
+				s.trackCounterfactual(ctx, dl.DecisionID, cand)
+				continue
+			case llm.ActionReduceSize:
+				s.log.Info("LLM reviewer reduced size", map[string]any{
+					"symbol":        cand.Symbol,
+					"multiplier":    reviewOutcome.SizeMultiplier,
+					"review_reason": reviewOutcome.ReasonSummary,
+				})
+			case llm.ActionApproveRetestOnly:
+				s.log.Info("LLM reviewer forced retest-only entry", map[string]any{
+					"symbol":         cand.Symbol,
+					"review_reason":  reviewOutcome.ReasonSummary,
+				})
+			}
+		}
+
 		approvedForPortfolio = append(approvedForPortfolio, riskCandidate{
-			candidate:   cand,
-			decision:    llmDecision,
-			output:      riskOutput,
-			candidateID: candID,
+			candidate:     cand,
+			decision:      llmDecision,
+			output:        riskOutput,
+			candidateID:   candID,
+			monitorStatus: monitorStatus,
+			marketPrice:   marketPrice,
+			ob:            ob,
 		})
 	}
 
@@ -335,7 +571,6 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 	for i, item := range approvedForPortfolio {
 		cand := item.candidate
-		llmDecision := item.decision
 		riskOutput := item.output
 		if i >= remainingNew {
 			riskOutput.Approved = false
@@ -347,38 +582,166 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				"symbol": cand.Symbol,
 				"score":  cand.CandidateScore,
 			})
+			fields := buildBaseFields(screenResult, cand)
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, 0, "REJECTED_RISK", "PORTFOLIO_RISK_LIMIT")
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			continue
 		}
 
 		riskOutput.PortfolioRank = i + 1
 		s.saveRiskDecision(ctx, riskOutput, item.candidateID, cycleID)
 
-		// Execute only after final portfolio selection.
-		execResult := s.executor.Execute(ctx, cand, llmDecision, riskOutput)
-		if execResult.Success {
-			result.Executions++
-			s.log.Info("trade executed", map[string]any{
-				"symbol":   cand.Symbol,
-				"side":     cand.Side,
-				"order_id": execResult.OrderID,
+		// Phase 4: deterministic candidate risk validation → order plan
+		tc, tcOk := screenResult.TradeCandidates[cand.Symbol]
+		sr, srOk := screenResult.ScoreResults[cand.Symbol]
+		rs, rsOk := screenResult.RegimeSnapshots[cand.Symbol]
+		var phase4Result risk.RiskValidationResult
+		if tcOk && srOk && rsOk {
+			phase4Result = s.riskEng.ValidateCandidate(risk.CandidateRiskInput{
+				Candidate:      tc,
+				ScoreResult:    sr,
+				RegimeSnapshot: rs,
+				SymbolInfo: domain.SymbolInfo{
+					Symbol:      cand.Symbol,
+					TickSize:    0.01,
+					LotSize:     0.001,
+					MinNotional: 10,
+					MaxLeverage: 100,
+				},
+				AccountState: item.monitorStatus.AccountState,
+				Portfolio: risk.PortfolioState{
+					OpenPositions:         item.monitorStatus.OpenPositions,
+					OpenOrders:            item.monitorStatus.OpenOrders,
+					NewPositionsThisCycle: result.Executions,
+				},
+				BotState: domain.BotState{Running: true},
 			})
+		} else {
+			phase4Result = risk.RiskValidationResult{
+				CandidateID:      cand.Symbol,
+				Approved:         false,
+				RejectionReasons: []string{"MISSING_PHASE3_DATA"},
+			}
+		}
+		if !phase4Result.Approved {
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "PHASE4_RISK_REJECTED"})
+			s.log.Info("candidate rejected by Phase 4 risk engine", map[string]any{
+				"symbol":  cand.Symbol,
+				"reasons": phase4Result.RejectionReasons,
+			})
+			fields := buildBaseFields(screenResult, cand)
+			fields.WithRiskValidation(phase4Result)
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, 0, "REJECTED_RISK", joinReasons(phase4Result.RejectionReasons))
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
+			continue
+		}
 
-			// Alert on trade executed
+		// Phase 4: execution safety checks
+		safetyResult := s.safetyEng.EvaluateExecutionSafety(ctx, *phase4Result.OrderPlan, execution.MarketState{
+			Symbol:          cand.Symbol,
+			Price:           item.marketPrice,
+			OrderBook:       item.ob,
+			SpreadPct:       item.ob.SpreadBps / 100.0,
+			SlippagePct:     item.ob.EstimatedSlippageBps / 100.0,
+			ExchangeHealthy: true,
+		}, execution.AccountState{
+			OpenPositions: item.monitorStatus.OpenPositions,
+			OpenOrders:    item.monitorStatus.OpenOrders,
+		})
+		if !safetyResult.Safe {
+			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "EXECUTION_SAFETY_FAILED"})
+			s.log.Info("candidate blocked by execution safety", map[string]any{
+				"symbol":             cand.Symbol,
+				"failed_checks":      safetyResult.FailedChecks,
+				"reasons":            safetyResult.Reasons,
+				"recommended_action": safetyResult.RecommendedAction,
+			})
+			fields := buildBaseFields(screenResult, cand)
+			fields.WithRiskValidation(phase4Result)
+			fields.WithSafetyValidation(false, safetyResult.FailedChecks, safetyResult.Reasons)
+			fields.WithOrderPlan(phase4Result.OrderPlan)
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, 0, "REJECTED_SAFETY", joinReasons(safetyResult.Reasons))
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
+			continue
+		}
+
+		// Phase 5: Route based on mode
+		fields := buildBaseFields(screenResult, cand)
+		fields.WithRiskValidation(phase4Result)
+		fields.WithSafetyValidation(true, nil, nil)
+		fields.WithOrderPlan(phase4Result.OrderPlan)
+		fields.RiskConfigVersion = phase4Result.RiskConfigVersion
+
+		if s.mode.IsShadow() {
+			// Shadow mode: log only, no submission
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, 0, "EXECUTED_SHADOW", "shadow mode: order plan validated, not submitted")
+			s.saveDecisionLog(ctx, dl)
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
+			result.Executions++
+			s.log.Info("shadow mode: order plan validated", map[string]any{
+				"symbol":    cand.Symbol,
+				"side":      cand.Side,
+				"plan":      phase4Result.OrderPlan,
+				"modifiers": phase4Result.ModifiersApplied,
+			})
+		} else if s.mode.IsPaper() && s.paperSim != nil {
+			// Paper mode: simulate fill
+			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, 0, "EXECUTED_PAPER", "paper mode: simulated fill")
+			s.saveDecisionLog(ctx, dl)
+			trade, err := s.paperSim.SimulateFill(ctx, dl.DecisionID, *phase4Result.OrderPlan)
+			if err != nil {
+				s.log.Error("paper simulator failed to open position", map[string]any{
+					"symbol": cand.Symbol,
+					"error":  err.Error(),
+				})
+				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "PAPER_SIM_FAILED"})
+				continue
+			}
+			s.trackCounterfactual(ctx, dl.DecisionID, cand)
+			result.Executions++
+			s.log.Info("paper mode: position opened", map[string]any{
+				"symbol":    cand.Symbol,
+				"side":      cand.Side,
+				"trade_id":  trade.PaperTradeID,
+				"entry":     trade.EntryPrice,
+				"sl":        trade.StopLoss,
+				"tp":        trade.TakeProfit,
+			})
+		} else {
+			// Default: log plan (Phase 4 behavior)
+			execResult := s.executor.ExecutePlan(ctx, phase4Result, safetyResult)
+			if execResult.Success {
+				result.Executions++
+				s.log.Info("order plan validated and logged", map[string]any{
+					"symbol":   cand.Symbol,
+					"side":     cand.Side,
+					"plan":     phase4Result.OrderPlan,
+					"modifiers": phase4Result.ModifiersApplied,
+				})
+				dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, 0, "EXECUTED_SHADOW", "order plan logged (no simulator)")
+				s.saveDecisionLog(ctx, dl)
+				s.trackCounterfactual(ctx, dl.DecisionID, cand)
+			} else {
+				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "EXECUTION_FAILED"})
+			}
+		}
+
+		// Alert on validated plan (non-paper fallback)
+		if s.mode.IsShadow() || s.paperSim == nil {
 			if s.alertSvc != nil {
-				msg := fmt.Sprintf("Trade executed: %s %s at proposed entry", cand.Symbol, cand.Side)
-				if execResult.OrderID != "" {
-					msg = fmt.Sprintf("Trade executed: %s %s [%s]", cand.Symbol, cand.Side, execResult.OrderID)
-				}
+				msg := fmt.Sprintf("Order plan validated: %s %s qty=%.4f entry=%.2f (Phase 4 log only)",
+					cand.Symbol, cand.Side, phase4Result.OrderPlan.Qty, phase4Result.OrderPlan.EntryPrice)
 				_ = s.alertSvc.Send(ctx, alert.AlertEvent{
-					Type:      "trade_executed",
+					Type:      "order_plan_validated",
 					Severity:  "info",
 					Message:   msg,
 					Symbol:    cand.Symbol,
 					Timestamp: time.Now(),
 				})
 			}
-		} else {
-			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "EXECUTION_FAILED"})
 		}
 	}
 
@@ -395,6 +758,64 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 	})
 
 	return result, nil
+}
+
+func latestCandleCloseTime(candles []domain.Candle, timeframe string) time.Time {
+	if len(candles) == 0 {
+		return time.Time{}
+	}
+	interval, err := timeframeDuration(timeframe)
+	if err != nil {
+		return time.Time{}
+	}
+	latest := candles[len(candles)-1]
+	return time.UnixMilli(latest.OpenTime).UTC().Add(interval)
+}
+
+func timeframeDuration(timeframe string) (time.Duration, error) {
+	switch timeframe {
+	case "1m":
+		return time.Minute, nil
+	case "5m":
+		return 5 * time.Minute, nil
+	case "15m":
+		return 15 * time.Minute, nil
+	case "30m":
+		return 30 * time.Minute, nil
+	case "1H":
+		return time.Hour, nil
+	case "4H":
+		return 4 * time.Hour, nil
+	case "1d":
+		return 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("unsupported timeframe %q", timeframe)
+	}
+}
+
+func (s *Scheduler) computeBTC5mReturn(ctx context.Context) float64 {
+	candles, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", 2)
+	if err != nil || len(candles) < 2 {
+		return 0
+	}
+	prev := candles[len(candles)-2].Close
+	last := candles[len(candles)-1].Close
+	if prev <= 0 {
+		return 0
+	}
+	return ((last - prev) / prev) * 100
+}
+
+func toPositionState(positions []domain.Position) []risk.PositionState {
+	out := make([]risk.PositionState, 0, len(positions))
+	for _, p := range positions {
+		out = append(out, risk.PositionState{
+			Symbol: p.Symbol,
+			Side:   p.Side,
+			Size:   p.Size,
+		})
+	}
+	return out
 }
 
 // Run starts the main loop with time-based scheduling.
@@ -437,6 +858,16 @@ func (s *Scheduler) isHalted() bool {
 		return true
 	}
 	return s.monitor.IsHalted()
+}
+
+func (s *Scheduler) checkDailyReset() {
+	today := time.Now().UTC().Format("2006-01-02")
+	if s.lastDailyResetDay == today {
+		return
+	}
+	s.lastDailyResetDay = today
+	s.monitor.ResetDaily()
+	s.log.Info("daily reset triggered", map[string]any{"date": today})
 }
 
 func (s *Scheduler) refreshUniverseIfNeeded(ctx context.Context) error {
@@ -696,4 +1127,147 @@ func (s *Scheduler) trackLLMCall(ctx context.Context) {
 	if err := s.llmUsageRepo.IncrementCalls(ctx, usageDate, 1); err != nil {
 		s.log.Error("failed to persist LLM usage", map[string]any{"error": err.Error()})
 	}
+}
+
+// --- Phase 5 helpers ---
+
+func (s *Scheduler) saveDecisionLog(ctx context.Context, dl domain.DecisionLog) {
+	if s.decisionLogRepo == nil {
+		return
+	}
+	if err := s.decisionLogRepo.Insert(ctx, dl); err != nil {
+		s.log.Error("failed to save decision log", map[string]any{
+			"decision_id":  dl.DecisionID,
+			"symbol":       dl.Symbol,
+			"final_action": dl.FinalAction,
+			"error":        err.Error(),
+		})
+	}
+}
+
+func (s *Scheduler) trackCounterfactual(ctx context.Context, decisionID string, cand domain.Candidate) {
+	if s.counterfactualTracker == nil {
+		return
+	}
+	tps := []float64{cand.ProposedTakeProfit}
+	if err := s.counterfactualTracker.TrackCandidate(ctx, decisionID, cand.Symbol, cand.Side, cand.ProposedEntry, cand.ProposedStopLoss, tps); err != nil {
+		s.log.Warn("failed to track counterfactual", map[string]any{
+			"decision_id": decisionID,
+			"symbol":      cand.Symbol,
+			"error":       err.Error(),
+		})
+	}
+}
+
+func buildBaseFields(sr *screener.ScreenResult, cand domain.Candidate) *DecisionLogFields {
+	fields := &DecisionLogFields{}
+	fields.WithDataValidationResult("passed")
+	if tc, ok := sr.TradeCandidates[cand.Symbol]; ok {
+		fields.WithCandidate(tc)
+	}
+	if s, ok := sr.ScoreResults[cand.Symbol]; ok {
+		fields.WithScoreBreakdown(s)
+		fields.ScoringVersion = s.ScoringVersion
+	}
+	if rs, ok := sr.RegimeSnapshots[cand.Symbol]; ok {
+		fields.WithRegimeSnapshot(rs)
+	}
+	return fields
+}
+
+func buildTradeCandidateFromDomain(c domain.Candidate) strategy.TradeCandidate {
+	return strategy.TradeCandidate{
+		Symbol:            c.Symbol,
+		Side:              c.Side,
+		EntryPrice:        c.ProposedEntry,
+		StopLoss:          c.ProposedStopLoss,
+	}
+}
+
+func marshalLLMDecision(d domain.LLMDecision) string {
+	return fmt.Sprintf("LLM_BLOCK reason=%v confidence=%.2f", d.ReasonCodes, d.Confidence)
+}
+
+func joinReasons(reasons []string) string {
+	if len(reasons) == 0 {
+		return ""
+	}
+	result := reasons[0]
+	for i := 1; i < len(reasons); i++ {
+		result += "; " + reasons[i]
+	}
+	return result
+}
+
+// runLLMReview runs the Phase 6 LLM Reviewer on a risk-approved candidate.
+// Returns the review outcome, or nil if reviewer is disabled.
+func (s *Scheduler) runLLMReview(
+	ctx context.Context,
+	cand domain.Candidate,
+	screenResult *screener.ScreenResult,
+	riskOutput risk.ValidateOutput,
+	cycleID, setupTF string,
+) *llm.ReviewOutcome {
+	if s.llmReviewer == nil || !s.llmReviewer.IsEnabled() {
+		return nil
+	}
+
+	// Build indicator summary for the reviewer
+	rs, hasRegime := screenResult.RegimeSnapshots[cand.Symbol]
+	sr, hasScore := screenResult.ScoreResults[cand.Symbol]
+
+	input := llm.ReviewCandidateInput{
+		Symbol:       cand.Symbol,
+		Side:         string(cand.Side),
+		StrategyName: cand.SetupType,
+		Timeframe:    setupTF,
+		EntryType:    string(cand.EntryType),
+		EntryPrice:   cand.ProposedEntry,
+		StopLoss:     cand.ProposedStopLoss,
+		TakeProfits: []llm.ReviewTP{
+			{Price: cand.ProposedTakeProfit, SizePct: 100},
+		},
+		RRRatio:          cand.RR,
+		ModifiersApplied: riskOutput.ReasonCodes,
+		Qty:              riskOutput.FinalPositionNotional / cand.ProposedEntry,
+		Leverage:         3,
+		RiskAmountUSD:    riskOutput.EstimatedLoss,
+		RiskPct:          0.5,
+	}
+
+	if hasRegime {
+		input.BTCFiltersTrig = rs.BTCFiltersTriggered
+		input.BTCDAvailable = rs.BTCDAvailable
+		input.BTCDTrend = classifyBTCDTrend(rs)
+		input.RelativeStrength = rs.RelativeStrength.RS4H
+		input.RSClass = rs.RelativeStrength.Classification
+	}
+
+	if hasScore {
+		input.TotalScore = sr.ScoreTotal
+		input.ScoringVersion = sr.ScoringVersion
+	}
+
+	outcome, err := s.llmReviewer.Review(ctx, input)
+	if err != nil {
+		s.log.Error("LLM reviewer call failed", map[string]any{
+			"symbol": cand.Symbol,
+			"error":  err.Error(),
+		})
+		return nil
+	}
+
+	return outcome
+}
+
+func classifyBTCDTrend(rs regime.MarketRegimeSnapshot) string {
+	for _, f := range rs.BTCDFiltersTriggered {
+		if f == "BTCDominanceRisingFast" {
+			return "rising"
+		}
+		if f == "BTCDominanceFalling" {
+			return "falling"
+		}
+	}
+	return "stable"
 }

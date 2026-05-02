@@ -34,6 +34,61 @@ market_data:
     - 60
     - 300
 
+data_validation:
+  min_candles: 250
+  max_data_age_seconds:
+    "1m": 30
+    "5m": 90
+    "15m": 180
+    "1H": 600
+    "4H": 1800
+
+hard_blocks:
+  max_spread_pct: 0.15
+  max_funding_abs_pct: 0.5
+  btc_flash_crash_5m_pct: -2.5
+  daily_max_loss_pct: 3.0
+  max_consecutive_losses: 3
+  cooldown_after_loss_min: 30
+  cooldown_after_win_min: 10
+
+indicator_engine:
+  ema20_period: 20
+  ema50_period: 50
+  ema200_period: 200
+  rsi_period: 14
+  macd_fast_period: 12
+  macd_slow_period: 26
+  macd_signal_period: 9
+  atr_period: 14
+  volume_ma_period: 20
+  swing_lookback: 3
+  recent_swing_count: 5
+  support_resistance_atr_tolerance: 1.0
+
+market_regime:
+  btc_dump_short_pct: -2.5
+  btc_dump_medium_pct: -3.0
+  btc_near_level_atr_buffer: 1.0
+  btcd_rising_fast_pct: 0.8
+  relative_strength:
+    strong_outperform_pct: 2.0
+    strong_underperform_pct: -2.0
+    neutral_band_pct: 0.5
+    smoothed_ema_period: 8
+
+scoring:
+  mode: balanced
+  scoring_version: v0.1.0
+  balanced:
+    allow_market: 75
+    allow_retest_only: 65
+    reduce_size: 55
+  aggressive:
+    allow_market: 70
+    allow_retest_only: 60
+    reduce_size: 50
+
 broker:
   provider: paper
   paper:
@@ -75,7 +130,7 @@ strategy:
     min_volume_ratio: 1.3
     max_breakout_extension_atr: 2.5
     max_distance_from_breakout_atr: 1.0
-    min_rr: 2.0
+    min_rr: 1.4
     expected_move_cost_multiplier: 3.0
   regime:
     trend_up_min_distance_from_ema_pct: 1.0
@@ -131,6 +186,19 @@ sizing:
   margin_per_trade_usd: 100
   max_leverage: 5
   max_risk_per_trade_pct: 0.5
+
+risk:
+  base_risk_per_trade_pct: 0.5
+  max_risk_per_trade_pct: 1.0
+  max_leverage: 5
+  preferred_leverage: 3
+  min_rr: 1.4
+  max_open_positions: 2
+  max_correlated_positions: 1
+  daily_max_loss_pct: 3.0
+  weekly_max_loss_pct: 6.0
+  min_risk_per_trade_pct: 0.1
+  risk_config_version: v1.0.0
 
 alerts:
   enabled: true

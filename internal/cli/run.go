@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/virhan/botsurv/internal/broker"
 	"github.com/virhan/botsurv/internal/db"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/execution"
+	paperexec "github.com/virhan/botsurv/internal/execution/paper"
 	"github.com/virhan/botsurv/internal/executor"
 	"github.com/virhan/botsurv/internal/llm"
 	"github.com/virhan/botsurv/internal/logger"
@@ -23,6 +26,7 @@ import (
 	"github.com/virhan/botsurv/internal/risk"
 	"github.com/virhan/botsurv/internal/scheduler"
 	"github.com/virhan/botsurv/internal/screener"
+	"github.com/virhan/botsurv/internal/shadow"
 	"github.com/virhan/botsurv/internal/universe"
 )
 
@@ -46,7 +50,13 @@ func newRunCmd() *cobra.Command {
 				return err
 			}
 
-			components, cleanup, err := buildComponents(cfg)
+			// Phase 5: Resolve and enforce mode at startup
+			mode, err := app.ResolveMode(cfg.App.Mode)
+			if err != nil {
+				return fmt.Errorf("mode resolution: %w", err)
+			}
+
+			components, cleanup, err := buildComponents(cfg, mode)
 			if err != nil {
 				return err
 			}
@@ -68,7 +78,32 @@ func newRunCmd() *cobra.Command {
 				cancel()
 			}()
 
-			return components.scheduler.Run(ctx)
+			// Start background services
+			var bgWg sync.WaitGroup
+
+			// Paper simulator: background SL/TP checker (5s interval)
+			bgWg.Add(1)
+			go func() {
+				defer bgWg.Done()
+				components.paperSim.Run(ctx, 5*time.Second)
+			}()
+
+			// Counterfactual tracker: update candidate outcomes (5m interval)
+			bgWg.Add(1)
+			go func() {
+				defer bgWg.Done()
+				components.counterfactual.Run(ctx, 5*time.Minute)
+			}()
+
+			// Run scheduler (blocks until ctx is cancelled)
+			schedErr := components.scheduler.Run(ctx)
+
+			// Graceful shutdown: wait for background services to flush
+			fmt.Println("Waiting for background services to complete...")
+			bgWg.Wait()
+			fmt.Println("Shutdown complete.")
+
+			return schedErr
 		},
 	}
 }
@@ -79,7 +114,12 @@ func runCycle(ctx context.Context, configPath string) error {
 		return err
 	}
 
-	components, cleanup, err := buildComponents(cfg)
+	mode, err := app.ResolveMode(cfg.App.Mode)
+	if err != nil {
+		return fmt.Errorf("mode resolution: %w", err)
+	}
+
+	components, cleanup, err := buildComponents(cfg, mode)
 	if err != nil {
 		return err
 	}
@@ -108,12 +148,14 @@ func runCycle(ctx context.Context, configPath string) error {
 }
 
 type components struct {
-	scheduler       *scheduler.Scheduler
-	mdSvc           marketdata.MarketDataService
-	universeScanner *universe.Scanner
+	scheduler          *scheduler.Scheduler
+	mdSvc              marketdata.MarketDataService
+	universeScanner    *universe.Scanner
+	paperSim           *paperexec.Simulator
+	counterfactual     *shadow.CounterfactualTracker
 }
 
-func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
+func buildComponents(cfg *app.UserConfig, mode app.BotMode) (*components, func(), error) {
 	log := logger.New(nil, logger.Level(cfg.App.LogLevel))
 
 	database, err := db.Open(cfg.Database.Driver, cfg.Database.DSN, cfg.Database.Pool.MaxOpenConns, cfg.Database.Pool.MaxIdleConns, cfg.Database.Pool.ConnMaxLifetime)
@@ -183,18 +225,42 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 	riskEng := risk.NewEngine(*cfg)
 
 	exec := executor.NewExecutor(pb, log)
+	safetyEng := execution.NewSafetyEngine(*cfg)
 
 	mon := monitor.NewMonitor(pb, mdSvc, cfg.PortfolioRisk, log)
 	mon.SetAlertService(alertSvc)
 	mon.SetTimeframe(cfg.Strategy.Timeframes.Execution)
 
-	sched := scheduler.NewScheduler(*cfg, screenerSvc, llmClient, riskEng, exec, mon, mdSvc, log)
+	sched := scheduler.NewScheduler(*cfg, screenerSvc, llmClient, riskEng, exec, safetyEng, mon, mdSvc, log)
+	sched.SetMode(mode)
 	sched.SetAlertService(alertSvc)
 	sched.SetLLMDecisionRepo(repos.LLMDecisionRepository)
 	sched.SetRiskDecisionRepo(repos.RiskDecisionRepository)
 	sched.SetLLMUsageRepo(repos.LLMUsageRepository)
 	sched.SetCycleRepo(repos.CycleRepository)
 	sched.SetCandidateRepo(repos.CandidateRepository)
+
+	// Phase 5: Wire decision logging and paper simulation
+	sched.SetDecisionLogRepo(repos.DecisionLogRepository)
+	sched.SetOutcomeRepo(repos.CandidateOutcomeRepository)
+
+	// Phase 5: Paper simulator (only relevant in PAPER mode, but always created)
+	paperSim := paperexec.NewSimulator(mdSvc, repos.PaperTradeRepository, repos.PaperAccountStateRepository, cfg.Broker.Paper, log)
+	if err := paperSim.Initialize(context.Background()); err != nil {
+		log.Warn("paper simulator initialization failed", map[string]any{"error": err.Error()})
+	}
+	sched.SetPaperSimulator(paperSim)
+
+	// Phase 5: Counterfactual tracker
+	counterfactualTracker := shadow.NewCounterfactualTracker(mdSvc, repos.CandidateOutcomeRepository, log)
+	sched.SetCounterfactualTracker(counterfactualTracker)
+
+	// Phase 6: LLM Reviewer (only wired when mode != "off")
+	if cfg.LLMReview.Mode != "" && cfg.LLMReview.Mode != "off" {
+		reviewer := llm.NewReviewer(cfg.LLMReview, log)
+		sched.SetLLMReviewer(reviewer)
+		log.Info("LLM reviewer wired", map[string]any{"mode": cfg.LLMReview.Mode})
+	}
 
 	cleanup := func() {
 		mdSvc.Stop(context.Background())
@@ -205,6 +271,8 @@ func buildComponents(cfg *app.UserConfig) (*components, func(), error) {
 		scheduler:       sched,
 		mdSvc:           mdSvc,
 		universeScanner: universeScanner,
+		paperSim:        paperSim,
+		counterfactual:  counterfactualTracker,
 	}, cleanup, nil
 }
 

@@ -32,4 +32,9 @@ type Broker interface {
 	EmergencyCloseAll(ctx context.Context) error
 	IsHalted() bool
 	SetHalted(reason string)
+	// SetSymbolPrice pushes the latest ticker price into the broker cache.
+	// Required before PlaceOrder for MARKET orders to succeed.
+	SetSymbolPrice(symbol string, price float64)
+	// ProcessCandle updates price and checks pending orders against a candle.
+	ProcessCandle(candle domain.Candle)
 }

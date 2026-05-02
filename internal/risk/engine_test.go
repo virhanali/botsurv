@@ -7,6 +7,9 @@ import (
 
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/regime"
+	"github.com/virhan/botsurv/internal/scoring"
+	"github.com/virhan/botsurv/internal/strategy"
 )
 
 func defaultConfig() app.UserConfig {
@@ -517,4 +520,459 @@ func TestRiskEngine_RejectZeroEntry(t *testing.T) {
 		t.Fatal("expected rejection for zero entry")
 	}
 	assertContainsReason(t, output.ReasonCodes, "INVALID_ENTRY")
+}
+
+// --- Phase 4 Candidate Risk Validation Tests ---
+
+func phase4Config() app.UserConfig {
+	cfg := defaultConfig()
+	cfg.Risk = app.RiskConfig{
+		BaseRiskPerTradePct:    0.5,
+		MaxRiskPerTradePct:     1.0,
+		MaxLeverage:            5,
+		PreferredLeverage:      3,
+		MinRR:                  1.4,
+		MaxOpenPositions:       2,
+		MaxCorrelatedPositions: 1,
+		DailyMaxLossPct:        3.0,
+		WeeklyMaxLossPct:       6.0,
+		MinRiskPerTradePct:     0.1,
+		RiskConfigVersion:      "v1.0.0",
+	}
+	cfg.Broker.Paper.FeeTakerBps = 5.5
+	return cfg
+}
+
+func phase4Input() CandidateRiskInput {
+	return CandidateRiskInput{
+		Candidate: strategy.TradeCandidate{
+			CandidateID: "test-cand-1",
+			Symbol:      "BTCUSDT",
+			Side:        domain.SideLong,
+			EntryType:   strategy.CandidateEntryMarket,
+			EntryPrice:  50000,
+			StopLoss:    49000,
+			TakeProfits: []strategy.TakeProfitTarget{
+				{Price: 52000, SizePct: 50},
+				{Price: 53000, SizePct: 50},
+			},
+			RiskRewardRatio: 2.0,
+		},
+		ScoreResult: scoring.ScoreResult{Action: scoring.ActionAllowMarket, SizeMultiplier: 1.0},
+		RegimeSnapshot: regime.MarketRegimeSnapshot{
+			RelativeStrength: regime.RelativeStrengthSnapshot{Classification: "neutral"},
+		},
+		SymbolInfo: domain.SymbolInfo{
+			Symbol:      "BTCUSDT",
+			TickSize:    0.5,
+			LotSize:     0.001,
+			MinNotional: 10,
+			MaxLeverage: 100,
+		},
+		AccountState: domain.AccountState{Equity: 10000, AvailableBalance: 10000, Balance: 10000},
+		Portfolio:    PortfolioState{},
+		BotState:     domain.BotState{Running: true},
+	}
+}
+
+func TestValidateCandidate_ApproveValidTrade(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got rejected: %v", result.RejectionReasons)
+	}
+	if result.OrderPlan == nil {
+		t.Fatal("expected order plan")
+	}
+	// risk_amount = 10000 * 0.5 / 100 = 50
+	// risk_per_unit = 50000 - 49000 = 1000
+	// qty_raw = 50 / 1000 = 0.05 -> round to lot 0.001 -> 0.05
+	// position_value = 0.05 * 50000 = 2500
+	// margin = 2500 / 3 = 833.33
+	expectedQty := 0.05
+	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
+		t.Errorf("expected qty %.4f, got %.4f", expectedQty, result.OrderPlan.Qty)
+	}
+	if result.OrderPlan.Leverage != 3 {
+		t.Errorf("expected leverage 3, got %f", result.OrderPlan.Leverage)
+	}
+	if result.RiskConfigVersion != "v1.0.0" {
+		t.Errorf("expected version v1.0.0, got %s", result.RiskConfigVersion)
+	}
+}
+
+func TestValidateCandidate_SizingKnownValues(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Candidate.EntryPrice = 100000
+	input.Candidate.StopLoss = 99000
+	input.Candidate.TakeProfits = []strategy.TakeProfitTarget{
+		{Price: 102000, SizePct: 50},
+		{Price: 103000, SizePct: 50},
+	}
+	input.AccountState.Equity = 20000
+	// risk_amount = 20000 * 0.5 / 100 = 100
+	// risk_per_unit = 1000
+	// qty_raw = 0.1 -> round to lot 0.001 -> 0.1
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	expectedQty := 0.1
+	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
+		t.Errorf("expected qty %.4f, got %.4f", expectedQty, result.OrderPlan.Qty)
+	}
+	expectedMargin := (0.1 * 100000) / 3
+	if math.Abs(result.OrderPlan.MarginRequired-expectedMargin) > 1e-6 {
+		t.Errorf("expected margin %.2f, got %.2f", expectedMargin, result.OrderPlan.MarginRequired)
+	}
+}
+
+func TestValidateCandidate_ModifierReduceSize(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.ScoreResult.Action = scoring.ActionReduceSize
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	found := false
+	for _, m := range result.ModifiersApplied {
+		if m == "scoring_reduce_size_0.5x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected reduce_size modifier, got %v", result.ModifiersApplied)
+	}
+	// Base qty without modifier = 0.05, with 0.5x risk -> 0.025
+	expectedQty := 0.025
+	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
+		t.Errorf("expected qty %.4f after reduce, got %.4f", expectedQty, result.OrderPlan.Qty)
+	}
+}
+
+func TestValidateCandidate_ModifierBTCBearishHTF(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.RegimeSnapshot.BTCFiltersTriggered = []string{"BTCStronglyBearishHTF"}
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	found := false
+	for _, m := range result.ModifiersApplied {
+		if m == "btc_bearish_htf_0.7x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected btc_bearish_htf modifier, got %v", result.ModifiersApplied)
+	}
+}
+
+func TestValidateCandidate_ModifierStrongUnderperform(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.RegimeSnapshot.RelativeStrength.Classification = "strong_underperform"
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	found := false
+	for _, m := range result.ModifiersApplied {
+		if m == "strong_underperform_0.6x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected strong_underperform modifier, got %v", result.ModifiersApplied)
+	}
+}
+
+func TestValidateCandidate_ModifierOrder(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.ScoreResult.Action = scoring.ActionReduceSize
+	input.RegimeSnapshot.BTCFiltersTriggered = []string{"BTCStronglyBearishHTF"}
+	input.RegimeSnapshot.RelativeStrength.Classification = "strong_underperform"
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	// Order: reduce_size (0.5) -> bearish (0.7) -> underperform (0.6)
+	// total multiplier = 0.5 * 0.7 * 0.6 = 0.21
+	// base risk = 0.5%, final = 0.105% which is > min 0.1%
+	expectedRiskPct := 0.5 * 0.5 * 0.7 * 0.6
+	if math.Abs(result.OrderPlan.RiskPctUsed-expectedRiskPct) > 1e-9 {
+		t.Errorf("expected risk pct %.4f, got %.4f", expectedRiskPct, result.OrderPlan.RiskPctUsed)
+	}
+	// Modifiers should be in order
+	if len(result.ModifiersApplied) != 3 {
+		t.Errorf("expected 3 modifiers, got %d: %v", len(result.ModifiersApplied), result.ModifiersApplied)
+	}
+	if result.ModifiersApplied[0] != "scoring_reduce_size_0.5x" {
+		t.Errorf("expected first modifier scoring_reduce_size, got %s", result.ModifiersApplied[0])
+	}
+}
+
+func TestValidateCandidate_RejectRiskTooSmall(t *testing.T) {
+	cfg := phase4Config()
+	cfg.Risk.MinRiskPerTradePct = 0.2 // set high so modifiers push below
+	e := NewEngine(cfg)
+	input := phase4Input()
+	input.ScoreResult.Action = scoring.ActionReduceSize
+	input.RegimeSnapshot.BTCFiltersTriggered = []string{"BTCStronglyBearishHTF"}
+	input.RegimeSnapshot.RelativeStrength.Classification = "strong_underperform"
+	// base 0.5 * 0.5 * 0.7 * 0.6 = 0.105 < 0.2 -> should reject
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for risk too small")
+	}
+	assertContainsReason(t, result.RejectionReasons, "RISK_TOO_SMALL")
+}
+
+func TestValidateCandidate_RejectSLWrongSideLong(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Candidate.StopLoss = 51000 // above entry for LONG
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for SL wrong side")
+	}
+	assertContainsReason(t, result.RejectionReasons, "SL_WRONG_SIDE")
+}
+
+func TestValidateCandidate_RejectSLWrongSideShort(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Candidate.Side = domain.SideShort
+	input.Candidate.StopLoss = 49000 // below entry for SHORT
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for SL wrong side short")
+	}
+	assertContainsReason(t, result.RejectionReasons, "SL_WRONG_SIDE")
+}
+
+func TestValidateCandidate_RejectTPWrongSideLong(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Candidate.TakeProfits[0].Price = 48000 // below entry for LONG
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for TP wrong side")
+	}
+	assertContainsReason(t, result.RejectionReasons, "TP_WRONG_SIDE")
+}
+
+func TestValidateCandidate_RejectRRBelowMin(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Candidate.RiskRewardRatio = 1.2
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for RR below min")
+	}
+	assertContainsReason(t, result.RejectionReasons, "RR_BELOW_MIN")
+}
+
+func TestValidateCandidate_RejectMarginExceedsAvailable(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.AccountState.AvailableBalance = 100
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for margin exceeds available")
+	}
+	assertContainsReason(t, result.RejectionReasons, "MARGIN_EXCEEDS_AVAILABLE")
+}
+
+func TestValidateCandidate_RejectInvalidQty(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.SymbolInfo.LotSize = 10.0
+	input.Candidate.EntryPrice = 50000
+	input.Candidate.StopLoss = 49999 // tiny stop -> qty_raw very small
+	input.AccountState.Equity = 10   // tiny equity -> qty_raw = 0.05
+	// qty_raw = 0.05, rounded to lot 10.0 -> 0.0
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for invalid qty")
+	}
+	assertContainsReason(t, result.RejectionReasons, "INVALID_QTY")
+}
+
+func TestValidateCandidate_RejectBelowMinNotional(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.SymbolInfo.MinNotional = 1000000
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for below min notional")
+	}
+	assertContainsReason(t, result.RejectionReasons, "BELOW_MIN_NOTIONAL")
+}
+
+func TestValidateCandidate_RejectMaxOpenPositions(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Portfolio.OpenPositions = []domain.Position{
+		{Symbol: "ETHUSDT", Status: domain.PositionStatusOpen},
+		{Symbol: "SOLUSDT", Status: domain.PositionStatusOpen},
+	}
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for max open positions")
+	}
+	assertContainsReason(t, result.RejectionReasons, "MAX_OPEN_POSITIONS")
+}
+
+func TestValidateCandidate_RejectMaxCorrelatedAltPositions(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Candidate.Symbol = "ETHUSDT"
+	input.Portfolio.OpenPositions = []domain.Position{
+		{Symbol: "SOLUSDT", Side: domain.SideLong, Status: domain.PositionStatusOpen},
+	}
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for max correlated alt positions")
+	}
+	assertContainsReason(t, result.RejectionReasons, "MAX_CORRELATED_ALT_POSITIONS")
+}
+
+func TestValidateCandidate_BTCNotCountedAsCorrelatedAlt(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.Candidate.Symbol = "BTCUSDT"
+	input.Portfolio.OpenPositions = []domain.Position{
+		{Symbol: "ETHUSDT", Side: domain.SideLong, Status: domain.PositionStatusOpen},
+	}
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected BTC to bypass correlated alt check, got: %v", result.RejectionReasons)
+	}
+}
+
+func TestValidateCandidate_RejectBotHalted(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.BotState.Halted = true
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for bot halted")
+	}
+	assertContainsReason(t, result.RejectionReasons, "BOT_HALTED")
+}
+
+func TestValidateCandidate_TickSizeRounding(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.SymbolInfo.TickSize = 10
+	input.Candidate.EntryPrice = 50005
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	// 50005 rounded to tick size 10 -> 50010
+	if result.OrderPlan.EntryPrice != 50010 {
+		t.Errorf("expected entry price 50010, got %f", result.OrderPlan.EntryPrice)
+	}
+}
+
+func TestValidateCandidate_LotSizeRounding(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.SymbolInfo.LotSize = 0.01
+	input.Candidate.EntryPrice = 50000
+	input.Candidate.StopLoss = 49000
+	// qty_raw = 0.05, rounded to lot 0.01 -> 0.05 (exact)
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	if result.OrderPlan.Qty != 0.05 {
+		t.Errorf("expected qty 0.05, got %f", result.OrderPlan.Qty)
+	}
+}
+
+func TestValidateCandidate_LotSizeRoundingEdgeCase(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	input.SymbolInfo.LotSize = 0.03
+	input.Candidate.EntryPrice = 50000
+	input.Candidate.StopLoss = 49000
+	// qty_raw = 0.05, rounded to lot 0.03 -> 0.06 (round up)
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	if result.OrderPlan.Qty != 0.06 {
+		t.Errorf("expected qty 0.06, got %f", result.OrderPlan.Qty)
+	}
+}
+
+func TestValidateCandidate_TakeProfitsDistributed(t *testing.T) {
+	e := NewEngine(phase4Config())
+	input := phase4Input()
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	if len(result.OrderPlan.TakeProfits) != 2 {
+		t.Fatalf("expected 2 take profits, got %d", len(result.OrderPlan.TakeProfits))
+	}
+	tp1 := result.OrderPlan.TakeProfits[0]
+	tp2 := result.OrderPlan.TakeProfits[1]
+	if tp1.Price != 52000 || tp2.Price != 53000 {
+		t.Errorf("expected TP prices 52000/53000, got %.2f/%.2f", tp1.Price, tp2.Price)
+	}
+	// Each should get roughly half the qty
+	if tp1.Qty <= 0 || tp2.Qty <= 0 {
+		t.Errorf("expected positive TP qtys, got %.4f/%.4f", tp1.Qty, tp2.Qty)
+	}
+}
+
+func TestRoundToTickSize(t *testing.T) {
+	cases := []struct {
+		price    float64
+		tickSize float64
+		want     float64
+	}{
+		{50005, 10, 50010},
+		{50004, 10, 50000},
+		{50000, 10, 50000},
+		{123.456, 0.01, 123.46},
+		{123.451, 0.01, 123.45},
+		{100, 0, 100},
+	}
+	for _, c := range cases {
+		got := roundToTickSize(c.price, c.tickSize)
+		if math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("roundToTickSize(%f, %f) = %f, want %f", c.price, c.tickSize, got, c.want)
+		}
+	}
+}
+
+func TestRoundToLotSize(t *testing.T) {
+	cases := []struct {
+		qty     float64
+		lotSize float64
+		want    float64
+	}{
+		{0.05, 0.001, 0.05},
+		{0.051, 0.01, 0.05},
+		{0.056, 0.01, 0.06},
+		{1.23, 0.5, 1.0},
+		{1.26, 0.5, 1.5},
+		{100, 0, 100},
+	}
+	for _, c := range cases {
+		got := roundToLotSize(c.qty, c.lotSize)
+		if math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("roundToLotSize(%f, %f) = %f, want %f", c.qty, c.lotSize, got, c.want)
+		}
+	}
 }

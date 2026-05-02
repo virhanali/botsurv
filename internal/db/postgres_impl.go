@@ -13,17 +13,21 @@ import (
 // NewPostgresRepositories creates a PostgreSQL-backed repository set.
 func NewPostgresRepositories(db *sql.DB) *Repositories {
 	return &Repositories{
-		CandleRepository:          &postgresCandleRepository{db: db},
-		UniverseRepository:        &postgresUniverseRepository{db: db},
-		CycleRepository:           &postgresCycleRepository{db: db},
-		CandidateRepository:       &postgresCandidateRepository{db: db},
-		PositionRepository:        &postgresPositionRepository{db: db},
-		OrderRepository:           &postgresOrderRepository{db: db},
-		ExecutionRepository:       &postgresExecutionRepository{db: db},
-		AccountSnapshotRepository: &postgresAccountSnapshotRepository{db: db},
-		LLMDecisionRepository:     &postgresLLMDecisionRepository{db: db},
-		RiskDecisionRepository:    &postgresRiskDecisionRepository{db: db},
-		LLMUsageRepository:        &postgresLLMUsageRepository{db: db},
+		CandleRepository:             &postgresCandleRepository{db: db},
+		UniverseRepository:           &postgresUniverseRepository{db: db},
+		CycleRepository:              &postgresCycleRepository{db: db},
+		CandidateRepository:          &postgresCandidateRepository{db: db},
+		PositionRepository:           &postgresPositionRepository{db: db},
+		OrderRepository:              &postgresOrderRepository{db: db},
+		ExecutionRepository:          &postgresExecutionRepository{db: db},
+		AccountSnapshotRepository:    &postgresAccountSnapshotRepository{db: db},
+		LLMDecisionRepository:        &postgresLLMDecisionRepository{db: db},
+		RiskDecisionRepository:       &postgresRiskDecisionRepository{db: db},
+		LLMUsageRepository:           &postgresLLMUsageRepository{db: db},
+		DecisionLogRepository:        &postgresDecisionLogRepository{db: db},
+		CandidateOutcomeRepository:   &postgresCandidateOutcomeRepository{db: db},
+		PaperTradeRepository:         &postgresPaperTradeRepository{db: db},
+		PaperAccountStateRepository:  &postgresPaperAccountStateRepository{db: db},
 	}
 }
 
@@ -912,4 +916,438 @@ func scanAccountSnapshots(rows *sql.Rows) ([]domain.AccountState, error) {
 		return nil, fmt.Errorf("iterate account snapshots: %w", err)
 	}
 	return snapshots, nil
+}
+
+// --- DecisionLogRepository ---
+
+type postgresDecisionLogRepository struct {
+	db *sql.DB
+}
+
+func (r *postgresDecisionLogRepository) Insert(ctx context.Context, d domain.DecisionLog) error {
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO decision_logs (
+			decision_id, cycle_id, timestamp, mode, symbol, timeframe,
+			candle_count, data_validation_result,
+			indicator_snapshot, regime_snapshot, strategy_attempted,
+			candidate, score_breakdown, near_misses,
+			risk_validation, safety_validation, order_plan,
+			llm_review, llm_mode_active,
+			final_action, final_action_reason,
+			engine_version, scoring_version, risk_config_version, llm_prompt_version
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+		d.DecisionID, d.CycleID, d.Timestamp, d.Mode, d.Symbol, d.Timeframe,
+		d.CandleCount, d.DataValidationResult,
+		jsonOrNull(d.IndicatorSnapshot), jsonOrNull(d.RegimeSnapshot),
+		jsonOrNull(d.StrategyAttempted),
+		jsonOrNull(d.Candidate), jsonOrNull(d.ScoreBreakdown),
+		jsonOrNull(d.NearMisses),
+		jsonOrNull(d.RiskValidation), jsonOrNull(d.SafetyValidation),
+		jsonOrNull(d.OrderPlan),
+		jsonOrNull(d.LLMReview), d.LLMModeActive,
+		d.FinalAction, d.FinalActionReason,
+		d.EngineVersion, d.ScoringVersion, d.RiskConfigVersion, d.LLMPromptVersion,
+	)
+	if err != nil {
+		return fmt.Errorf("insert decision_log: %w", err)
+	}
+	return nil
+}
+
+func (r *postgresDecisionLogRepository) GetByCycle(ctx context.Context, cycleID string) ([]domain.DecisionLog, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT decision_id, cycle_id, timestamp, mode, symbol, timeframe,
+			candle_count, data_validation_result,
+			COALESCE(indicator_snapshot::text,''), COALESCE(regime_snapshot::text,''),
+			COALESCE(strategy_attempted::text,''),
+			COALESCE(candidate::text,''), COALESCE(score_breakdown::text,''),
+			COALESCE(near_misses::text,''),
+			COALESCE(risk_validation::text,''), COALESCE(safety_validation::text,''),
+			COALESCE(order_plan::text,''),
+			COALESCE(llm_review::text,''), llm_mode_active,
+			final_action, final_action_reason,
+			engine_version, scoring_version, risk_config_version, llm_prompt_version
+		FROM decision_logs WHERE cycle_id = $1 ORDER BY timestamp`, cycleID)
+	if err != nil {
+		return nil, fmt.Errorf("query decision_logs by cycle: %w", err)
+	}
+	defer rows.Close()
+	return scanDecisionLogs(rows)
+}
+
+func (r *postgresDecisionLogRepository) GetRecent(ctx context.Context, limit int) ([]domain.DecisionLog, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT decision_id, cycle_id, timestamp, mode, symbol, timeframe,
+			candle_count, data_validation_result,
+			COALESCE(indicator_snapshot::text,''), COALESCE(regime_snapshot::text,''),
+			COALESCE(strategy_attempted::text,''),
+			COALESCE(candidate::text,''), COALESCE(score_breakdown::text,''),
+			COALESCE(near_misses::text,''),
+			COALESCE(risk_validation::text,''), COALESCE(safety_validation::text,''),
+			COALESCE(order_plan::text,''),
+			COALESCE(llm_review::text,''), llm_mode_active,
+			final_action, final_action_reason,
+			engine_version, scoring_version, risk_config_version, llm_prompt_version
+		FROM decision_logs ORDER BY timestamp DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query recent decision_logs: %w", err)
+	}
+	defer rows.Close()
+	return scanDecisionLogs(rows)
+}
+
+func (r *postgresDecisionLogRepository) GetBySymbol(ctx context.Context, symbol string, since time.Time) ([]domain.DecisionLog, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT decision_id, cycle_id, timestamp, mode, symbol, timeframe,
+			candle_count, data_validation_result,
+			COALESCE(indicator_snapshot::text,''), COALESCE(regime_snapshot::text,''),
+			COALESCE(strategy_attempted::text,''),
+			COALESCE(candidate::text,''), COALESCE(score_breakdown::text,''),
+			COALESCE(near_misses::text,''),
+			COALESCE(risk_validation::text,''), COALESCE(safety_validation::text,''),
+			COALESCE(order_plan::text,''),
+			COALESCE(llm_review::text,''), llm_mode_active,
+			final_action, final_action_reason,
+			engine_version, scoring_version, risk_config_version, llm_prompt_version
+		FROM decision_logs WHERE symbol = $1 AND timestamp >= $2 ORDER BY timestamp DESC`, symbol, since)
+	if err != nil {
+		return nil, fmt.Errorf("query decision_logs by symbol: %w", err)
+	}
+	defer rows.Close()
+	return scanDecisionLogs(rows)
+}
+
+func (r *postgresDecisionLogRepository) CountByAction(ctx context.Context, action string, since time.Time) (int, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM decision_logs WHERE final_action = $1 AND timestamp >= $2`, action, since).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count decision_logs by action: %w", err)
+	}
+	return count, nil
+}
+
+func scanDecisionLogs(rows *sql.Rows) ([]domain.DecisionLog, error) {
+	var logs []domain.DecisionLog
+	for rows.Next() {
+		var d domain.DecisionLog
+		if err := rows.Scan(
+			&d.DecisionID, &d.CycleID, &d.Timestamp, &d.Mode, &d.Symbol, &d.Timeframe,
+			&d.CandleCount, &d.DataValidationResult,
+			&d.IndicatorSnapshot, &d.RegimeSnapshot,
+			&d.StrategyAttempted,
+			&d.Candidate, &d.ScoreBreakdown,
+			&d.NearMisses,
+			&d.RiskValidation, &d.SafetyValidation,
+			&d.OrderPlan,
+			&d.LLMReview, &d.LLMModeActive,
+			&d.FinalAction, &d.FinalActionReason,
+			&d.EngineVersion, &d.ScoringVersion, &d.RiskConfigVersion, &d.LLMPromptVersion,
+		); err != nil {
+			return nil, fmt.Errorf("scan decision_log: %w", err)
+		}
+		logs = append(logs, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate decision_logs: %w", err)
+	}
+	return logs, nil
+}
+
+// --- CandidateOutcomeRepository ---
+
+type postgresCandidateOutcomeRepository struct {
+	db *sql.DB
+}
+
+func (r *postgresCandidateOutcomeRepository) Insert(ctx context.Context, o domain.CandidateOutcome) error {
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO candidate_outcomes (
+			decision_id, symbol, side, entry_price, stop_loss, take_profits,
+			price_at_15m, price_at_1h, price_at_4h, price_at_24h,
+			max_favorable_excursion_24h, max_adverse_excursion_24h,
+			would_have_hit_tp1, would_have_hit_sl, would_have_outcome, result_in_r,
+			tracked_until, status
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		o.DecisionID, o.Symbol, string(o.Side), o.EntryPrice, o.StopLoss,
+		o.TakeProfits,
+		o.PriceAt15m, o.PriceAt1h, o.PriceAt4h, o.PriceAt24h,
+		o.MaxFavorableExcursion24h, o.MaxAdverseExcursion24h,
+		o.WouldHaveHitTP1, o.WouldHaveHitSL, o.WouldHaveOutcome, o.ResultInR,
+		o.TrackedUntil, o.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("insert candidate_outcome: %w", err)
+	}
+	return nil
+}
+
+func (r *postgresCandidateOutcomeRepository) Update(ctx context.Context, o domain.CandidateOutcome) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE candidate_outcomes SET
+			price_at_15m = $2, price_at_1h = $3, price_at_4h = $4, price_at_24h = $5,
+			max_favorable_excursion_24h = $6, max_adverse_excursion_24h = $7,
+			would_have_hit_tp1 = $8, would_have_hit_sl = $9,
+			would_have_outcome = $10, result_in_r = $11,
+			tracked_until = $12, status = $13
+		WHERE decision_id = $1`,
+		o.DecisionID,
+		o.PriceAt15m, o.PriceAt1h, o.PriceAt4h, o.PriceAt24h,
+		o.MaxFavorableExcursion24h, o.MaxAdverseExcursion24h,
+		o.WouldHaveHitTP1, o.WouldHaveHitSL,
+		o.WouldHaveOutcome, o.ResultInR,
+		o.TrackedUntil, o.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("update candidate_outcome: %w", err)
+	}
+	return nil
+}
+
+func (r *postgresCandidateOutcomeRepository) GetPending(ctx context.Context) ([]domain.CandidateOutcome, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT decision_id, symbol, side, entry_price, stop_loss, COALESCE(take_profits::text,''),
+			price_at_15m, price_at_1h, price_at_4h, price_at_24h,
+			max_favorable_excursion_24h, max_adverse_excursion_24h,
+			would_have_hit_tp1, would_have_hit_sl, would_have_outcome, result_in_r,
+			tracked_until, status
+		FROM candidate_outcomes WHERE status = 'tracking' ORDER BY decision_id`)
+	if err != nil {
+		return nil, fmt.Errorf("query pending candidate_outcomes: %w", err)
+	}
+	defer rows.Close()
+	return scanCandidateOutcomes(rows)
+}
+
+func (r *postgresCandidateOutcomeRepository) GetByDecision(ctx context.Context, decisionID string) (*domain.CandidateOutcome, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT decision_id, symbol, side, entry_price, stop_loss, COALESCE(take_profits::text,''),
+			price_at_15m, price_at_1h, price_at_4h, price_at_24h,
+			max_favorable_excursion_24h, max_adverse_excursion_24h,
+			would_have_hit_tp1, would_have_hit_sl, would_have_outcome, result_in_r,
+			tracked_until, status
+		FROM candidate_outcomes WHERE decision_id = $1`, decisionID)
+	var o domain.CandidateOutcome
+	var side string
+	err := row.Scan(&o.DecisionID, &o.Symbol, &side, &o.EntryPrice, &o.StopLoss,
+		&o.TakeProfits,
+		&o.PriceAt15m, &o.PriceAt1h, &o.PriceAt4h, &o.PriceAt24h,
+		&o.MaxFavorableExcursion24h, &o.MaxAdverseExcursion24h,
+		&o.WouldHaveHitTP1, &o.WouldHaveHitSL, &o.WouldHaveOutcome, &o.ResultInR,
+		&o.TrackedUntil, &o.Status,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get candidate_outcome: %w", err)
+	}
+	o.Side = domain.Side(side)
+	return &o, nil
+}
+
+func (r *postgresCandidateOutcomeRepository) GetCompleted(ctx context.Context, since time.Time) ([]domain.CandidateOutcome, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT decision_id, symbol, side, entry_price, stop_loss, COALESCE(take_profits::text,''),
+			price_at_15m, price_at_1h, price_at_4h, price_at_24h,
+			max_favorable_excursion_24h, max_adverse_excursion_24h,
+			would_have_hit_tp1, would_have_hit_sl, would_have_outcome, result_in_r,
+			tracked_until, status
+		FROM candidate_outcomes WHERE status = 'completed' AND tracked_until >= $1 ORDER BY tracked_until DESC`, since)
+	if err != nil {
+		return nil, fmt.Errorf("query completed candidate_outcomes: %w", err)
+	}
+	defer rows.Close()
+	return scanCandidateOutcomes(rows)
+}
+
+func scanCandidateOutcomes(rows *sql.Rows) ([]domain.CandidateOutcome, error) {
+	var outcomes []domain.CandidateOutcome
+	for rows.Next() {
+		var o domain.CandidateOutcome
+		var side string
+		if err := rows.Scan(&o.DecisionID, &o.Symbol, &side, &o.EntryPrice, &o.StopLoss,
+			&o.TakeProfits,
+			&o.PriceAt15m, &o.PriceAt1h, &o.PriceAt4h, &o.PriceAt24h,
+			&o.MaxFavorableExcursion24h, &o.MaxAdverseExcursion24h,
+			&o.WouldHaveHitTP1, &o.WouldHaveHitSL, &o.WouldHaveOutcome, &o.ResultInR,
+			&o.TrackedUntil, &o.Status,
+		); err != nil {
+			return nil, fmt.Errorf("scan candidate_outcome: %w", err)
+		}
+		o.Side = domain.Side(side)
+		outcomes = append(outcomes, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate candidate_outcomes: %w", err)
+	}
+	return outcomes, nil
+}
+
+// --- PaperTradeRepository ---
+
+type postgresPaperTradeRepository struct {
+	db *sql.DB
+}
+
+func (r *postgresPaperTradeRepository) Insert(ctx context.Context, t domain.PaperTrade) error {
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO paper_trades (
+			paper_trade_id, decision_id, opened_at, closed_at,
+			symbol, side, qty, leverage, entry_price, exit_price,
+			stop_loss, take_profit, fees_paid, funding_paid,
+			pnl_gross, pnl_net, r_multiple, exit_reason
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		t.PaperTradeID, t.DecisionID, t.OpenedAt, t.ClosedAt,
+		t.Symbol, string(t.Side), t.Qty, t.Leverage, t.EntryPrice, t.ExitPrice,
+		t.StopLoss, t.TakeProfit, t.FeesPaid, t.FundingPaid,
+		t.PnLGross, t.PnLNet, t.RMultiple, t.ExitReason,
+	)
+	if err != nil {
+		return fmt.Errorf("insert paper_trade: %w", err)
+	}
+	return nil
+}
+
+func (r *postgresPaperTradeRepository) Update(ctx context.Context, t domain.PaperTrade) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE paper_trades SET
+			closed_at = $2, exit_price = $3, fees_paid = $4, funding_paid = $5,
+			pnl_gross = $6, pnl_net = $7, r_multiple = $8, exit_reason = $9
+		WHERE paper_trade_id = $1`,
+		t.PaperTradeID, t.ClosedAt, t.ExitPrice, t.FeesPaid, t.FundingPaid,
+		t.PnLGross, t.PnLNet, t.RMultiple, t.ExitReason,
+	)
+	if err != nil {
+		return fmt.Errorf("update paper_trade: %w", err)
+	}
+	return nil
+}
+
+func (r *postgresPaperTradeRepository) GetOpen(ctx context.Context) ([]domain.PaperTrade, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT paper_trade_id, decision_id, opened_at, closed_at,
+			symbol, side, qty, leverage, entry_price, exit_price,
+			stop_loss, take_profit, fees_paid, funding_paid,
+			pnl_gross, pnl_net, r_multiple, exit_reason
+		FROM paper_trades WHERE closed_at IS NULL ORDER BY opened_at`)
+	if err != nil {
+		return nil, fmt.Errorf("query open paper_trades: %w", err)
+	}
+	defer rows.Close()
+	return scanPaperTrades(rows)
+}
+
+func (r *postgresPaperTradeRepository) GetByDecision(ctx context.Context, decisionID string) (*domain.PaperTrade, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT paper_trade_id, decision_id, opened_at, closed_at,
+			symbol, side, qty, leverage, entry_price, exit_price,
+			stop_loss, take_profit, fees_paid, funding_paid,
+			pnl_gross, pnl_net, r_multiple, exit_reason
+		FROM paper_trades WHERE decision_id = $1`, decisionID)
+	var t domain.PaperTrade
+	var side string
+	err := row.Scan(&t.PaperTradeID, &t.DecisionID, &t.OpenedAt, &t.ClosedAt,
+		&t.Symbol, &side, &t.Qty, &t.Leverage, &t.EntryPrice, &t.ExitPrice,
+		&t.StopLoss, &t.TakeProfit, &t.FeesPaid, &t.FundingPaid,
+		&t.PnLGross, &t.PnLNet, &t.RMultiple, &t.ExitReason,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get paper_trade: %w", err)
+	}
+	t.Side = domain.Side(side)
+	return &t, nil
+}
+
+func (r *postgresPaperTradeRepository) GetAll(ctx context.Context, since time.Time) ([]domain.PaperTrade, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT paper_trade_id, decision_id, opened_at, closed_at,
+			symbol, side, qty, leverage, entry_price, exit_price,
+			stop_loss, take_profit, fees_paid, funding_paid,
+			pnl_gross, pnl_net, r_multiple, exit_reason
+		FROM paper_trades WHERE closed_at IS NOT NULL AND closed_at >= $1 ORDER BY closed_at DESC`, since)
+	if err != nil {
+		return nil, fmt.Errorf("query paper_trades: %w", err)
+	}
+	defer rows.Close()
+	return scanPaperTrades(rows)
+}
+
+func (r *postgresPaperTradeRepository) CountByExitReason(ctx context.Context, reason string, since time.Time) (int, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM paper_trades WHERE exit_reason = $1 AND closed_at >= $2`, reason, since).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count paper_trades by exit_reason: %w", err)
+	}
+	return count, nil
+}
+
+func scanPaperTrades(rows *sql.Rows) ([]domain.PaperTrade, error) {
+	var trades []domain.PaperTrade
+	for rows.Next() {
+		var t domain.PaperTrade
+		var side string
+		if err := rows.Scan(&t.PaperTradeID, &t.DecisionID, &t.OpenedAt, &t.ClosedAt,
+			&t.Symbol, &side, &t.Qty, &t.Leverage, &t.EntryPrice, &t.ExitPrice,
+			&t.StopLoss, &t.TakeProfit, &t.FeesPaid, &t.FundingPaid,
+			&t.PnLGross, &t.PnLNet, &t.RMultiple, &t.ExitReason,
+		); err != nil {
+			return nil, fmt.Errorf("scan paper_trade: %w", err)
+		}
+		t.Side = domain.Side(side)
+		trades = append(trades, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate paper_trades: %w", err)
+	}
+	return trades, nil
+}
+
+// --- PaperAccountStateRepository ---
+
+type postgresPaperAccountStateRepository struct {
+	db *sql.DB
+}
+
+func (r *postgresPaperAccountStateRepository) Get(ctx context.Context) (*domain.PaperAccountState, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT id, starting_equity, current_equity, total_trades, wins, losses, realized_pnl, updated_at
+		FROM paper_account_state WHERE id = 1`)
+	var s domain.PaperAccountState
+	err := row.Scan(&s.ID, &s.StartingEquity, &s.CurrentEquity, &s.TotalTrades, &s.Wins, &s.Losses, &s.RealizedPnL, &s.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return &domain.PaperAccountState{ID: 1}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get paper_account_state: %w", err)
+	}
+	return &s, nil
+}
+
+func (r *postgresPaperAccountStateRepository) Update(ctx context.Context, s domain.PaperAccountState) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE paper_account_state SET
+			starting_equity = $2, current_equity = $3, total_trades = $4,
+			wins = $5, losses = $6, realized_pnl = $7, updated_at = NOW()
+		WHERE id = $1`,
+		s.ID, s.StartingEquity, s.CurrentEquity, s.TotalTrades, s.Wins, s.Losses, s.RealizedPnL,
+	)
+	if err != nil {
+		return fmt.Errorf("update paper_account_state: %w", err)
+	}
+	return nil
+}
+
+func jsonOrNull(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }

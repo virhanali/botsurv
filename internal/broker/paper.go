@@ -573,22 +573,33 @@ func (pb *PaperBroker) UpdatePrice(symbol string, price float64) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	pb.prices[symbol] = price
+	pb.setPriceLocked(symbol, price)
+	pb.updateUnrealizedPnLLocked(symbol)
+	pb.checkProtectiveOrders(symbol, price, time.Now())
+}
 
-	// Update unrealized PnL
+// SetSymbolPrice pushes a ticker price into the broker cache without triggering
+// PnL recalculation or protective order checks. Use this before PlaceOrder for
+// new symbols that don't have open positions yet.
+func (pb *PaperBroker) SetSymbolPrice(symbol string, price float64) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.setPriceLocked(symbol, price)
+}
+
+func (pb *PaperBroker) setPriceLocked(symbol string, price float64) {
+	pb.prices[symbol] = price
+}
+
+func (pb *PaperBroker) updateUnrealizedPnLLocked(symbol string) {
 	var totalUnrealized float64
 	for _, pos := range pb.openPositions {
-		pb.updatePositionPnL(pos, price)
-		if pos.Symbol == symbol {
-			totalUnrealized += pos.UnrealizedPnL
-		} else {
-			totalUnrealized += pos.UnrealizedPnL
+		if price, ok := pb.prices[pos.Symbol]; ok {
+			pb.updatePositionPnL(pos, price)
 		}
+		totalUnrealized += pos.UnrealizedPnL
 	}
 	pb.unrealizedPnL = totalUnrealized
-
-	// Check protective orders
-	pb.checkProtectiveOrders(symbol, price, time.Now())
 }
 
 // ProcessCandle checks pending orders against candle OHLCV for fills.
