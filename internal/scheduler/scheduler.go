@@ -842,7 +842,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			s.log.Info("scheduler stopped", nil)
-			return ctx.Err()
+			return nil
 		case <-ticker.C:
 			// Add buffer to avoid racing with candle close
 			time.Sleep(buffer)
