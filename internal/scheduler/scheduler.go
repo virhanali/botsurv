@@ -260,9 +260,22 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 	candidateIDs := s.persistCandidates(ctx, screenResult.Candidates, screenResult.NonEligible, cycleID)
 
 	if len(screenResult.Candidates) == 0 {
-		result.ReasonCodes = append(result.ReasonCodes, "NO_CANDIDATE")
+		reasons := []string{"NO_CANDIDATE"}
+		codeSeen := map[string]bool{}
+		for _, r := range screenResult.StrategyRejections {
+			if !codeSeen[r.Code] {
+				reasons = append(reasons, r.Code)
+				codeSeen[r.Code] = true
+			}
+		}
+		result.ReasonCodes = append(result.ReasonCodes, reasons...)
 		result.EndedAt = time.Now()
-		s.log.Info("cycle complete: no candidates", map[string]any{"cycle_id": cycleID})
+		logDetails := map[string]any{
+			"cycle_id":          cycleID,
+			"reason_codes":      reasons,
+			"strategy_rejects":  len(screenResult.StrategyRejections),
+		}
+		s.log.Info("cycle complete: no candidates", logDetails)
 		return result, nil
 	}
 

@@ -127,7 +127,7 @@ func ComputeFibonacciContext(candles []domain.Candle, side domain.Side, lookback
 		ZoneLabel:               zoneLabel,
 		DistanceToNearestFibPct: round2(distPct),
 		Valid:                   true,
-		ReasonCodes:             nil,
+		ReasonCodes:             []string{},
 	}
 }
 

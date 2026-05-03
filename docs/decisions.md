@@ -94,7 +94,29 @@ Prevent overexposure when many assets move together.
 
 ---
 
-## Decision 8 - External signals are inputs, not authority
+## Decision 9 - Fibonacci is optional context, not entry trigger
+
+Fibonacci retracement levels (0.5, 0.618, 0.786) are computed as optional confluence context only.
+
+They are:
+- Only used in LLM context JSON for veto/awareness
+- Feature-flagged via `watchlist_context.enabled` and `watchlist_context.fibonacci.enabled`
+- Capped by `scoring_weight` so they can never dominate the deterministic score
+- Not allowed to modify entry, SL, TP, or side
+- Not required for candidate eligibility
+
+The watchlist context struct also provides chart quality, volume liquidity, narrative sector, and marketcap class labels.
+
+All fields default to "unknown" / delta 0 when config is missing.
+
+Reason:
+Fibonacci can add useful pullback context for LLM veto decisions but must remain an optional
+confluence layer, never a direct entry trigger. Validation must come from paper/backtest before
+increasing weight.
+
+---
+
+## Decision 10 - External signals are inputs, not authority
 
 Manual/external signals such as Telegram signals can be added.
 

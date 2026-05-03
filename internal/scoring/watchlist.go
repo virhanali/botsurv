@@ -4,7 +4,6 @@ import (
 	"math"
 
 	"github.com/virhan/botsurv/internal/app"
-	"github.com/virhan/botsurv/internal/domain"
 	"github.com/virhan/botsurv/internal/indicator"
 )
 
@@ -27,7 +26,6 @@ type WatchlistContext struct {
 func BuildWatchlistContext(
 	fibCtx indicator.FibonacciContext,
 	symbol string,
-	side domain.Side,
 	volumeRatio float64,
 	atrPct float64,
 	cfg app.WatchlistContextConfig,

@@ -3,8 +3,10 @@ package screener
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/virhan/botsurv/internal/app"
@@ -102,16 +104,41 @@ func (s *Screener) RefreshUniverse(ctx context.Context) error {
 	return s.universe.RefreshUniverse(ctx)
 }
 
+// StrategyRejection captures why a strategy failed for a symbol.
+type StrategyRejection struct {
+	Symbol   string `json:"symbol"`
+	Strategy string `json:"strategy"`  // "trend_pullback" or "breakout_retest"
+	Reason   string `json:"reason"`    // raw FailedOn string, e.g. "RR 1.2 < 1.4"
+	Code     string `json:"code"`      // normalized code: "NO_BREAKOUT", "RR_TOO_LOW", etc.
+	NearMiss bool   `json:"near_miss"`
+}
+
+// EvaluateError wraps evaluateSymbol failures with strategy rejection details.
+type EvaluateError struct {
+	Symbol    string
+	Err       error
+	Rejections []StrategyRejection
+}
+
+func (e *EvaluateError) Error() string {
+	return fmt.Sprintf("evaluate %s: %s", e.Symbol, e.Err.Error())
+}
+
+func (e *EvaluateError) Unwrap() error {
+	return e.Err
+}
+
 // ScreenResult holds the output of the screener.
 type ScreenResult struct {
-	Candidates            []domain.Candidate
-	LLMContexts           map[string]string // symbol -> JSON context
-	NonEligible           []domain.Candidate
-	TradeCandidates       map[string]strategy.TradeCandidate
-	ScoreResults          map[string]scoring.ScoreResult
-	RegimeSnapshots       map[string]regime.MarketRegimeSnapshot
+	Candidates      []domain.Candidate
+	LLMContexts     map[string]string // symbol -> JSON context
+	NonEligible     []domain.Candidate
+	TradeCandidates map[string]strategy.TradeCandidate
+	ScoreResults    map[string]scoring.ScoreResult
+	RegimeSnapshots map[string]regime.MarketRegimeSnapshot
 	IndicatorSnapshots15m map[string]indicator.IndicatorSnapshot
 	IndicatorSnapshots1h  map[string]indicator.IndicatorSnapshot
+	StrategyRejections []StrategyRejection
 }
 
 // Screen runs the full screening pipeline:
@@ -131,6 +158,7 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 	tradeCandidates := make(map[string]strategy.TradeCandidate)
 	scoreResults := make(map[string]scoring.ScoreResult)
 	regimeSnapshots := make(map[string]regime.MarketRegimeSnapshot)
+	var strategyRejections []StrategyRejection
 	for _, sym := range qualitySymbols {
 		if sym.Blacklist {
 			continue
@@ -139,6 +167,18 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 		cand, tc, sr, rs, err := s.evaluateSymbol(ctx, sym, cycleID)
 		if err != nil {
 			s.log.Warn("skip symbol in screener", map[string]any{"symbol": sym.Symbol, "error": err.Error()})
+			var ee *EvaluateError
+			if errors.As(err, &ee) {
+				strategyRejections = append(strategyRejections, ee.Rejections...)
+			} else {
+				strategyRejections = append(strategyRejections, StrategyRejection{
+					Symbol:   sym.Symbol,
+					Strategy: "infra",
+					Reason:   err.Error(),
+					Code:     rejectionCode(err.Error()),
+					NearMiss: false,
+				})
+			}
 			continue
 		}
 		candidates = append(candidates, cand)
@@ -214,12 +254,22 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 		llmContexts[c.Symbol] = ctxJSON
 	}
 
-	s.log.Info("screener complete", map[string]any{
+	// Log aggregated strategy rejections for observability
+	rejectByCode := map[string]int{}
+	for _, r := range strategyRejections {
+		rejectByCode[r.Code]++
+	}
+	logReject := map[string]any{
 		"total_candidates": len(candidates),
 		"llm_eligible":     len(eligible),
 		"non_eligible":     len(nonEligible),
 		"contexts_built":   len(llmContexts),
-	})
+		"strategy_rejects": len(strategyRejections),
+	}
+	if len(rejectByCode) > 0 {
+		logReject["reject_breakdown"] = rejectByCode
+	}
+	s.log.Info("screener complete", logReject)
 
 	return &ScreenResult{
 		Candidates:            eligible,
@@ -230,6 +280,7 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 		RegimeSnapshots:       regimeSnapshots,
 		IndicatorSnapshots15m: snap15mMap,
 		IndicatorSnapshots1h:  snap1hMap,
+		StrategyRejections:    strategyRejections,
 	}, nil
 }
 
@@ -498,11 +549,19 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		IndicatorSnapshotRef: indicatorRef,
 		RegimeSnapshotRef:    regimeRef,
 	})
+	var rejections []StrategyRejection
 	if trendReject != nil {
 		s.log.Info("rejected_candidate", map[string]any{
 			"would_have_been": trendReject.WouldHaveBeen,
 			"failed_on":       trendReject.FailedOn,
 			"near_miss":       trendReject.NearMiss,
+		})
+		rejections = append(rejections, StrategyRejection{
+			Symbol:   sym.Symbol,
+			Strategy: "trend_pullback",
+			Reason:   trendReject.FailedOn,
+			Code:     rejectionCode(trendReject.FailedOn),
+			NearMiss: trendReject.NearMiss,
 		})
 	}
 	breakoutCand, breakoutReject := strategy.GenerateBreakoutRetest(strategy.BreakoutRetestInput{
@@ -522,6 +581,13 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 			"failed_on":       breakoutReject.FailedOn,
 			"near_miss":       breakoutReject.NearMiss,
 		})
+		rejections = append(rejections, StrategyRejection{
+			Symbol:   sym.Symbol,
+			Strategy: "breakout_retest",
+			Reason:   breakoutReject.FailedOn,
+			Code:     rejectionCode(breakoutReject.FailedOn),
+			NearMiss: breakoutReject.NearMiss,
+		})
 	}
 
 	var chosen *strategy.TradeCandidate
@@ -537,7 +603,12 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		chosen = breakoutCand
 	}
 	if chosen == nil {
-		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("no phase3 setup candidate generated")
+		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{},
+			&EvaluateError{
+				Symbol:     sym.Symbol,
+				Err:        fmt.Errorf("no phase3 setup candidate generated"),
+				Rejections: rejections,
+			}
 	}
 
 	scoreCfg := s.cfg.Scoring.WithDefaults()
@@ -803,7 +874,6 @@ func (s *Screener) buildWatchlistContext(ctx context.Context, cand domain.Candid
 	wc := scoring.BuildWatchlistContext(
 		fibCtx,
 		cand.Symbol,
-		cand.Side,
 		volumeRatio,
 		atrPct,
 		cfg,
@@ -821,6 +891,65 @@ func closedCandleRawLimit(minRequired int) int {
 		return 0
 	}
 	return minRequired + 1
+}
+
+// rejectionCode normalizes a strategy rejection reason to a canonical code.
+// This is a best-effort categorization; unknown reasons get "OTHER_REJECT".
+func rejectionCode(reason string) string {
+	switch {
+	// Strategy-specific patterns — check before generic infra keywords
+	// because strategy strings may contain "candle", "regime", etc.
+
+	// Breakout (covers "no valid breakout in last 8 candles", retest, confirmation, etc.)
+	case containsFold(reason, "no valid breakout"), containsFold(reason, "retest condition failed"),
+		containsFold(reason, "closed below broken resistance"), containsFold(reason, "closed above broken support"),
+		containsFold(reason, "bullish confirmation missing"), containsFold(reason, "bearish confirmation missing"):
+		return "NO_BREAKOUT"
+	// Pullback / structure (covers "reaction candle/structure condition failed")
+	case containsFold(reason, "pullback distance"), containsFold(reason, "reaction candle"),
+		containsFold(reason, "structure condition"):
+		return "STRUCTURE_REJECT"
+	// Volume
+	case containsFold(reason, "volume") && containsFold(reason, "volume_ma"):
+		return "LOW_VOLUME"
+	// RR — "rr" followed by "<" indicates RR below threshold
+	case containsFold(reason, "rr") && containsFold(reason, "<"):
+		return "RR_TOO_LOW"
+	// RSI
+	case containsFold(reason, "rsi"):
+		return "RSI_REJECT"
+	// MACD
+	case containsFold(reason, "macd"):
+		return "MACD_REJECT"
+	// Infrastructure errors — keywords that do NOT appear in strategy rejection strings.
+	// Check before "regime" keyword to avoid matching "build market regime snapshot".
+	case containsFold(reason, "validation"), containsFold(reason, "snapshot"),
+		containsFold(reason, "market regime"):
+		return "DATA_ERROR"
+	// "get" + "candle" pattern from infra candle fetch errors
+	case containsFold(reason, "get") && containsFold(reason, "candle"):
+		return "DATA_ERROR"
+	// Trend / regime mismatches (after infra checks so "market regime snapshot" is DATA_ERROR)
+	case containsFold(reason, "htf trend"), containsFold(reason, "strongly bearish"),
+		containsFold(reason, "strongly bullish"):
+		return "REGIME_MISMATCH"
+	case containsFold(reason, "regime"):
+		return "REGIME_MISMATCH"
+	// Insufficient data (must be after strategy breakout to avoid "insufficient candles" masking NO_BREAKOUT)
+	case containsFold(reason, "insufficient"), containsFold(reason, "unavailable"):
+		return "INSUFFICIENT_DATA"
+	// Invalid risk / distance
+	case containsFold(reason, "invalid risk"), containsFold(reason, "risk distance"):
+		return "RISK_REJECT"
+	// Generic candidate failure
+	case containsFold(reason, "no phase3"), containsFold(reason, "no setup"):
+		return "NO_STRATEGY_CANDIDATE"
+	}
+	return "OTHER_REJECT"
+}
+
+func containsFold(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
 // sanitizeContext replaces NaN and +/-Inf float64 values with 0

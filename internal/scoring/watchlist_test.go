@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/virhan/botsurv/internal/app"
-	"github.com/virhan/botsurv/internal/domain"
 	"github.com/virhan/botsurv/internal/indicator"
 )
 
@@ -24,7 +23,7 @@ func TestWatchlistContext_UnknownConfig_NeutralDelta(t *testing.T) {
 	cfg := app.WatchlistContextConfig{Enabled: false}
 	fibCtx := indicator.FibonacciContext{Valid: false}
 
-	wc := BuildWatchlistContext(fibCtx, "BTCUSDT", domain.SideLong, 0, 0, cfg)
+	wc := BuildWatchlistContext(fibCtx, "BTCUSDT", 0, 0, cfg)
 
 	if wc.ConfluenceScoreDelta != 0 {
 		t.Errorf("expected delta 0 for disabled config, got %.2f", wc.ConfluenceScoreDelta)
@@ -52,7 +51,7 @@ func TestWatchlistContext_NarrativeActiveSector_GivesSmallPositiveDelta(t *testi
 		CurrentPrice: 161.8,
 	}
 
-	wc := BuildWatchlistContext(fibCtx, "BTCUSDT", domain.SideLong, 1.5, 1.0, cfg)
+	wc := BuildWatchlistContext(fibCtx, "BTCUSDT", 1.5, 1.0, cfg)
 
 	if wc.NarrativeSector != "AI" {
 		t.Errorf("expected narrative_sector=AI, got %s", wc.NarrativeSector)
@@ -76,7 +75,7 @@ func TestWatchlistContext_MarketcapClass_FromConfig(t *testing.T) {
 		SymbolClasses: map[string]string{"BTCUSDT": "large_liquid"},
 	}
 
-	wc := BuildWatchlistContext(indicator.FibonacciContext{}, "BTCUSDT", domain.SideLong, 0, 0, cfg)
+	wc := BuildWatchlistContext(indicator.FibonacciContext{}, "BTCUSDT", 0, 0, cfg)
 
 	if wc.MarketcapLiquidityClass != "large_liquid" {
 		t.Errorf("expected marketcap=large_liquid, got %s", wc.MarketcapLiquidityClass)
@@ -95,7 +94,7 @@ func TestWatchlistContext_VolumeLabels(t *testing.T) {
 		{0, "unknown"},
 	}
 	for _, tt := range tests {
-		wc := BuildWatchlistContext(indicator.FibonacciContext{}, "TEST", domain.SideLong, tt.ratio, 0, cfg)
+		wc := BuildWatchlistContext(indicator.FibonacciContext{}, "TEST", tt.ratio, 0, cfg)
 		if wc.VolumeLiquidityLabel != tt.want {
 			t.Errorf("volumeRatio=%.1f expected %s, got %s", tt.ratio, tt.want, wc.VolumeLiquidityLabel)
 		}
@@ -119,7 +118,7 @@ func TestWatchlistContext_DeltaCapped(t *testing.T) {
 		CurrentPrice: 161.8,
 	}
 
-	wc := BuildWatchlistContext(fibCtx, "TEST", domain.SideLong, 2.0, 2.5, cfg)
+	wc := BuildWatchlistContext(fibCtx, "TEST", 2.0, 2.5, cfg)
 
 	// Expected: fib_zone(2.0) + healthy_range(0.5) + strong_vol(0.5) + narrative(1.0) = 4.0
 	// But scoring_weight caps at 1.0
@@ -140,7 +139,7 @@ func TestWatchlistContext_NegativeDeltaForChopAndExtended(t *testing.T) {
 		CurrentPrice: 195,
 	}
 
-	wc := BuildWatchlistContext(fibCtx, "TEST", domain.SideLong, 0.5, 0.5, cfg)
+	wc := BuildWatchlistContext(fibCtx, "TEST", 0.5, 0.5, cfg)
 
 	if wc.ConfluenceScoreDelta > 0 {
 		t.Errorf("expected negative or zero delta for extended zone, got %.2f", wc.ConfluenceScoreDelta)
@@ -165,7 +164,7 @@ func TestWatchlistContext_IncludesReasonCodes(t *testing.T) {
 		CurrentPrice: 161.8,
 	}
 
-	wc := BuildWatchlistContext(fibCtx, "BTCUSDT", domain.SideLong, 1.5, 2.0, cfg)
+	wc := BuildWatchlistContext(fibCtx, "BTCUSDT", 1.5, 2.0, cfg)
 
 	if len(wc.ReasonCodes) == 0 {
 		t.Error("expected non-empty reason codes")
@@ -185,7 +184,7 @@ func TestWatchlistContext_IncludesReasonCodes(t *testing.T) {
 func TestWatchlistContext_FibNotValid_StillReturnsContext(t *testing.T) {
 	cfg := defaultWatchlistCfg()
 
-	wc := BuildWatchlistContext(indicator.FibonacciContext{Valid: false}, "TEST", domain.SideLong, 0, 0, cfg)
+	wc := BuildWatchlistContext(indicator.FibonacciContext{Valid: false}, "TEST", 0, 0, cfg)
 
 	// Should not crash, should return context with unknown/neutral values
 	if wc.ChartQualityLabel != "unknown" {

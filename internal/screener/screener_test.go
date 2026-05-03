@@ -3,10 +3,13 @@ package screener
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/indicator"
+	"github.com/virhan/botsurv/internal/scoring"
 )
 
 func TestComputeScores_HighQuality(t *testing.T) {
@@ -385,6 +388,110 @@ func TestSanitizeContext_NaNInf(t *testing.T) {
 	_, err := json.Marshal(c)
 	if err != nil {
 		t.Fatalf("json.Marshal failed after sanitize: %v", err)
+	}
+}
+
+func TestCandidateContext_JSON_WithWatchlistContext(t *testing.T) {
+	fibCtx := indicator.FibonacciContext{
+		SwingHigh:             200,
+		SwingLow:              100,
+		ImpulseDirection:      "up",
+		Fib05:                 150,
+		Fib0618:               138.2,
+		Fib0786:               121.4,
+		CurrentPrice:          138.2,
+		ZoneLabel:             "in_0_618_zone",
+		DistanceToNearestFibPct: 0,
+		Valid:                 true,
+	}
+	wc := scoring.WatchlistContext{
+		ChartQualityLabel:       "healthy_range",
+		VolumeLiquidityLabel:    "strong",
+		NarrativeSector:         "AI",
+		NarrativeActive:         true,
+		MarketcapLiquidityClass: "large_liquid",
+		Fibonacci:               fibCtx,
+		ConfluenceScoreDelta:    2.5,
+		ReasonCodes:             []string{"fib_zone:0.618", "confluence_positive"},
+	}
+
+	ctx := CandidateContext{
+		Symbol:        "BTCUSDT",
+		Side:          "LONG",
+		SetupType:     "trend_pullback",
+		Regime:        "trend_up",
+		EntryType:     "MARKET",
+		ProposedEntry: 65000,
+		StopLoss:      64000,
+		TakeProfit:    67000,
+		RR:            2.0,
+		SetupScore:    80,
+		ExpectedMove:  2000,
+		WatchlistContext: &wc,
+	}
+
+	b, err := json.Marshal(ctx)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	jsonStr := string(b)
+	if !strings.Contains(jsonStr, "watchlist_context") {
+		t.Error("expected watchlist_context in JSON")
+	}
+	if !strings.Contains(jsonStr, "in_0_618_zone") {
+		t.Error("expected fibonacci zone in JSON")
+	}
+	if !strings.Contains(jsonStr, "confluence_score_delta") {
+		t.Error("expected confluence_score_delta in JSON")
+	}
+
+	// Verify it round-trips
+	var decoded CandidateContext
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.WatchlistContext == nil {
+		t.Error("expected WatchlistContext after unmarshal")
+	} else if decoded.WatchlistContext.Fibonacci.ZoneLabel != "in_0_618_zone" {
+		t.Errorf("expected zone_label=in_0_618_zone, got %s", decoded.WatchlistContext.Fibonacci.ZoneLabel)
+	}
+}
+
+func TestRejectionCode(t *testing.T) {
+	tests := []struct {
+		reason string
+		want   string
+	}{
+		{"HTF trend support condition failed", "REGIME_MISMATCH"},
+		{"no valid breakout in last 8 candles", "NO_BREAKOUT"},
+		{"retest condition failed", "NO_BREAKOUT"},
+		{"closed below broken resistance", "NO_BREAKOUT"},
+		{"bullish confirmation missing", "NO_BREAKOUT"},
+		{"RR 1.2 < 1.4", "RR_TOO_LOW"},
+		{"volume 0.50 < 0.7 * volume_ma20 1.00", "LOW_VOLUME"},
+		{"RSI 14 = 72.00 out of range [38,68]", "RSI_REJECT"},
+		{"MACD histogram not improving", "MACD_REJECT"},
+		{"MACD histogram not weakening", "MACD_REJECT"},
+		{"pullback distance condition failed", "STRUCTURE_REJECT"},
+		{"reaction candle/structure condition failed", "STRUCTURE_REJECT"},
+		{"insufficient 15m candles (<30)", "INSUFFICIENT_DATA"},
+		{"ATR14 unavailable", "INSUFFICIENT_DATA"},
+		{"invalid risk distance", "RISK_REJECT"},
+		{"4h strongly bearish", "REGIME_MISMATCH"},
+		{"4h strongly bullish", "REGIME_MISMATCH"},
+		{"no phase3 setup candidate generated", "NO_STRATEGY_CANDIDATE"},
+		{"get 15m candles: exchange error", "DATA_ERROR"},
+		{"candle validation failed: bad data", "DATA_ERROR"},
+		{"build indicator snapshot: ema error", "DATA_ERROR"},
+		{"build market regime snapshot: BTC data", "DATA_ERROR"},
+		{"some completely unknown error", "OTHER_REJECT"},
+	}
+	for _, tt := range tests {
+		got := rejectionCode(tt.reason)
+		if got != tt.want {
+			t.Errorf("rejectionCode(%q) = %q, want %q", tt.reason, got, tt.want)
+		}
 	}
 }
 
