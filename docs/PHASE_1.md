@@ -54,4 +54,3 @@ Runtime defaults are applied if fields are omitted.
   ]
 }
 ```
-

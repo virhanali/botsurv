@@ -26,22 +26,23 @@ type MarketDataProvider interface {
 
 // CandidateContext is the compact JSON context sent to LLM for veto.
 type CandidateContext struct {
-	Symbol        string            `json:"symbol"`
-	Side          string            `json:"side"`
-	SetupType     string            `json:"setup_type"`
-	Regime        string            `json:"regime"`
-	EntryType     string            `json:"entry_type"`
-	ProposedEntry float64           `json:"proposed_entry"`
-	StopLoss      float64           `json:"stop_loss"`
-	TakeProfit    float64           `json:"take_profit"`
-	RR            float64           `json:"rr"`
-	SetupScore    float64           `json:"setup_score"`
-	ExpectedMove  float64           `json:"expected_move"`
-	OrderBook     *OrderBookSummary `json:"order_book,omitempty"`
-	TradeFlow     *TradeFlowSummary `json:"trade_flow,omitempty"`
-	RegimeSummary *RegimeSummary    `json:"regime_summary,omitempty"`
-	CostSummary   *CostSummary      `json:"cost_summary,omitempty"`
-	RiskSummary   *RiskSummary      `json:"risk_summary,omitempty"`
+	Symbol           string                    `json:"symbol"`
+	Side             string                    `json:"side"`
+	SetupType        string                    `json:"setup_type"`
+	Regime           string                    `json:"regime"`
+	EntryType        string                    `json:"entry_type"`
+	ProposedEntry    float64                   `json:"proposed_entry"`
+	StopLoss         float64                   `json:"stop_loss"`
+	TakeProfit       float64                   `json:"take_profit"`
+	RR               float64                   `json:"rr"`
+	SetupScore       float64                   `json:"setup_score"`
+	ExpectedMove     float64                   `json:"expected_move"`
+	OrderBook        *OrderBookSummary         `json:"order_book,omitempty"`
+	TradeFlow        *TradeFlowSummary         `json:"trade_flow,omitempty"`
+	RegimeSummary    *RegimeSummary            `json:"regime_summary,omitempty"`
+	CostSummary      *CostSummary              `json:"cost_summary,omitempty"`
+	RiskSummary      *RiskSummary              `json:"risk_summary,omitempty"`
+	WatchlistContext *scoring.WatchlistContext `json:"watchlist_context,omitempty"`
 }
 
 type OrderBookSummary struct {
@@ -103,12 +104,12 @@ func (s *Screener) RefreshUniverse(ctx context.Context) error {
 
 // ScreenResult holds the output of the screener.
 type ScreenResult struct {
-	Candidates      []domain.Candidate
-	LLMContexts     map[string]string // symbol -> JSON context
-	NonEligible     []domain.Candidate
-	TradeCandidates map[string]strategy.TradeCandidate
-	ScoreResults    map[string]scoring.ScoreResult
-	RegimeSnapshots map[string]regime.MarketRegimeSnapshot
+	Candidates            []domain.Candidate
+	LLMContexts           map[string]string // symbol -> JSON context
+	NonEligible           []domain.Candidate
+	TradeCandidates       map[string]strategy.TradeCandidate
+	ScoreResults          map[string]scoring.ScoreResult
+	RegimeSnapshots       map[string]regime.MarketRegimeSnapshot
 	IndicatorSnapshots15m map[string]indicator.IndicatorSnapshot
 	IndicatorSnapshots1h  map[string]indicator.IndicatorSnapshot
 }
@@ -221,12 +222,12 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 	})
 
 	return &ScreenResult{
-		Candidates:      eligible,
-		LLMContexts:     llmContexts,
-		NonEligible:     nonEligible,
-		TradeCandidates: tradeCandidates,
-		ScoreResults:    scoreResults,
-		RegimeSnapshots: regimeSnapshots,
+		Candidates:            eligible,
+		LLMContexts:           llmContexts,
+		NonEligible:           nonEligible,
+		TradeCandidates:       tradeCandidates,
+		ScoreResults:          scoreResults,
+		RegimeSnapshots:       regimeSnapshots,
 		IndicatorSnapshots15m: snap15mMap,
 		IndicatorSnapshots1h:  snap1hMap,
 	}, nil
@@ -666,6 +667,13 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 		return "", fmt.Errorf("invalid latest price: %v", price)
 	}
 
+	// Optional watchlist context with Fibonacci confluence (built before ctxObj).
+	var watchlistCtx *scoring.WatchlistContext
+	if s.cfg.WatchlistContext.Enabled {
+		wc := s.buildWatchlistContext(ctx, cand, atr, price)
+		watchlistCtx = &wc
+	}
+
 	ctxObj := CandidateContext{
 		Symbol:        cand.Symbol,
 		Side:          string(cand.Side),
@@ -722,6 +730,10 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 		MaxOpenPositions: s.cfg.PortfolioRisk.MaxOpenPositions,
 	}
 
+	if watchlistCtx != nil {
+		ctxObj.WatchlistContext = watchlistCtx
+	}
+
 	// Sanitize NaN/Inf values that would break JSON marshal.
 	sanitizeContext(&ctxObj)
 
@@ -730,6 +742,73 @@ func (s *Screener) buildContext(ctx context.Context, cand domain.Candidate) (str
 		return "", fmt.Errorf("marshal context: %w", err)
 	}
 	return string(b), nil
+}
+
+// buildWatchlistContext computes optional watchlist/Fibonacci context for LLM.
+// This is purely informational — it never modifies entry, SL, TP, or score.
+func (s *Screener) buildWatchlistContext(ctx context.Context, cand domain.Candidate, atr, price float64) scoring.WatchlistContext {
+	cfg := s.cfg.WatchlistContext.WithDefaults()
+
+	var fibCtx indicator.FibonacciContext
+	if cfg.Fibonacci.Enabled {
+		setupTF := s.cfg.Strategy.Timeframes.Setup
+		if setupTF == "" {
+			setupTF = "15m"
+		}
+		lookback := cfg.Fibonacci.LookbackCandles
+		if lookback <= 0 {
+			lookback = 80
+		}
+		fibCandles, err := s.md.GetCandles(ctx, cand.Symbol, setupTF, lookback+20)
+		if err == nil && len(fibCandles) >= lookback {
+			fibCtx = indicator.ComputeFibonacciContext(
+				fibCandles,
+				cand.Side,
+				lookback,
+				cfg.Fibonacci.ZoneTolerancePct,
+			)
+		}
+	}
+
+	// Compute ATR% for chart quality if not already available
+	atrPct := 0.0
+	if price > 0 && atr > 0 {
+		atrPct = atr / price * 100
+	}
+
+	volumeRatio := 0.0
+	// Best-effort volume ratio from available indicator snapshots
+	if s.cfg.Strategy.Timeframes.Setup != "" {
+		volCandles, err := s.md.GetCandles(ctx, cand.Symbol, s.cfg.Strategy.Timeframes.Setup, 30)
+		if err == nil && len(volCandles) > 1 {
+			last := volCandles[len(volCandles)-1].Volume
+			var sum float64
+			count := 0
+			for i := 0; i < len(volCandles)-1 && count < 20; i++ {
+				idx := len(volCandles) - 2 - i
+				if idx >= 0 {
+					sum += volCandles[idx].Volume
+					count++
+				}
+			}
+			if count > 0 && sum > 0 {
+				avg := sum / float64(count)
+				if avg > 0 {
+					volumeRatio = last / avg
+				}
+			}
+		}
+	}
+
+	wc := scoring.BuildWatchlistContext(
+		fibCtx,
+		cand.Symbol,
+		cand.Side,
+		volumeRatio,
+		atrPct,
+		cfg,
+	)
+	return wc
 }
 
 // sanitizeContext replaces NaN and +/-Inf float64 values with 0
@@ -765,6 +844,17 @@ func sanitizeContext(c *CandidateContext) {
 		c.CostSummary.EstimatedSlippage = sanitizeFloat(c.CostSummary.EstimatedSlippage)
 		c.CostSummary.TotalCost = sanitizeFloat(c.CostSummary.TotalCost)
 		c.CostSummary.CostBps = sanitizeFloat(c.CostSummary.CostBps)
+	}
+
+	if c.WatchlistContext != nil {
+		c.WatchlistContext.Fibonacci.SwingHigh = sanitizeFloat(c.WatchlistContext.Fibonacci.SwingHigh)
+		c.WatchlistContext.Fibonacci.SwingLow = sanitizeFloat(c.WatchlistContext.Fibonacci.SwingLow)
+		c.WatchlistContext.Fibonacci.Fib05 = sanitizeFloat(c.WatchlistContext.Fibonacci.Fib05)
+		c.WatchlistContext.Fibonacci.Fib0618 = sanitizeFloat(c.WatchlistContext.Fibonacci.Fib0618)
+		c.WatchlistContext.Fibonacci.Fib0786 = sanitizeFloat(c.WatchlistContext.Fibonacci.Fib0786)
+		c.WatchlistContext.Fibonacci.CurrentPrice = sanitizeFloat(c.WatchlistContext.Fibonacci.CurrentPrice)
+		c.WatchlistContext.Fibonacci.DistanceToNearestFibPct = sanitizeFloat(c.WatchlistContext.Fibonacci.DistanceToNearestFibPct)
+		c.WatchlistContext.ConfluenceScoreDelta = sanitizeFloat(c.WatchlistContext.ConfluenceScoreDelta)
 	}
 }
 

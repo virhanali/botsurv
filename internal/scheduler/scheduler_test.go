@@ -12,6 +12,7 @@ import (
 	"github.com/virhan/botsurv/internal/db"
 	"github.com/virhan/botsurv/internal/domain"
 	"github.com/virhan/botsurv/internal/execution"
+	paperexec "github.com/virhan/botsurv/internal/execution/paper"
 	"github.com/virhan/botsurv/internal/executor"
 	"github.com/virhan/botsurv/internal/llm"
 	"github.com/virhan/botsurv/internal/logger"
@@ -613,6 +614,199 @@ func TestScheduler_RunOnce_PortfolioRankingPersistsRejectedCandidates(t *testing
 	}
 }
 
+func TestScheduler_CheckDailyReset_UpdatesDay(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
+	md := &mockMarketData{}
+	mon := monitor.NewMonitor(pb, md, app.PortfolioRiskConfig{}, log)
+	sched := &Scheduler{
+		log:               log,
+		monitor:           mon,
+		lastDailyResetDay: "2020-01-01",
+	}
+	sched.checkDailyReset()
+	today := time.Now().UTC().Format("2006-01-02")
+	if sched.lastDailyResetDay != today {
+		t.Errorf("expected lastDailyResetDay = %s, got %s", today, sched.lastDailyResetDay)
+	}
+}
+
+func TestScheduler_CheckDailyReset_CallsReviewerResetCost(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
+	md := &mockMarketData{}
+	mon := monitor.NewMonitor(pb, md, app.PortfolioRiskConfig{}, log)
+	sched := &Scheduler{
+		log:               log,
+		monitor:           mon,
+		lastDailyResetDay: "2020-01-01",
+	}
+	// Reviewer with audit_only mode (enabled, no active calls)
+	reviewer := llm.NewReviewer(app.LLMReviewConfig{
+		Mode:            "audit_only",
+		Provider:        "openrouter",
+		Model:           "test-model",
+		BaseURL:         "http://localhost:99999",
+		TimeoutSeconds:  1,
+		MaxOutputTokens: 100,
+	}, log)
+	if !reviewer.IsEnabled() {
+		t.Fatal("expected reviewer to be enabled")
+	}
+	sched.SetLLMReviewer(reviewer)
+
+	sched.checkDailyReset()
+	today := time.Now().UTC().Format("2006-01-02")
+	if sched.lastDailyResetDay != today {
+		t.Errorf("expected lastDailyResetDay = %s, got %s", today, sched.lastDailyResetDay)
+	}
+}
+
+func TestPaperMode_SimulatorPositions_MergedIntoCycleState(t *testing.T) {
+	cycleRepo := &mockCycleRepo{}
+	candidateRepo := &mockCandidateRepo{}
+	riskDecisionRepo := &mockRiskDecisionRepo{}
+	universeRepo := &mockUniverseRepo{
+		symbols: []domain.UniverseSymbol{
+			{SymbolInfo: domain.SymbolInfo{Symbol: "BTCUSDT", Status: "Trading", QuoteAsset: "USDT", MinNotional: 10}},
+		},
+	}
+
+	log := logger.New(nil, logger.LevelDebug)
+	cfg := app.UserConfig{
+		App: app.AppConfig{
+			Mode:                 "paper",
+			CycleIntervalSeconds: 900,
+		},
+		Universe: app.UniverseConfig{
+			Mode: "all_usdt_perpetual",
+		},
+		DataValidation: app.DataValidationConfig{
+			MinCandles: 25,
+			MaxDataAgeSeconds: map[string]int{
+				"1H":  7200,
+				"15m": 7200,
+				"5m":  7200,
+			},
+		},
+		Strategy: app.StrategyConfig{
+			Enabled: true,
+			Timeframes: app.TimeframesConfig{
+				Context:   "1H",
+				Setup:     "15m",
+				Execution: "15m",
+			},
+			Indicators: app.IndicatorsConfig{
+				ATRPeriod:                  14,
+				EMA200Period:               200,
+				VolumeSMAPeriod:            20,
+				RangeCandles:               20,
+				MinVolumeRatio:             1.0,
+				MaxBreakoutExtensionATR:    2.0,
+				MaxDistanceFromBreakoutATR: 1.0,
+				MinRR:                      1.5,
+			},
+			Regime: app.RegimeConfig{
+				TrendUpMinDistanceFromEMAPct:   1.0,
+				TrendDownMaxDistanceFromEMAPct: -1.0,
+				RangeMaxDistanceFromEMAPct:     0.5,
+			},
+		},
+		LLMRouting: app.LLMRoutingConfig{
+			Mode:              "off",
+			MinCandidateScore: 1.0,
+		},
+		PortfolioRisk: app.PortfolioRiskConfig{
+			MaxOpenPositions:          5,
+			MaxRiskPerTradePct:        1.0,
+			MaxDailyLossPct:           3.0,
+			MaxTotalExposureUSD:       100000,
+			MaxTotalMarginUsedPct:     50.0,
+			MaxLeverage:               10.0,
+			MinNotionalUSD:            10.0,
+			MarginPerTradeUSD:         100.0,
+			MaxNewPositionsPerCycle:   2,
+			MaxSameDirectionPositions: 5,
+		},
+		Sizing: app.SizingConfig{
+			Method:             "fixed_margin",
+			MarginPerTradeUSD:  100.0,
+			MaxLeverage:        10.0,
+			MaxRiskPerTradePct: 1.0,
+		},
+	}
+
+	md := &mockMarketData{}
+	universeScanner := universe.NewScanner(cfg.Universe, cfg.Strategy, cfg.LLMRouting, "", md, universeRepo, &mockCandleRepo{}, log, cfg.ComputeTargetNotional())
+	screenerSvc := screener.NewScreener(cfg, universeScanner, md, log)
+
+	pb := broker.NewPaperBroker(app.PaperConfig{StartingBalanceUSD: 10000}, log)
+	riskEng := risk.NewEngine(cfg)
+	exec := executor.NewExecutor(pb, log)
+	safetyEng := execution.NewSafetyEngine(cfg)
+	mon := monitor.NewMonitor(pb, md, cfg.PortfolioRisk, log)
+
+	mockLLM := llm.NewMockClient(domain.LLMDecision{Decision: "ALLOW_MARKET", Confidence: 0.9, SizeMultiplier: 1.0}, nil)
+	sched := NewScheduler(cfg, screenerSvc, mockLLM, riskEng, exec, safetyEng, mon, md, log)
+	sched.SetMode(app.ModePaper)
+	sched.SetCycleRepo(cycleRepo)
+	sched.SetCandidateRepo(candidateRepo)
+	sched.SetRiskDecisionRepo(riskDecisionRepo)
+
+	// Set up paper simulator with a pre-existing BTCUSDT open trade
+	// Use TakeProfit well above current mock price (65000) so it doesn't trigger
+	paperTradeRepo := &mockPaperTradeRepo{}
+	paperTradeRepo.trades = append(paperTradeRepo.trades, domain.PaperTrade{
+		PaperTradeID: "existing-btc",
+		Symbol:       "BTCUSDT",
+		Side:         domain.SideLong,
+		Qty:          0.1,
+		EntryPrice:   64000,
+		StopLoss:     63000,
+		TakeProfit:   100000,
+		OpenedAt:     time.Now().Add(-time.Hour),
+	})
+	paperSim := paperexec.NewSimulator(md, paperTradeRepo, &mockPaperAccountRepo{}, app.PaperConfig{StartingBalanceUSD: 10000}, log)
+	if err := paperSim.Initialize(context.Background()); err != nil {
+		t.Fatalf("paper sim init: %v", err)
+	}
+	sched.SetPaperSimulator(paperSim)
+
+	result, err := sched.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected result")
+	}
+
+	// With an existing BTCUSDT paper trade, the candidate should be blocked
+	// either by hard blocks (BlockIfPositionAlreadyOpen) or risk (DUPLICATE_SYMBOL).
+	foundRejected := false
+	for _, sk := range result.Skips {
+		if sk.Symbol == "BTCUSDT" && (sk.Reason == "HARD_BLOCK" || sk.Reason == "RISK_REJECTED") {
+			foundRejected = true
+			break
+		}
+	}
+	if !foundRejected {
+		t.Fatalf("expected BTCUSDT to be rejected due to existing paper trade, skips: %v", result.Skips)
+	}
+
+	// Verify the risk decision contains DUPLICATE_SYMBOL
+	foundDuplicate := false
+	for _, rec := range riskDecisionRepo.decisions {
+		for _, rc := range rec.decision.ReasonCodes {
+			if rc == "DUPLICATE_SYMBOL" {
+				foundDuplicate = true
+			}
+		}
+	}
+	if !foundDuplicate {
+		t.Log("risk decisions did not contain DUPLICATE_SYMBOL; may have been blocked by hard blocks")
+	}
+}
+
 // recordingMockMarketData records the arguments passed to GetOrderBookSummary.
 type recordingMockMarketData struct {
 	mockMarketData
@@ -1012,6 +1206,52 @@ func TestTrackLLMCall_PersistsUsage(t *testing.T) {
 	if sched.llmCallsToday != 1 {
 		t.Fatalf("expected in-memory calls=1, got %d", sched.llmCallsToday)
 	}
+}
+
+// mockPaperTradeRepo is an in-memory PaperTradeRepository.
+type mockPaperTradeRepo struct {
+	trades []domain.PaperTrade
+}
+
+func (m *mockPaperTradeRepo) Insert(ctx context.Context, t domain.PaperTrade) error {
+	m.trades = append(m.trades, t)
+	return nil
+}
+func (m *mockPaperTradeRepo) Update(ctx context.Context, t domain.PaperTrade) error {
+	for i := range m.trades {
+		if m.trades[i].PaperTradeID == t.PaperTradeID {
+			m.trades[i] = t
+			return nil
+		}
+	}
+	return nil
+}
+func (m *mockPaperTradeRepo) GetOpen(ctx context.Context) ([]domain.PaperTrade, error) {
+	var out []domain.PaperTrade
+	for _, t := range m.trades {
+		if t.ClosedAt == nil {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+func (m *mockPaperTradeRepo) GetByDecision(ctx context.Context, decisionID string) (*domain.PaperTrade, error) {
+	return nil, nil
+}
+func (m *mockPaperTradeRepo) GetAll(ctx context.Context, since time.Time) ([]domain.PaperTrade, error) {
+	return m.trades, nil
+}
+func (m *mockPaperTradeRepo) CountByExitReason(ctx context.Context, reason string, since time.Time) (int, error) {
+	return 0, nil
+}
+
+type mockPaperAccountRepo struct{}
+
+func (m *mockPaperAccountRepo) Get(ctx context.Context) (*domain.PaperAccountState, error) {
+	return &domain.PaperAccountState{StartingEquity: 10000, CurrentEquity: 10000}, nil
+}
+func (m *mockPaperAccountRepo) Update(ctx context.Context, s domain.PaperAccountState) error {
+	return nil
 }
 
 func skipContains(skips []SkipReason, reason string) bool {

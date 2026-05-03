@@ -56,17 +56,13 @@ func (v *Validator) ValidateCandleBatch(in CandleValidationInput) (CandleValidat
 	}
 	intervalMS := interval.Milliseconds()
 
-	// Strip in-progress latest candle if not closed
+	// Strip in-progress latest candle if not closed.
+	// MinRequired applies to closed candles used downstream; do not reduce it.
 	if in.RequireClosedLatest && !in.Candles[len(in.Candles)-1].Confirmed {
 		if len(in.Candles) < 2 {
 			return CandleValidationResult{}, fmt.Errorf("validation failed: latest candle is in-progress but no closed candles available")
 		}
 		in.Candles = in.Candles[:len(in.Candles)-1]
-		// The stripped candle was in-progress so it should not count toward
-		// the closed-candle minimum requirement. Reduce by 1.
-		if in.MinRequired > 0 {
-			in.MinRequired--
-		}
 	}
 
 	minRequired := in.MinRequired

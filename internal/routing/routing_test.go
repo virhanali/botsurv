@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"math"
 	"testing"
 
 	"github.com/virhan/botsurv/internal/domain"
@@ -50,10 +51,10 @@ func makeTestRegime(isBTCNearResistance bool) regime.MarketRegimeSnapshot {
 
 func makeTradeCandidate() strategy.TradeCandidate {
 	return strategy.TradeCandidate{
-		Symbol:    "BTCUSDT",
-		Side:      domain.SideLong,
-		EntryType: strategy.CandidateEntryMarket,
-		Strategy:  strategy.StrategyBreakoutRetest,
+		Symbol:     "BTCUSDT",
+		Side:       domain.SideLong,
+		EntryType:  strategy.CandidateEntryMarket,
+		Strategy:   strategy.StrategyBreakoutRetest,
 		EntryPrice: 65300,
 		StopLoss:   64800,
 	}
@@ -133,6 +134,16 @@ func TestRoute_RejectLowScore(t *testing.T) {
 	}
 }
 
+func TestRoute_RejectNonFiniteScore(t *testing.T) {
+	eng := DefaultRoutingEngine()
+	for _, score := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		result := eng.RouteCandidate(score, AmbiguityFlags{}, 0, 0)
+		if result.Route != RouteRejectPreLLM {
+			t.Errorf("expected REJECT_PRE_LLM for non-finite score, got %s", result.Route)
+		}
+	}
+}
+
 func TestRoute_SkipLLMHighScore(t *testing.T) {
 	eng := DefaultRoutingEngine()
 	result := eng.RouteCandidate(90, AmbiguityFlags{}, 0, 5)
@@ -151,21 +162,44 @@ func TestRoute_LLMVetoAmbiguous(t *testing.T) {
 	}
 }
 
-func TestRoute_LLMBudgetExhausted_ScoreAbove70(t *testing.T) {
+func TestRoute_LLMBudgetExhausted_MidScoreRejects(t *testing.T) {
 	eng := DefaultRoutingEngine()
 	result := eng.RouteCandidate(75, AmbiguityFlags{}, 5, 5)
 
-	if result.Route != RouteSkipLLM {
-		t.Errorf("expected SKIP_LLM when budget exhausted but score >= 70, got %s", result.Route)
+	if result.Route != RouteRejectPreLLM {
+		t.Errorf("expected REJECT_PRE_LLM when budget exhausted with score 75 (< 85), got %s", result.Route)
+	}
+	if result.Reason != "LLM budget exhausted" {
+		t.Errorf("expected reason 'LLM budget exhausted', got %q", result.Reason)
 	}
 }
 
-func TestRoute_LLMBudgetExhausted_ScoreBelow70(t *testing.T) {
+func TestRoute_LLMBudgetExhausted_ScoreBelowMinStillRejects(t *testing.T) {
 	eng := DefaultRoutingEngine()
 	result := eng.RouteCandidate(60, AmbiguityFlags{}, 5, 5)
 
 	if result.Route != RouteRejectPreLLM {
-		t.Errorf("expected REJECT_PRE_LLM when budget exhausted and score < 70, got %s", result.Route)
+		t.Errorf("expected REJECT_PRE_LLM when budget exhausted and score 60, got %s", result.Route)
+	}
+}
+
+func TestRoute_LLMBudgetExhausted_HighScoreStillSkips(t *testing.T) {
+	eng := DefaultRoutingEngine()
+	result := eng.RouteCandidate(90, AmbiguityFlags{}, 5, 5)
+
+	if result.Route != RouteSkipLLM {
+		t.Errorf("expected SKIP_LLM for score 90 even when budget exhausted, got %s", result.Route)
+	}
+}
+
+func TestRoute_ZeroMaxLLM_Unlimited(t *testing.T) {
+	eng := DefaultRoutingEngine()
+	// 6 candidates with score 72, maxLLMPerCycle=0 means unlimited
+	for i := 0; i < 6; i++ {
+		result := eng.RouteCandidate(72, AmbiguityFlags{}, i, 0)
+		if result.Route != RouteLLMVeto {
+			t.Errorf("candidate %d: expected LLM_VETO with 0 cap (unlimited), got %s", i, result.Route)
+		}
 	}
 }
 
@@ -185,8 +219,8 @@ func TestCountFlags_All(t *testing.T) {
 	f := AmbiguityFlags{
 		NearResistance:               true,
 		NearSupport:                  true,
-		BTCNearResistance:             true,
-		BTCNearSupport:                true,
+		BTCNearResistance:            true,
+		BTCNearSupport:               true,
 		TargetOutperformingShortTerm: true,
 		MixedTimeframeTrend:          true,
 		VolumeNotStrong:              true,

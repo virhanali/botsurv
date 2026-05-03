@@ -158,6 +158,60 @@ func TestValidateCandleBatch_RequireClosedLatestStripsInProgress(t *testing.T) {
 	}
 }
 
+func TestValidateCandleBatch_RequireClosedLatest_249Plus1Fails(t *testing.T) {
+	v := NewValidator(app.DataValidationConfig{
+		MinCandles:        250,
+		MaxDataAgeSeconds: map[string]int{"15m": 180},
+	})
+	start := time.Now().Add(-70 * time.Hour).Truncate(time.Minute)
+	// 249 closed + 1 in-progress = 250 total
+	candles := makeCandles("BTCUSDT", "15m", 250, start, true)
+	candles[len(candles)-1].Confirmed = false
+	now := time.UnixMilli(candles[len(candles)-2].OpenTime).Add(16 * time.Minute)
+
+	_, err := v.ValidateCandleBatch(CandleValidationInput{
+		Symbol:              "BTCUSDT",
+		Timeframe:           "15m",
+		Candles:             candles,
+		MinRequired:         250,
+		RequireClosedLatest: true,
+		Now:                 now,
+	})
+	if err == nil {
+		t.Fatal("expected validation error: 249 closed < 250 minRequired")
+	}
+}
+
+func TestValidateCandleBatch_RequireClosedLatest_250Plus1Passes(t *testing.T) {
+	v := NewValidator(app.DataValidationConfig{
+		MinCandles:        250,
+		MaxDataAgeSeconds: map[string]int{"15m": 180},
+	})
+	start := time.Now().Add(-70 * time.Hour).Truncate(time.Minute)
+	// 250 closed + 1 in-progress = 251 total
+	candles := makeCandles("BTCUSDT", "15m", 251, start, true)
+	candles[len(candles)-1].Confirmed = false
+	now := time.UnixMilli(candles[len(candles)-2].OpenTime).Add(16 * time.Minute)
+
+	result, err := v.ValidateCandleBatch(CandleValidationInput{
+		Symbol:              "BTCUSDT",
+		Timeframe:           "15m",
+		Candles:             candles,
+		MinRequired:         250,
+		RequireClosedLatest: true,
+		Now:                 now,
+	})
+	if err != nil {
+		t.Fatalf("expected success: 250 closed >= 250 minRequired: %v", err)
+	}
+	if len(result.ClosedCandles) != 250 {
+		t.Fatalf("expected 250 closed candles, got %d", len(result.ClosedCandles))
+	}
+	if len(result.Candles) != 250 {
+		t.Fatalf("expected 250 candles after stripping, got %d", len(result.Candles))
+	}
+}
+
 func makeCandles(symbol, timeframe string, n int, start time.Time, confirmed bool) []domain.Candle {
 	step := 15 * time.Minute
 	if timeframe == "1H" {

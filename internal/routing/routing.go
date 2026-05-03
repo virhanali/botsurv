@@ -12,42 +12,42 @@ import (
 
 // AmbiguityFlags describe why a candidate is considered ambiguous.
 type AmbiguityFlags struct {
-	NearResistance                bool `json:"near_resistance"`
-	NearSupport                   bool `json:"near_support"`
-	BTCNearResistance             bool `json:"btc_near_resistance"`
-	BTCNearSupport                bool `json:"btc_near_support"`
-	TargetOutperformingShortTerm  bool `json:"target_outperforming_short_term_only"`
-	MixedTimeframeTrend           bool `json:"mixed_timeframe"`
-	VolumeNotStrong               bool `json:"volume_not_strong"`
-	Overextended                  bool `json:"overextended"`
-	MarketRegimeMixed             bool `json:"market_regime_mixed"`
-	EntryChasing                  bool `json:"entry_chasing_risk"`
-	RSMismatchShortTerm           bool `json:"rs_mismatch_short_term"`
+	NearResistance               bool `json:"near_resistance"`
+	NearSupport                  bool `json:"near_support"`
+	BTCNearResistance            bool `json:"btc_near_resistance"`
+	BTCNearSupport               bool `json:"btc_near_support"`
+	TargetOutperformingShortTerm bool `json:"target_outperforming_short_term_only"`
+	MixedTimeframeTrend          bool `json:"mixed_timeframe"`
+	VolumeNotStrong              bool `json:"volume_not_strong"`
+	Overextended                 bool `json:"overextended"`
+	MarketRegimeMixed            bool `json:"market_regime_mixed"`
+	EntryChasing                 bool `json:"entry_chasing_risk"`
+	RSMismatchShortTerm          bool `json:"rs_mismatch_short_term"`
 }
 
 // Route describes what to do with a candidate.
 type Route string
 
 const (
-	RouteRejectPreLLM   Route = "REJECT_PRE_LLM"
-	RouteLLMVeto        Route = "LLM_VETO_REQUIRED"
-	RouteSkipLLM        Route = "SKIP_LLM_HIGH_SCORE"
+	RouteRejectPreLLM Route = "REJECT_PRE_LLM"
+	RouteLLMVeto      Route = "LLM_VETO_REQUIRED"
+	RouteSkipLLM      Route = "SKIP_LLM_HIGH_SCORE"
 )
 
 // RouteResult is the output of the routing engine.
 type RouteResult struct {
-	Route          Route          `json:"route"`
-	Flags          AmbiguityFlags `json:"flags"`
-	Score          float64        `json:"score"`
-	Reason         string         `json:"reason"`
-	FlagCount      int            `json:"flag_count"`
-	LLMCandidate   bool           `json:"llm_candidate"`
+	Route        Route          `json:"route"`
+	Flags        AmbiguityFlags `json:"flags"`
+	Score        float64        `json:"score"`
+	Reason       string         `json:"reason"`
+	FlagCount    int            `json:"flag_count"`
+	LLMCandidate bool           `json:"llm_candidate"`
 }
 
 // RoutingEngine decides LLM routing for a candidate.
 type RoutingEngine struct {
-	MinScoreLLM       float64
-	MinScoreSkipLLM   float64
+	MinScoreLLM         float64
+	MinScoreSkipLLM     float64
 	MaxLLMCallsPerCycle int
 }
 
@@ -138,6 +138,7 @@ func DetectAmbiguity(
 }
 
 // Route candidate determines what to do based on score + ambiguity flags.
+// maxLLMPerCycle <= 0 means unlimited per-cycle count.
 func (e *RoutingEngine) RouteCandidate(
 	score float64,
 	flags AmbiguityFlags,
@@ -145,6 +146,14 @@ func (e *RoutingEngine) RouteCandidate(
 	maxLLMPerCycle int,
 ) RouteResult {
 	flagCount := countFlags(flags)
+
+	if math.IsNaN(score) || math.IsInf(score, 0) {
+		return RouteResult{
+			Route:  RouteRejectPreLLM,
+			Score:  score,
+			Reason: "score is non-finite",
+		}
+	}
 
 	// Hard reject below minimum
 	if score < e.MinScoreLLM {
@@ -155,7 +164,7 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// High quality: skip LLM
+	// High quality: skip LLM (score >= 85)
 	if score >= e.MinScoreSkipLLM {
 		return RouteResult{
 			Route:        RouteSkipLLM,
@@ -167,12 +176,9 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// Ambiguous: send to LLM if budget available
-	callBudget := maxLLMPerCycle
-	if callBudget <= 0 {
-		callBudget = 5
-	}
-	if llmCallsThisCycle < callBudget {
+	// Score 58-84: send to LLM if budget available.
+	// maxLLMPerCycle <= 0 means unlimited.
+	if maxLLMPerCycle <= 0 || llmCallsThisCycle < maxLLMPerCycle {
 		return RouteResult{
 			Route:        RouteLLMVeto,
 			Flags:        flags,
@@ -183,22 +189,12 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// No budget — fall back to score-only decision
-	if score >= 70 {
-		return RouteResult{
-			Route:        RouteSkipLLM,
-			Flags:        flags,
-			Score:        score,
-			FlagCount:    flagCount,
-			Reason:       "LLM budget exhausted, score >= 70, allowing",
-			LLMCandidate: false,
-		}
-	}
+	// Positive maxLLMPerCycle exhausted: reject mid-range scores pre-LLM.
+	// RouteSkipLLM is only for score >= MinScoreSkipLLM (85).
 	return RouteResult{
 		Route:  RouteRejectPreLLM,
-		Flags:  flags,
 		Score:  score,
-		Reason: "LLM budget exhausted, score < 70, rejecting",
+		Reason: "LLM budget exhausted",
 	}
 }
 
@@ -217,16 +213,38 @@ func PrioritizeCandidates(candidates []RouteResult) {
 
 func countFlags(f AmbiguityFlags) int {
 	n := 0
-	if f.NearResistance { n++ }
-	if f.NearSupport { n++ }
-	if f.BTCNearResistance { n++ }
-	if f.BTCNearSupport { n++ }
-	if f.TargetOutperformingShortTerm { n++ }
-	if f.MixedTimeframeTrend { n++ }
-	if f.VolumeNotStrong { n++ }
-	if f.Overextended { n++ }
-	if f.MarketRegimeMixed { n++ }
-	if f.EntryChasing { n++ }
-	if f.RSMismatchShortTerm { n++ }
+	if f.NearResistance {
+		n++
+	}
+	if f.NearSupport {
+		n++
+	}
+	if f.BTCNearResistance {
+		n++
+	}
+	if f.BTCNearSupport {
+		n++
+	}
+	if f.TargetOutperformingShortTerm {
+		n++
+	}
+	if f.MixedTimeframeTrend {
+		n++
+	}
+	if f.VolumeNotStrong {
+		n++
+	}
+	if f.Overextended {
+		n++
+	}
+	if f.MarketRegimeMixed {
+		n++
+	}
+	if f.EntryChasing {
+		n++
+	}
+	if f.RSMismatchShortTerm {
+		n++
+	}
 	return n
 }

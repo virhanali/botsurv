@@ -28,16 +28,16 @@ import (
 
 // Scheduler orchestrates the full trading cycle.
 type Scheduler struct {
-	cfg        app.UserConfig
-	screener   *screener.Screener
-	llmClient  llm.Client
+	cfg         app.UserConfig
+	screener    *screener.Screener
+	llmClient   llm.Client
 	llmReviewer *llm.Reviewer
-	riskEng    *risk.Engine
-	executor   *executor.Executor
-	safetyEng  *execution.SafetyEngine
-	monitor    *monitor.Monitor
-	md         screener.MarketDataProvider
-	log        *logger.Logger
+	riskEng     *risk.Engine
+	executor    *executor.Executor
+	safetyEng   *execution.SafetyEngine
+	monitor     *monitor.Monitor
+	md          screener.MarketDataProvider
+	log         *logger.Logger
 
 	mu       sync.Mutex
 	running  bool
@@ -53,9 +53,9 @@ type Scheduler struct {
 	candidateRepo    db.CandidateRepository
 
 	// Phase 5
-	decisionLogRepo      db.DecisionLogRepository
-	outcomeRepo          db.CandidateOutcomeRepository
-	paperSim             *paperexec.Simulator
+	decisionLogRepo       db.DecisionLogRepository
+	outcomeRepo           db.CandidateOutcomeRepository
+	paperSim              *paperexec.Simulator
 	counterfactualTracker *shadow.CounterfactualTracker
 
 	// LLM daily call tracking. Persisted when llmUsageRepo is wired.
@@ -125,7 +125,9 @@ func (s *Scheduler) SetOutcomeRepo(repo db.CandidateOutcomeRepository) { s.outco
 func (s *Scheduler) SetPaperSimulator(sim *paperexec.Simulator) { s.paperSim = sim }
 
 // SetCounterfactualTracker sets the counterfactual tracker.
-func (s *Scheduler) SetCounterfactualTracker(t *shadow.CounterfactualTracker) { s.counterfactualTracker = t }
+func (s *Scheduler) SetCounterfactualTracker(t *shadow.CounterfactualTracker) {
+	s.counterfactualTracker = t
+}
 
 // CycleResult holds the outcome of a trading cycle.
 type CycleResult struct {
@@ -139,14 +141,14 @@ type CycleResult struct {
 	ReasonCodes []string
 
 	// Phase 3: per-cycle breakdown
-	RejectedPreLLM     int `json:"rejected_pre_llm"`
+	RejectedPreLLM      int `json:"rejected_pre_llm"`
 	LLMSkippedHighScore int `json:"llm_skipped_high_score"`
-	LLMVetoCalled     int `json:"llm_veto_called"`
-	LLMApprove        int `json:"llm_approve"`
-	LLMReject         int `json:"llm_reject"`
-	LLMReduceSize     int `json:"llm_reduce_size"`
-	RiskRejected      int `json:"risk_rejected"`
-	SafetyRejected    int `json:"safety_rejected"`
+	LLMVetoCalled       int `json:"llm_veto_called"`
+	LLMApprove          int `json:"llm_approve"`
+	LLMReject           int `json:"llm_reject"`
+	LLMReduceSize       int `json:"llm_reduce_size"`
+	RiskRejected        int `json:"risk_rejected"`
+	SafetyRejected      int `json:"safety_rejected"`
 }
 
 type SkipReason struct {
@@ -279,6 +281,22 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 	// 5. Snapshot broker state once for the entire cycle to avoid races
 	// between WS-driven position closures and scheduler state reads.
 	cycleMonitorStatus := s.monitor.Status(ctx)
+
+	// Paper mode: merge simulator open positions into cycle state so risk
+	// checks (duplicate symbol, max open positions, same direction, exposure)
+	// see paper trades opened by the simulator.
+	if s.mode.IsPaper() && s.paperSim != nil {
+		paperPositions, simErr := s.paperSim.GetOpenPositions(ctx)
+		if simErr != nil {
+			s.log.Error("paper simulator state unavailable", map[string]any{"error": simErr.Error()})
+			result.ReasonCodes = append(result.ReasonCodes, "PAPER_STATE_UNAVAILABLE")
+			result.EndedAt = time.Now()
+			return result, nil
+		}
+		if len(paperPositions) > 0 {
+			cycleMonitorStatus.OpenPositions = append(cycleMonitorStatus.OpenPositions, paperPositions...)
+		}
+	}
 
 	// 6. For each capped eligible candidate: LLM veto -> risk validation.
 	var approvedForPortfolio []riskCandidate
@@ -427,10 +445,10 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			result.RejectedPreLLM++
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "PRE_LLM_REJECTED:" + routeResult.Reason})
 			s.log.Info("candidate rejected before LLM", map[string]any{
-				"symbol":    cand.Symbol,
-				"score":     score,
-				"flags":     routeResult.FlagCount,
-				"reason":    routeResult.Reason,
+				"symbol": cand.Symbol,
+				"score":  score,
+				"flags":  routeResult.FlagCount,
+				"reason": routeResult.Reason,
 			})
 			continue
 
@@ -582,11 +600,11 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			case llm.ActionReject:
 				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_REVIEW_REJECTED"})
 				s.log.Info("candidate rejected by LLM reviewer", map[string]any{
-					"symbol":           cand.Symbol,
-					"review_action":    reviewOutcome.Action,
+					"symbol":            cand.Symbol,
+					"review_action":     reviewOutcome.Action,
 					"review_confidence": reviewOutcome.Confidence,
-					"review_quality":   reviewOutcome.SetupQuality,
-					"review_reason":    reviewOutcome.ReasonSummary,
+					"review_quality":    reviewOutcome.SetupQuality,
+					"review_reason":     reviewOutcome.ReasonSummary,
 				})
 				fields := buildBaseFields(screenResult, cand)
 				fields.WithLLMReview(reviewOutcome)
@@ -602,8 +620,8 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				})
 			case llm.ActionApproveRetestOnly:
 				s.log.Info("LLM reviewer forced retest-only entry", map[string]any{
-					"symbol":         cand.Symbol,
-					"review_reason":  reviewOutcome.ReasonSummary,
+					"symbol":        cand.Symbol,
+					"review_reason": reviewOutcome.ReasonSummary,
 				})
 			}
 		}
@@ -768,12 +786,12 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			result.Executions++
 			s.log.Info("paper mode: position opened", map[string]any{
-				"symbol":    cand.Symbol,
-				"side":      cand.Side,
-				"trade_id":  trade.PaperTradeID,
-				"entry":     trade.EntryPrice,
-				"sl":        trade.StopLoss,
-				"tp":        trade.TakeProfit,
+				"symbol":   cand.Symbol,
+				"side":     cand.Side,
+				"trade_id": trade.PaperTradeID,
+				"entry":    trade.EntryPrice,
+				"sl":       trade.StopLoss,
+				"tp":       trade.TakeProfit,
 			})
 		} else {
 			// Default: log plan (Phase 4 behavior)
@@ -781,9 +799,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			if execResult.Success {
 				result.Executions++
 				s.log.Info("order plan validated and logged", map[string]any{
-					"symbol":   cand.Symbol,
-					"side":     cand.Side,
-					"plan":     phase4Result.OrderPlan,
+					"symbol":    cand.Symbol,
+					"side":      cand.Side,
+					"plan":      phase4Result.OrderPlan,
 					"modifiers": phase4Result.ModifiersApplied,
 				})
 				dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, 0, "EXECUTED_SHADOW", "order plan logged (no simulator)")
@@ -814,20 +832,20 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 	result.ReasonCodes = append(result.ReasonCodes, "CYCLE_COMPLETE")
 
 	s.log.Info("cycle complete", map[string]any{
-		"cycle_id":    cycleID,
-		"duration_ms": result.EndedAt.Sub(result.StartedAt).Milliseconds(),
-		"candidates":  result.Candidates,
-		"llm_calls":   result.LLMCalls,
-		"executions":            result.Executions,
-		"skips":                 len(result.Skips),
-		"rejected_pre_llm":     result.RejectedPreLLM,
-		"llm_skipped_hiscore":  result.LLMSkippedHighScore,
-		"llm_veto_calls":       result.LLMVetoCalled,
-		"llm_approve":          result.LLMApprove,
-		"llm_reject":           result.LLMReject,
-		"llm_reduce_size":      result.LLMReduceSize,
-		"risk_rejected":        result.RiskRejected,
-		"safety_rejected":      result.SafetyRejected,
+		"cycle_id":            cycleID,
+		"duration_ms":         result.EndedAt.Sub(result.StartedAt).Milliseconds(),
+		"candidates":          result.Candidates,
+		"llm_calls":           result.LLMCalls,
+		"executions":          result.Executions,
+		"skips":               len(result.Skips),
+		"rejected_pre_llm":    result.RejectedPreLLM,
+		"llm_skipped_hiscore": result.LLMSkippedHighScore,
+		"llm_veto_calls":      result.LLMVetoCalled,
+		"llm_approve":         result.LLMApprove,
+		"llm_reject":          result.LLMReject,
+		"llm_reduce_size":     result.LLMReduceSize,
+		"risk_rejected":       result.RiskRejected,
+		"safety_rejected":     result.SafetyRejected,
 	})
 
 	return result, nil
@@ -940,6 +958,9 @@ func (s *Scheduler) checkDailyReset() {
 	}
 	s.lastDailyResetDay = today
 	s.monitor.ResetDaily()
+	if s.llmReviewer != nil && s.llmReviewer.IsEnabled() {
+		s.llmReviewer.ResetDailyCost()
+	}
 	s.log.Info("daily reset triggered", map[string]any{"date": today})
 }
 
@@ -1250,10 +1271,10 @@ func buildBaseFields(sr *screener.ScreenResult, cand domain.Candidate) *Decision
 
 func buildTradeCandidateFromDomain(c domain.Candidate) strategy.TradeCandidate {
 	return strategy.TradeCandidate{
-		Symbol:            c.Symbol,
-		Side:              c.Side,
-		EntryPrice:        c.ProposedEntry,
-		StopLoss:          c.ProposedStopLoss,
+		Symbol:     c.Symbol,
+		Side:       c.Side,
+		EntryPrice: c.ProposedEntry,
+		StopLoss:   c.ProposedStopLoss,
 	}
 }
 

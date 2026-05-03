@@ -3,30 +3,47 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/virhan/botsurv/internal/domain"
 )
 
 // BuildVetoContext creates a compact structured JSON for LLM veto request.
+// Uses encoding/json to produce valid JSON for quoted/special string inputs.
 func BuildVetoContext(req VetoRequestInput) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf(`{"schema_version":"2.1","request_id":"%s","candidate_id":"%s","symbol":"%s","side":"%s","strategy":"%s",`, req.RequestID, req.CandidateID, req.Symbol, req.Side, req.Strategy))
-	b.WriteString(fmt.Sprintf(`"entry_price":%.4f,"stop_loss":%.4f,`, req.EntryPrice, req.StopLoss))
-	if req.TakeProfit > 0 {
-		b.WriteString(fmt.Sprintf(`"take_profit":%.4f,`, req.TakeProfit))
+	m := map[string]interface{}{
+		"schema_version": "2.1",
+		"request_id":     req.RequestID,
+		"candidate_id":   req.CandidateID,
+		"symbol":         req.Symbol,
+		"side":           req.Side,
+		"strategy":       req.Strategy,
+		"entry_price":    req.EntryPrice,
+		"stop_loss":      req.StopLoss,
+		"rr":             req.RR,
+		"score":          req.Score,
+		"setup_quality":  req.SetupQuality,
+		"regime":         req.Regime,
+		"btc_trend":      req.BTCTrend,
+		"btcd_trend":     req.BTCDTrend,
+		"rs_1h":          req.RS1h,
+		"rs_4h":          req.RS4h,
+		"volume_ratio":   req.VolumeRatio,
+		"atr_pct":        req.ATRPct,
 	}
-	b.WriteString(fmt.Sprintf(`"rr":%.2f,"score":%.1f,"setup_quality":%.1f,"regime":"%s",`, req.RR, req.Score, req.SetupQuality, req.Regime))
-	b.WriteString(fmt.Sprintf(`"btc_trend":"%s","btcd_trend":"%s","rs_1h":%.1f,"rs_4h":%.1f,"volume_ratio":%.2f,"atr_pct":%.2f`, req.BTCTrend, req.BTCDTrend, req.RS1h, req.RS4h, req.VolumeRatio, req.ATRPct))
-
+	if req.TakeProfit > 0 {
+		m["take_profit"] = req.TakeProfit
+	}
 	if len(req.Warnings) > 0 {
-		b.WriteString(fmt.Sprintf(`,"warnings":["%s"]`, strings.Join(req.Warnings, `","`)))
+		m["warnings"] = req.Warnings
 	}
 	if len(req.AmbiguityFlags) > 0 {
-		b.WriteString(fmt.Sprintf(`,"ambiguity_flags":["%s"]`, strings.Join(req.AmbiguityFlags, `","`)))
+		m["ambiguity_flags"] = req.AmbiguityFlags
 	}
-	b.WriteString("}")
-	return b.String()
+	data, err := json.Marshal(m)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
 }
 
 // VetoRequestInput holds the data to build a veto context.
@@ -37,7 +54,7 @@ type VetoRequestInput struct {
 	Side           string
 	Strategy       string
 	EntryPrice     float64
-	StopLoss      float64
+	StopLoss       float64
 	TakeProfit     float64
 	RR             float64
 	Score          float64
@@ -53,6 +70,9 @@ type VetoRequestInput struct {
 	AmbiguityFlags []string
 }
 
+// validSizeMultipliers is the set of allowed size_multiplier values.
+var validSizeMultipliers = map[float64]bool{1.0: true, 0.75: true, 0.5: true, 0.25: true, 0.0: true}
+
 // ParseVetoResponse parses raw LLM JSON and validates it.
 // Returns a domain.LLMDecision suitable for the risk engine.
 func ParseVetoResponse(rawJSON string) (domain.LLMDecision, error) {
@@ -67,7 +87,37 @@ func ParseVetoResponse(rawJSON string) (domain.LLMDecision, error) {
 			RawResponse:      rawJSON,
 		}, fmt.Errorf("parse veto response: %w", err)
 	}
-	return resp.ApplyToDecision(), nil
+
+	d := resp.ApplyToDecision()
+
+	// Confidence >= 0.6 required
+	if d.Confidence < 0.6 {
+		return domain.LLMDecision{
+			Decision:         "BLOCK",
+			Confidence:       d.Confidence,
+			SizeMultiplier:   0,
+			ReasonCodes:      []string{"LOW_CONFIDENCE"},
+			ValidationStatus: "low_confidence",
+			RawResponse:      rawJSON,
+		}, fmt.Errorf("parse veto response: confidence %.2f below minimum 0.6", d.Confidence)
+	}
+
+	// Size multiplier must be exactly one of the allowed values
+	if d.Decision != "BLOCK" && !validSizeMultipliers[d.SizeMultiplier] {
+		return domain.LLMDecision{
+			Decision:         "BLOCK",
+			Confidence:       0,
+			SizeMultiplier:   0,
+			ReasonCodes:      []string{"INVALID_SIZE_MULTIPLIER"},
+			ValidationStatus: "invalid_multiplier",
+			RawResponse:      rawJSON,
+		}, fmt.Errorf("parse veto response: invalid size_multiplier %.2f", d.SizeMultiplier)
+	}
+
+	// Store raw response on success
+	d.RawResponse = rawJSON
+	d.ValidationStatus = "valid"
+	return d, nil
 }
 
 func parseVetoJSON(raw string) (*ReviewResponse, error) {

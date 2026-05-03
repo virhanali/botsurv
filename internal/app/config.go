@@ -14,25 +14,26 @@ import (
 
 // UserConfig is the top-level application configuration.
 type UserConfig struct {
-	App             AppConfig             `yaml:"app"`
-	Database        DatabaseConfig        `yaml:"database"`
-	MarketData      MarketDataConfig      `yaml:"market_data"`
-	DataValidation  DataValidationConfig  `yaml:"data_validation"`
-	HardBlocks      HardBlocksConfig      `yaml:"hard_blocks"`
-	IndicatorEngine IndicatorEngineConfig `yaml:"indicator_engine"`
-	MarketRegime    MarketRegimeConfig    `yaml:"market_regime"`
-	Scoring         ScoringConfig         `yaml:"scoring"`
-	Broker          BrokerConfig          `yaml:"broker"`
-	Universe        UniverseConfig        `yaml:"universe"`
-	Strategy        StrategyConfig        `yaml:"strategy"`
-	LLMRouting      LLMRoutingConfig      `yaml:"llm_routing"`
-	LLM             LLMConfig             `yaml:"llm"`
-	LLMReview       LLMReviewConfig       `yaml:"llm_review"`
-	PortfolioRisk   PortfolioRiskConfig   `yaml:"portfolio_risk"`
-	Sizing          SizingConfig          `yaml:"sizing"`
-	Risk            RiskConfig            `yaml:"risk"`
-	Alerts          AlertsConfig          `yaml:"alerts"`
-	Backtest        BacktestConfig        `yaml:"backtest"`
+	App              AppConfig              `yaml:"app"`
+	Database         DatabaseConfig         `yaml:"database"`
+	MarketData       MarketDataConfig       `yaml:"market_data"`
+	DataValidation   DataValidationConfig   `yaml:"data_validation"`
+	HardBlocks       HardBlocksConfig       `yaml:"hard_blocks"`
+	IndicatorEngine  IndicatorEngineConfig  `yaml:"indicator_engine"`
+	MarketRegime     MarketRegimeConfig     `yaml:"market_regime"`
+	Scoring          ScoringConfig          `yaml:"scoring"`
+	Broker           BrokerConfig           `yaml:"broker"`
+	Universe         UniverseConfig         `yaml:"universe"`
+	Strategy         StrategyConfig         `yaml:"strategy"`
+	LLMRouting       LLMRoutingConfig       `yaml:"llm_routing"`
+	LLM              LLMConfig              `yaml:"llm"`
+	LLMReview        LLMReviewConfig        `yaml:"llm_review"`
+	PortfolioRisk    PortfolioRiskConfig    `yaml:"portfolio_risk"`
+	Sizing           SizingConfig           `yaml:"sizing"`
+	Risk             RiskConfig             `yaml:"risk"`
+	Alerts           AlertsConfig           `yaml:"alerts"`
+	Backtest         BacktestConfig         `yaml:"backtest"`
+	WatchlistContext WatchlistContextConfig `yaml:"watchlist_context"`
 }
 
 // AppConfig contains application-level settings.
@@ -258,16 +259,16 @@ type LLMBudgetConfig struct {
 
 // LLMReviewConfig controls the LLM Reviewer (Phase 6) layer.
 type LLMReviewConfig struct {
-	Mode             string  `yaml:"mode"`
-	Provider         string  `yaml:"provider"`
-	Model            string  `yaml:"model"`
-	BaseURL          string  `yaml:"base_url"`
-	TimeoutSeconds   int     `yaml:"timeout_seconds"`
-	MaxInputTokens   int     `yaml:"max_input_tokens"`
-	MaxOutputTokens  int     `yaml:"max_output_tokens"`
-	DailyCostCapUSD  float64 `yaml:"daily_cost_cap_usd"`
-	PromptVersion    string  `yaml:"prompt_version"`
-	LogRawResponses  bool    `yaml:"log_raw_responses"`
+	Mode            string  `yaml:"mode"`
+	Provider        string  `yaml:"provider"`
+	Model           string  `yaml:"model"`
+	BaseURL         string  `yaml:"base_url"`
+	TimeoutSeconds  int     `yaml:"timeout_seconds"`
+	MaxInputTokens  int     `yaml:"max_input_tokens"`
+	MaxOutputTokens int     `yaml:"max_output_tokens"`
+	DailyCostCapUSD float64 `yaml:"daily_cost_cap_usd"`
+	PromptVersion   string  `yaml:"prompt_version"`
+	LogRawResponses bool    `yaml:"log_raw_responses"`
 }
 
 // PortfolioRiskConfig contains portfolio-level risk limits.
@@ -342,6 +343,33 @@ type BacktestConfig struct {
 	DefaultFrom string `yaml:"default_from"`
 	DefaultTo   string `yaml:"default_to"`
 	LLMMode     string `yaml:"llm_mode"`
+}
+
+// WatchlistContextConfig controls the optional watchlist context / Fibonacci confluence layer.
+type WatchlistContextConfig struct {
+	Enabled   bool            `yaml:"enabled"`
+	Fibonacci FibonacciConfig `yaml:"fibonacci"`
+	Narrative NarrativeConfig `yaml:"narrative"`
+	Marketcap MarketcapConfig `yaml:"marketcap"`
+}
+
+// FibonacciConfig controls Fibonacci retracement context behavior.
+type FibonacciConfig struct {
+	Enabled          bool    `yaml:"enabled"`
+	LookbackCandles  int     `yaml:"lookback_candles"`
+	ZoneTolerancePct float64 `yaml:"zone_tolerance_pct"`
+	ScoringWeight    float64 `yaml:"scoring_weight"`
+}
+
+// NarrativeConfig controls narrative sector mapping.
+type NarrativeConfig struct {
+	ActiveSectors []string          `yaml:"active_sectors"`
+	SymbolSectors map[string]string `yaml:"symbol_sectors"`
+}
+
+// MarketcapConfig controls marketcap class mapping.
+type MarketcapConfig struct {
+	SymbolClasses map[string]string `yaml:"symbol_classes"`
 }
 
 var envVarRegex = regexp.MustCompile(`\$\{([^}]+)\}`)
@@ -453,6 +481,9 @@ func (c *UserConfig) Validate() error {
 	}
 	if err := c.Backtest.validate(); err != nil {
 		return err
+	}
+	if err := c.WatchlistContext.Validate(); err != nil {
+		return fmt.Errorf("watchlist_context: %w", err)
 	}
 	return nil
 }
@@ -1106,4 +1137,37 @@ func (c ScoringThresholdConfig) withDefaults(allowMarket, allowRetest, reduce fl
 		out.ReduceSize = reduce
 	}
 	return out
+}
+
+// Validate checks watchlist context config.
+func (c *WatchlistContextConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Fibonacci.Enabled {
+		if c.Fibonacci.LookbackCandles <= 0 {
+			return errors.New("fibonacci.lookback_candles must be > 0 when enabled")
+		}
+		if c.Fibonacci.ZoneTolerancePct < 0 {
+			return errors.New("fibonacci.zone_tolerance_pct must be >= 0")
+		}
+		if c.Fibonacci.ScoringWeight < 0 || c.Fibonacci.ScoringWeight > 5 {
+			return errors.New("fibonacci.scoring_weight must be between 0 and 5")
+		}
+	}
+	return nil
+}
+
+// WithDefaults returns watchlist context config with defaults applied.
+func (c WatchlistContextConfig) WithDefaults() WatchlistContextConfig {
+	if c.Fibonacci.LookbackCandles <= 0 {
+		c.Fibonacci.LookbackCandles = 80
+	}
+	if c.Fibonacci.ZoneTolerancePct <= 0 {
+		c.Fibonacci.ZoneTolerancePct = 1.0
+	}
+	if c.Fibonacci.ScoringWeight <= 0 {
+		c.Fibonacci.ScoringWeight = 2.0
+	}
+	return c
 }
