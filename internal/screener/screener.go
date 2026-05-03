@@ -247,7 +247,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	minIndicatorCandles := maxInt(s.cfg.DataValidation.MinCandlesOrDefault(), 250)
 	minIndicatorCandles = maxInt(minIndicatorCandles, s.cfg.IndicatorEngine.WithDefaults().EMA200Period+50)
 
-	setupCandlesRaw, err := s.md.GetCandles(ctx, sym.Symbol, setupTF, minIndicatorCandles)
+	setupCandlesRaw, err := s.md.GetCandles(ctx, sym.Symbol, setupTF, closedCandleRawLimit(minIndicatorCandles))
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get %s candles: %w", setupTF, err)
 	}
@@ -263,7 +263,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("setup candle validation failed: %w", err)
 	}
 
-	context1hRaw, err := s.md.GetCandles(ctx, sym.Symbol, contextTF, minIndicatorCandles)
+	context1hRaw, err := s.md.GetCandles(ctx, sym.Symbol, contextTF, closedCandleRawLimit(minIndicatorCandles))
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get %s candles: %w", contextTF, err)
 	}
@@ -279,7 +279,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("context candle validation failed: %w", err)
 	}
 
-	context4hRaw, err := s.md.GetCandles(ctx, sym.Symbol, "4H", minIndicatorCandles)
+	context4hRaw, err := s.md.GetCandles(ctx, sym.Symbol, "4H", closedCandleRawLimit(minIndicatorCandles))
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get 4H candles: %w", err)
 	}
@@ -330,7 +330,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	})
 
 	// Regime snapshot strict placement: compute before strategy generation.
-	btc5mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", 3)
+	btc5mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", closedCandleRawLimit(2))
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 5m candles: %w", err)
 	}
@@ -345,7 +345,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 5m candles: %w", err)
 	}
-	btc15mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "15m", 3)
+	btc15mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "15m", closedCandleRawLimit(2))
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 15m candles: %w", err)
 	}
@@ -360,7 +360,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 15m candles: %w", err)
 	}
-	btc1hRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "1H", minIndicatorCandles)
+	btc1hRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "1H", closedCandleRawLimit(minIndicatorCandles))
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 1H candles: %w", err)
 	}
@@ -375,7 +375,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 1H candles: %w", err)
 	}
-	btc4hRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "4H", minIndicatorCandles)
+	btc4hRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "4H", closedCandleRawLimit(minIndicatorCandles))
 	if err != nil {
 		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 4H candles: %w", err)
 	}
@@ -404,7 +404,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	var btcd1hSnap *indicator.IndicatorSnapshot
 	var btcd4hSnap *indicator.IndicatorSnapshot
 
-	if raw, e := s.md.GetCandles(ctx, "BTCD", "1H", 6); e == nil {
+	if raw, e := s.md.GetCandles(ctx, "BTCD", "1H", closedCandleRawLimit(2)); e == nil {
 		if vr, vErr := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
 			Symbol:              "BTCD",
 			Timeframe:           "1H",
@@ -416,7 +416,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 			btcd1hCandles = vr.Candles
 		}
 	}
-	if raw, e := s.md.GetCandles(ctx, "BTCD", "1H", minIndicatorCandles); e == nil {
+	if raw, e := s.md.GetCandles(ctx, "BTCD", "1H", closedCandleRawLimit(minIndicatorCandles)); e == nil {
 		if vr, vErr := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
 			Symbol:              "BTCD",
 			Timeframe:           "1H",
@@ -430,7 +430,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 			}
 		}
 	}
-	if raw, e := s.md.GetCandles(ctx, "BTCD", "4H", minIndicatorCandles); e == nil {
+	if raw, e := s.md.GetCandles(ctx, "BTCD", "4H", closedCandleRawLimit(minIndicatorCandles)); e == nil {
 		if vr, vErr := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
 			Symbol:              "BTCD",
 			Timeframe:           "4H",
@@ -809,6 +809,18 @@ func (s *Screener) buildWatchlistContext(ctx context.Context, cand domain.Candid
 		cfg,
 	)
 	return wc
+}
+
+// closedCandleRawLimit returns the raw candle count to request when downstream
+// validation requires minRequired closed candles. Market data caches commonly
+// include the current in-progress candle as the latest item; requesting one
+// extra prevents a valid 250-closed-candle cache from turning into 249 after
+// the validator strips the in-progress candle.
+func closedCandleRawLimit(minRequired int) int {
+	if minRequired <= 0 {
+		return 0
+	}
+	return minRequired + 1
 }
 
 // sanitizeContext replaces NaN and +/-Inf float64 values with 0

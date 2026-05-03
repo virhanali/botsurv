@@ -29,6 +29,18 @@ func TestComputeScores_HighQuality(t *testing.T) {
 	}
 }
 
+func TestClosedCandleRawLimit_RequestsExtraForInProgressLatest(t *testing.T) {
+	if got := closedCandleRawLimit(250); got != 251 {
+		t.Fatalf("expected 251 raw candles for 250 closed requirement, got %d", got)
+	}
+	if got := closedCandleRawLimit(2); got != 3 {
+		t.Fatalf("expected 3 raw candles for 2 closed requirement, got %d", got)
+	}
+	if got := closedCandleRawLimit(0); got != 0 {
+		t.Fatalf("expected 0 for non-positive requirement, got %d", got)
+	}
+}
+
 func TestComputeScores_LowQuality(t *testing.T) {
 	ob := domain.OrderBookSummary{
 		SpreadBps:            100,

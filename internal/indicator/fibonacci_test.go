@@ -36,7 +36,10 @@ func buildFibonacciRange(swingLow, swingHigh, pullbackPrice float64, lookback in
 	}
 	// Second half: drift toward pullbackPrice
 	for i := mid; i < n; i++ {
-		t := float64(i-mid) / float64(n-mid)
+		t := 1.0
+		if n-mid > 1 {
+			t = float64(i-mid) / float64(n-mid-1)
+		}
 		price := swingHigh - (swingHigh-pullbackPrice)*t
 		candles[i] = newTestCandle(price, price, price, price)
 		candles[i].OpenTime = int64(i * 60000)
@@ -50,9 +53,9 @@ func buildFibonacciRange(swingLow, swingHigh, pullbackPrice float64, lookback in
 }
 
 func TestFibonacci_LONG_PullbackNear0618(t *testing.T) {
-	candles := buildFibonacciRange(100, 200, 161.8, 80)
-	candles[len(candles)-1] = newTestCandle(138.2, 138.2, 138.2, 138.2)
-	candles[len(candles)-1].OpenTime = int64((len(candles) - 1) * 60000)
+	// swingLow=100, swingHigh=200, range=100
+	// fib_0_618 = swingHigh - range*0.618 = 200 - 61.8 = 138.2
+	candles := buildFibonacciRange(100, 200, 138.2, 80)
 	fib := ComputeFibonacciContext(candles, domain.SideLong, 80, 1.0)
 
 	if !fib.Valid {
@@ -73,6 +76,8 @@ func TestFibonacci_LONG_PullbackNear0618(t *testing.T) {
 }
 
 func TestFibonacci_SHORT_PullbackNear0618(t *testing.T) {
+	// swingLow=100, swingHigh=200, range=100
+	// For SHORT: fib_0_618 = swingLow + range*0.618 = 100 + 61.8 = 161.8
 	candles2 := buildFibonacciRange(100, 200, 161.8, 80)
 	fib := ComputeFibonacciContext(candles2, domain.SideShort, 80, 1.0)
 
@@ -145,11 +150,13 @@ func TestFibonacci_InvalidCandles_ReturnsInvalid(t *testing.T) {
 }
 
 func TestFibonacci_DistanceCalculation(t *testing.T) {
-	// price exactly at 0.5 level -> distance should be 0
-	candles := make([]domain.Candle, 100)
+	// Use exactly lookback candles so the window covers all candles.
+	// swingLow=100 at index 0, swingHigh=200 at mid=40, then price drops to fib_0_5=150 at last candle.
+	lookback := 80
+	candles := make([]domain.Candle, lookback)
 	swingLow := 100.0
 	swingHigh := 200.0
-	mid := 50
+	mid := 40
 	for i := 0; i < mid; i++ {
 		t := float64(i) / float64(mid)
 		price := swingLow + (swingHigh-swingLow)*t
@@ -161,12 +168,12 @@ func TestFibonacci_DistanceCalculation(t *testing.T) {
 	candles[mid-1].High = swingHigh
 	candles[mid-1].Low = swingHigh
 	// Set remaining candles exactly at 0.5 level = 150
-	for i := mid; i < 100; i++ {
+	for i := mid; i < lookback; i++ {
 		candles[i] = newTestCandle(150, 150, 150, 150)
 		candles[i].OpenTime = int64(i * 60000)
 	}
 
-	fib := ComputeFibonacciContext(candles, domain.SideLong, 100, 1.0)
+	fib := ComputeFibonacciContext(candles, domain.SideLong, lookback, 1.0)
 
 	if !fib.Valid {
 		t.Fatalf("expected valid, got %v", fib.ReasonCodes)
@@ -180,14 +187,7 @@ func TestFibonacci_DistanceCalculation(t *testing.T) {
 }
 
 func TestFibonacci_AbovePullbackZone(t *testing.T) {
-	swingLow := 100.0
-	swingHigh := 200.0
-	// price above 0.5 = 150 -> should be above_pullback_zone
-	candles := buildFibonacciRange(swingLow, swingHigh, 155, 80)
-	// Override last candle close to be above fib_0_5
-	candles[len(candles)-1] = newTestCandle(180, 181, 179, 180)
-	candles[len(candles)-1].OpenTime = int64((len(candles) - 1) * 60000)
-
+	candles := buildFibonacciRange(100, 200, 180, 80)
 	fib := ComputeFibonacciContext(candles, domain.SideLong, 80, 1.0)
 
 	if !fib.Valid {
