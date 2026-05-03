@@ -18,6 +18,7 @@ func TestValidateCandleBatch_InvalidOHLCV(t *testing.T) {
 		{"inf", func(cs []domain.Candle) { cs[0].High = math.Inf(1) }},
 		{"negative", func(cs []domain.Candle) { cs[0].Low = -1 }},
 		{"zero", func(cs []domain.Candle) { cs[0].Close = 0 }},
+		{"negative_volume", func(cs []domain.Candle) { cs[0].Volume = -1 }},
 	}
 
 	v := NewValidator(app.DataValidationConfig{MinCandles: 5, MaxDataAgeSeconds: map[string]int{"15m": 180}})
@@ -35,6 +36,26 @@ func TestValidateCandleBatch_InvalidOHLCV(t *testing.T) {
 				t.Fatalf("expected validation error for %s", tt.name)
 			}
 		})
+	}
+}
+
+func TestValidateCandleBatch_AllowsZeroVolumeCandle(t *testing.T) {
+	v := NewValidator(app.DataValidationConfig{
+		MinCandles:        5,
+		MaxDataAgeSeconds: map[string]int{"15m": 180},
+	})
+	start := time.Now().Add(-75 * time.Minute).Truncate(time.Minute)
+	candles := makeCandles("BTCUSDT", "15m", 5, start, true)
+	candles[2].Volume = 0
+	now := time.UnixMilli(candles[len(candles)-1].OpenTime).Add(16 * time.Minute)
+
+	if _, err := v.ValidateCandleBatch(CandleValidationInput{
+		Symbol:    "BTCUSDT",
+		Timeframe: "15m",
+		Candles:   candles,
+		Now:       now,
+	}); err != nil {
+		t.Fatalf("expected zero-volume candle to remain valid market data, got %v", err)
 	}
 }
 

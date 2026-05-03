@@ -125,13 +125,17 @@ func (v *Validator) ValidateCandleBatch(in CandleValidationInput) (CandleValidat
 }
 
 func invalidOHLCV(c domain.Candle) bool {
-	return invalidValue(c.Open) ||
-		invalidValue(c.High) ||
-		invalidValue(c.Low) ||
-		invalidValue(c.Close) ||
-		invalidValue(c.Volume)
+	return invalidPositiveValue(c.Open) ||
+		invalidPositiveValue(c.High) ||
+		invalidPositiveValue(c.Low) ||
+		invalidPositiveValue(c.Close) ||
+		invalidNonNegativeValue(c.Volume)
 }
 
-func invalidValue(v float64) bool {
+func invalidPositiveValue(v float64) bool {
 	return math.IsNaN(v) || math.IsInf(v, 0) || v <= 0
+}
+
+func invalidNonNegativeValue(v float64) bool {
+	return math.IsNaN(v) || math.IsInf(v, 0) || v < 0
 }
