@@ -380,36 +380,44 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		"indicator_snapshot": setupSnap,
 	})
 
-	// Regime snapshot strict placement: compute before strategy generation.
+	// Regime snapshot: BTC 5m/15m used for flash-crash detection. If stale/unavailable,
+	// pass empty slice — the regime filter handles it gracefully (Triggered=false).
+	btc5m := marketdata.CandleValidationResult{}
 	btc5mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", closedCandleRawLimit(2))
-	if err != nil {
-		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 5m candles: %w", err)
+	if err == nil {
+		if vr, ve := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+			Symbol:              "BTCUSDT",
+			Timeframe:           "5m",
+			Candles:             btc5mRaw,
+			MinRequired:         2,
+			MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("5m"),
+			RequireClosedLatest: true,
+		}); ve == nil {
+			btc5m = vr
+		} else {
+			s.log.Warn("btc 5m validation skipped", map[string]any{"error": ve.Error()})
+		}
+	} else {
+		s.log.Warn("btc 5m fetch skipped", map[string]any{"error": err.Error()})
 	}
-	btc5m, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
-		Symbol:              "BTCUSDT",
-		Timeframe:           "5m",
-		Candles:             btc5mRaw,
-		MinRequired:         2,
-		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("5m"),
-		RequireClosedLatest: true,
-	})
-	if err != nil {
-		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 5m candles: %w", err)
-	}
+
+	btc15m := marketdata.CandleValidationResult{}
 	btc15mRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "15m", closedCandleRawLimit(2))
-	if err != nil {
-		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("get btc 15m candles: %w", err)
-	}
-	btc15m, err := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
-		Symbol:              "BTCUSDT",
-		Timeframe:           "15m",
-		Candles:             btc15mRaw,
-		MinRequired:         2,
-		MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("15m"),
-		RequireClosedLatest: true,
-	})
-	if err != nil {
-		return domain.Candidate{}, strategy.TradeCandidate{}, scoring.ScoreResult{}, regime.MarketRegimeSnapshot{}, fmt.Errorf("validate btc 15m candles: %w", err)
+	if err == nil {
+		if vr, ve := validator.ValidateCandleBatch(marketdata.CandleValidationInput{
+			Symbol:              "BTCUSDT",
+			Timeframe:           "15m",
+			Candles:             btc15mRaw,
+			MinRequired:         2,
+			MaxDataAgeSeconds:   s.cfg.DataValidation.MaxDataAgeSecondsFor("15m"),
+			RequireClosedLatest: true,
+		}); ve == nil {
+			btc15m = vr
+		} else {
+			s.log.Warn("btc 15m validation skipped", map[string]any{"error": ve.Error()})
+		}
+	} else {
+		s.log.Warn("btc 15m fetch skipped", map[string]any{"error": err.Error()})
 	}
 	btc1hRaw, err := s.md.GetCandles(ctx, "BTCUSDT", "1H", closedCandleRawLimit(minIndicatorCandles))
 	if err != nil {
