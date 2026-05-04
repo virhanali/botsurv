@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/virhan/botsurv/internal/app"
@@ -29,7 +30,7 @@ type Client interface {
 type MockClient struct {
 	Decision domain.LLMDecision
 	Err      error
-	cost     float64
+	cost     atomic.Int64
 }
 
 func NewMockClient(decision domain.LLMDecision, err error) *MockClient {
@@ -44,12 +45,12 @@ func (m *MockClient) VetoRequest(_ context.Context, _ string) (domain.LLMDecisio
 			ValidationStatus: "api_error",
 		}, m.Err
 	}
-	m.cost += 0.001 // mock cost
+	m.cost.Add(1) // mock cost (1 = 0.001)
 	return m.Decision, nil
 }
 
-func (m *MockClient) DailyCost() float64 { return m.cost }
-func (m *MockClient) ResetDailyCost()    { m.cost = 0 }
+func (m *MockClient) DailyCost() float64 { return float64(m.cost.Load()) * 0.001 }
+func (m *MockClient) ResetDailyCost()    { m.cost.Store(0) }
 
 // openAIClient is a provider-agnostic OpenAI-compatible chat completions client.
 // It supports OpenRouter and DeepSeek via provider-specific request/response handling.
@@ -58,7 +59,7 @@ type openAIClient struct {
 	budget    app.LLMBudgetConfig
 	log       *logger.Logger
 	client    *http.Client
-	dailyCost float64
+	dailyCost atomic.Int64
 	provider  string // "openrouter" or "deepseek"
 }
 
@@ -141,9 +142,9 @@ type chatResponse struct {
 // VetoRequest sends a context to the LLM and returns a parsed decision.
 func (c *openAIClient) VetoRequest(ctx context.Context, contextJSON string) (domain.LLMDecision, error) {
 	// Budget check
-	if c.budget.MaxCostUSDPerDay > 0 && c.dailyCost >= c.budget.MaxCostUSDPerDay {
+	if c.budget.MaxCostUSDPerDay > 0 && c.dailyCost.Load() >= int64(c.budget.MaxCostUSDPerDay*100000) {
 		c.log.Warn("LLM budget exceeded", map[string]any{
-			"daily_cost": c.dailyCost,
+			"daily_cost": float64(c.dailyCost.Load())/100000,
 			"max":        c.budget.MaxCostUSDPerDay,
 		})
 		return c.fallbackDecision("BLOCK", "LLM_BUDGET_EXCEEDED", ""), nil
@@ -329,7 +330,7 @@ Required JSON format:
 	// Budget tracking (rough estimate)
 	if chatResp.Usage != nil {
 		// Rough: $0.01 per 1K tokens for cheap models
-		c.dailyCost += float64(chatResp.Usage.TotalTokens) * 0.00001
+		c.dailyCost.Add(int64(chatResp.Usage.TotalTokens))
 	}
 
 	c.log.Info("LLM decision", map[string]any{
@@ -380,5 +381,5 @@ func (c *openAIClient) fallbackDecision(decision, reason, rawResponse string) do
 	}
 }
 
-func (c *openAIClient) DailyCost() float64 { return c.dailyCost }
-func (c *openAIClient) ResetDailyCost()    { c.dailyCost = 0 }
+func (c *openAIClient) DailyCost() float64 { return float64(c.dailyCost.Load()) / 100000 }
+func (c *openAIClient) ResetDailyCost()    { c.dailyCost.Store(0) }
