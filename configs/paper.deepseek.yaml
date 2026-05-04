@@ -148,7 +148,7 @@ llm_routing:
   mode: dynamic
   min_candidate_score: 50
   max_calls_per_cycle: 0
-  max_calls_per_day: 400
+  max_calls_per_day: 0
   max_cost_usd_per_day: 20.0
   require_execution_ok: false
   require_liquidity_ok: false
@@ -163,7 +163,7 @@ llm:
   timeout_seconds: 60
   max_tokens: 4096
   budget:
-    max_cost_usd_per_day: 3.0
+    max_cost_usd_per_day: 0
     fallback_decision: BLOCK
 
 portfolio_risk:
