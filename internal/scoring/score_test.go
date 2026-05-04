@@ -40,7 +40,7 @@ func TestScore_KnownInput(t *testing.T) {
 func TestResolveAction_Bands(t *testing.T) {
 	cfg := app.ScoringConfig{Mode: "balanced"}.WithDefaults()
 	check := func(score float64, want Action) {
-		got, _ := resolveAction(score, cfg)
+		got, _ := resolveAction(score, cfg, strategy.CandidateEntryMarket)
 		if got != want {
 			t.Fatalf("score %.1f expected %s got %s", score, want, got)
 		}
@@ -52,7 +52,7 @@ func TestResolveAction_Bands(t *testing.T) {
 
 	cfg.Mode = "aggressive"
 	checkAgg := func(score float64, want Action) {
-		got, _ := resolveAction(score, cfg)
+		got, _ := resolveAction(score, cfg, strategy.CandidateEntryMarket)
 		if got != want {
 			t.Fatalf("aggressive score %.1f expected %s got %s", score, want, got)
 		}
@@ -61,6 +61,25 @@ func TestResolveAction_Bands(t *testing.T) {
 	checkAgg(61, ActionAllowRetestOnly)
 	checkAgg(51, ActionReduceSize)
 	checkAgg(49, ActionReject)
+}
+
+func TestResolveAction_NonMarketEntryCapped(t *testing.T) {
+	cfg := app.ScoringConfig{Mode: "balanced"}.WithDefaults()
+	// High score with LIMIT_RETEST must not return ALLOW_MARKET
+	got, _ := resolveAction(90, cfg, strategy.CandidateEntryLimitRetest)
+	if got != ActionAllowRetestOnly {
+		t.Fatalf("expected ALLOW_RETEST_ONLY for LIMIT_RETEST at high score, got %s", got)
+	}
+	// STOP entry also capped
+	got, _ = resolveAction(90, cfg, strategy.CandidateEntryStop)
+	if got != ActionAllowRetestOnly {
+		t.Fatalf("expected ALLOW_RETEST_ONLY for STOP at high score, got %s", got)
+	}
+	// MARKET entry allowed
+	got, _ = resolveAction(90, cfg, strategy.CandidateEntryMarket)
+	if got != ActionAllowMarket {
+		t.Fatalf("expected ALLOW_MARKET for MARKET at high score, got %s", got)
+	}
 }
 
 func TestRiskRewardComponentInterpolation(t *testing.T) {

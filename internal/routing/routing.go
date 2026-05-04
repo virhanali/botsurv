@@ -55,7 +55,7 @@ type RoutingEngine struct {
 func DefaultRoutingEngine() *RoutingEngine {
 	return &RoutingEngine{
 		MinScoreLLM:     58,
-		MinScoreSkipLLM: 85,
+		MinScoreSkipLLM: 90,
 	}
 }
 

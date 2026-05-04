@@ -467,8 +467,12 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 		case routing.RouteSkipLLM:
 			result.LLMSkippedHighScore++
+			decision := "ALLOW_MARKET"
+			if cand.EntryType == domain.EntryTypeLimitRetest {
+				decision = "ALLOW_LIMIT_RETEST"
+			}
 			llmDecision = domain.LLMDecision{
-				Decision:         "ALLOW_MARKET",
+				Decision:         decision,
 				Confidence:       1.0,
 				SizeMultiplier:   1.0,
 				ReasonCodes:      []string{"HIGH_SCORE_SKIP_LLM"},

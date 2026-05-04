@@ -236,6 +236,14 @@ func (se *SafetyEngine) EvaluateExecutionSafety(ctx context.Context, plan risk.O
 		se.mu.Unlock()
 	}
 
+	// 8. TP/SL separation check
+	if len(plan.TakeProfits) > 0 && plan.StopLoss > 0 {
+		minSep := 0.0001
+		if math.Abs(plan.TakeProfits[0].Price-plan.StopLoss) < minSep {
+			check("TPSeparationCheck", false, fmt.Sprintf("TP %.6f and SL %.6f are too close", plan.TakeProfits[0].Price, plan.StopLoss))
+		}
+	}
+
 	if !result.Safe {
 		result.RecommendedAction = "abort"
 		for _, name := range result.FailedChecks {

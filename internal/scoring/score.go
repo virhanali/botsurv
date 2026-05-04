@@ -62,7 +62,7 @@ func Score(in Input, cfg app.ScoringConfig) ScoreResult {
 	comp.RiskReward = riskReward(in.Candidate.RiskRewardRatio)
 	total := comp.TrendAlignment + comp.SetupQuality + comp.MarketStructure + comp.MomentumConfluence + comp.VolumeConfirmation + comp.RelativeStrength + comp.RiskReward
 	total = clamp(total, 0, 100)
-	action, size := resolveAction(total, cfg)
+	action, size := resolveAction(total, cfg, in.Candidate.EntryType)
 	return ScoreResult{
 		ScoreTotal:     round2(total),
 		Components:     roundComponents(comp),
@@ -72,7 +72,7 @@ func Score(in Input, cfg app.ScoringConfig) ScoreResult {
 	}
 }
 
-func resolveAction(score float64, cfg app.ScoringConfig) (Action, float64) {
+func resolveAction(score float64, cfg app.ScoringConfig, entryType strategy.CandidateEntryType) (Action, float64) {
 	thresholds := cfg.Balanced
 	if cfg.Mode == "aggressive" {
 		thresholds = cfg.Aggressive
@@ -80,6 +80,10 @@ func resolveAction(score float64, cfg app.ScoringConfig) (Action, float64) {
 	s := round2(score)
 	switch {
 	case s >= thresholds.AllowMarket:
+		// Non-market entry types (limit_retest, stop) should never be upgraded to market.
+		if entryType == strategy.CandidateEntryLimitRetest || entryType == strategy.CandidateEntryStop {
+			return ActionAllowRetestOnly, 1.0
+		}
 		return ActionAllowMarket, 1.0
 	case s >= thresholds.AllowRetestOnly:
 		return ActionAllowRetestOnly, 1.0

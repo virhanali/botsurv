@@ -157,6 +157,26 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 		}
 	}
 
+	// Recalculate TP/SL if actual fill differs significantly from planned entry
+	sl := plan.StopLoss
+	if plan.EntryPrice > 0 && plan.EntryType == "market" {
+		slippagePct := math.Abs(price-plan.EntryPrice) / plan.EntryPrice
+		if slippagePct > 0.005 { // 0.5% threshold
+			riskDist := math.Abs(plan.EntryPrice - plan.StopLoss)
+			tpDist := 0.0
+			if len(plan.TakeProfits) > 0 {
+				tpDist = math.Abs(plan.TakeProfits[0].Price - plan.EntryPrice)
+			}
+			if plan.Side == domain.SideLong {
+				sl = price - riskDist
+				tp = price + tpDist
+			} else {
+				sl = price + riskDist
+				tp = price - tpDist
+			}
+		}
+	}
+
 	trade := domain.PaperTrade{
 		PaperTradeID: shadow.NewUUID(),
 		DecisionID:   decisionID,
@@ -166,7 +186,7 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 		Qty:          plan.Qty,
 		Leverage:     plan.Leverage,
 		EntryPrice:   price,
-		StopLoss:     plan.StopLoss,
+		StopLoss:     sl,
 		TakeProfit:   tp,
 		FeesPaid:     fee,
 	}

@@ -207,6 +207,27 @@ func generateTrendPullbackForSide(in TrendPullbackInput, side domain.Side) (*Tra
 		}
 	}
 
+	// Sanity check: TP/SL must be on correct side of entry
+	if side == domain.SideLong {
+		if sl >= entry {
+			rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, fmt.Sprintf("SL %.6f >= entry %.6f for LONG", sl, entry))
+			return nil, &rej
+		}
+		if tp1 <= entry {
+			rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, fmt.Sprintf("TP %.6f <= entry %.6f for LONG", tp1, entry))
+			return nil, &rej
+		}
+	} else {
+		if sl <= entry {
+			rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, fmt.Sprintf("SL %.6f <= entry %.6f for SHORT", sl, entry))
+			return nil, &rej
+		}
+		if tp1 >= entry {
+			rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, fmt.Sprintf("TP %.6f >= entry %.6f for SHORT", tp1, entry))
+			return nil, &rej
+		}
+	}
+
 	rr := math.Abs(tp1-entry) / riskDist
 	if rr < 1.4 {
 		// If nearest level is too close, fall back to the 1.5R target.

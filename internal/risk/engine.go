@@ -245,6 +245,17 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 		}
 	}
 
+	// 16b. TP/SL must not be equal or too close
+	if input.ProposedTrade.ProposedTakeProfit > 0 && input.ProposedTrade.ProposedStopLoss > 0 {
+		minSep := input.SymbolInfo.TickSize
+		if minSep <= 0 {
+			minSep = 0.0001
+		}
+		if math.Abs(input.ProposedTrade.ProposedTakeProfit-input.ProposedTrade.ProposedStopLoss) < minSep {
+			reasons = append(reasons, "TP_SL_TOO_CLOSE")
+		}
+	}
+
 	// 17. RR check
 	minRR := e.cfg.Strategy.Indicators.MinRR
 	if minRR <= 0 {
@@ -458,6 +469,7 @@ func GetRejectionReason(code string) string {
 		"SL_WRONG_SIDE":               "Stop loss on wrong side",
 		"SL_MISSING":                  "Stop loss is missing",
 		"TP_WRONG_SIDE":               "Take profit on wrong side",
+		"TP_SL_TOO_CLOSE":             "Take profit and stop loss are too close",
 		"RR_BELOW_MIN":                "Risk/Reward below minimum",
 		"EXPECTED_MOVE_TOO_SMALL":     "Expected move too small relative to cost",
 		"BELOW_MIN_NOTIONAL":          "Position below minimum notional",
@@ -578,6 +590,17 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 		rr := cand.RiskRewardRatio
 		if rr < cfg.MinRR {
 			reasons = append(reasons, "RR_BELOW_MIN")
+		}
+	}
+
+	// TP/SL must not be equal or too close
+	if len(cand.TakeProfits) > 0 {
+		minSep := input.SymbolInfo.TickSize
+		if minSep <= 0 {
+			minSep = 0.0001
+		}
+		if math.Abs(cand.TakeProfits[0].Price-cand.StopLoss) < minSep {
+			reasons = append(reasons, "TP_SL_TOO_CLOSE")
 		}
 	}
 
