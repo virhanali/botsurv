@@ -285,7 +285,7 @@ func TestOpenRouterClient_BudgetExceededFallsBackToBlock(t *testing.T) {
 	}
 
 	client := NewOpenRouterClient(cfg, newTestLogger())
-	client.dailyCost.Store(500000) // exceed budget (5.0 USD = 500000 units)
+	client.dailyCost.Store(500_000_000) // exceed budget (5.0 USD = 500M units)
 
 	decision, _ := client.VetoRequest(context.Background(), "{}")
 	if decision.Decision != "BLOCK" {
@@ -356,8 +356,13 @@ func TestOpenRouterClient_DailyCostTracking(t *testing.T) {
 				}},
 			},
 			Usage: &struct {
-				TotalTokens int `json:"total_tokens"`
-			}{TotalTokens: 1000},
+				TotalTokens      int `json:"total_tokens"`
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				PromptTokensDetails *struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			}{TotalTokens: 1000, PromptTokens: 500, CompletionTokens: 500},
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))

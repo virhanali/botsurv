@@ -132,7 +132,12 @@ type chatResponse struct {
 		Message chatMessageResponse `json:"message"`
 	} `json:"choices"`
 	Usage *struct {
-		TotalTokens int `json:"total_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -142,9 +147,9 @@ type chatResponse struct {
 // VetoRequest sends a context to the LLM and returns a parsed decision.
 func (c *openAIClient) VetoRequest(ctx context.Context, contextJSON string) (domain.LLMDecision, error) {
 	// Budget check
-	if c.budget.MaxCostUSDPerDay > 0 && c.dailyCost.Load() >= int64(c.budget.MaxCostUSDPerDay*100000) {
+	if c.budget.MaxCostUSDPerDay > 0 && c.dailyCost.Load() >= int64(c.budget.MaxCostUSDPerDay*100_000_000) {
 		c.log.Warn("LLM budget exceeded", map[string]any{
-			"daily_cost": float64(c.dailyCost.Load())/100000,
+			"daily_cost": float64(c.dailyCost.Load())/100_000_000,
 			"max":        c.budget.MaxCostUSDPerDay,
 		})
 		return c.fallbackDecision("BLOCK", "LLM_BUDGET_EXCEEDED", ""), nil
@@ -327,10 +332,21 @@ Required JSON format:
 		return c.fallbackDecision("BLOCK", "LOW_CONFIDENCE", rawContent), nil
 	}
 
-	// Budget tracking (rough estimate)
+	// Budget tracking: DeepSeek Flash pricing per token
+	// Input cache hit: $2.8/M, Input cache miss: $0.14/M, Output: $0.28/M
+	// 1 unit = $1e-8 (100M units = $1)
 	if chatResp.Usage != nil {
-		// Rough: $0.01 per 1K tokens for cheap models
-		c.dailyCost.Add(int64(chatResp.Usage.TotalTokens))
+		cached := 0
+		if chatResp.Usage.PromptTokensDetails != nil {
+			cached = chatResp.Usage.PromptTokensDetails.CachedTokens
+		}
+		cacheMiss := chatResp.Usage.PromptTokens - cached
+		if cacheMiss < 0 {
+			cacheMiss = 0
+		}
+		// cache hit: 280 units/token, cache miss: 14000 units/token, output: 28000 units/token
+		cost := int64(cached)*280 + int64(cacheMiss)*14000 + int64(chatResp.Usage.CompletionTokens)*28000
+		c.dailyCost.Add(cost)
 	}
 
 	c.log.Info("LLM decision", map[string]any{
@@ -381,5 +397,5 @@ func (c *openAIClient) fallbackDecision(decision, reason, rawResponse string) do
 	}
 }
 
-func (c *openAIClient) DailyCost() float64 { return float64(c.dailyCost.Load()) / 100000 }
+func (c *openAIClient) DailyCost() float64 { return float64(c.dailyCost.Load()) / 100_000_000 }
 func (c *openAIClient) ResetDailyCost()    { c.dailyCost.Store(0) }
