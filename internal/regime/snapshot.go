@@ -67,6 +67,9 @@ func BuildSnapshot(in SnapshotInput) (MarketRegimeSnapshot, error) {
 		now = time.Now().UTC()
 	}
 
+	if len(in.BTC15mCandles) < 2 {
+		return MarketRegimeSnapshot{}, fmt.Errorf("btc 15m candles unavailable")
+	}
 	if len(in.BTC1hCandles) < 25 {
 		return MarketRegimeSnapshot{}, fmt.Errorf("btc 1h candles unavailable for relative strength")
 	}
