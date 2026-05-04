@@ -311,8 +311,25 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		}
 	}
 
-	// 6. For each capped eligible candidate: LLM veto -> risk validation.
+	// 6. Phase 1: Pre-LLM processing — collect candidates that pass hard blocks and routing
+	type candidateCtx struct {
+		cand             domain.Candidate
+		ctxJSON          string
+		routeResult      routing.RouteResult
+		ob               domain.OrderBookSummary
+		obErr            error
+		marketPrice      float64
+		priceErr         error
+		candlesForBlocks []domain.Candle
+		setupTF          string
+		llmDecision      domain.LLMDecision
+		llmErr           error
+	}
+
 	var approvedForPortfolio []riskCandidate
+	var preLLMPass []*candidateCtx
+	var vetoTasks []*candidateCtx
+
 	for _, cand := range cappedCandidates {
 		ctxJSON, ok := screenResult.LLMContexts[cand.Symbol]
 		if !ok {
@@ -403,7 +420,6 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				"first_block":       blockEval.FirstBlockReason,
 				"all_block_reasons": blockEval.AllBlockReasons,
 			})
-			// Log decision
 			fields := &DecisionLogFields{}
 			fields.WithDataValidationResult("blocks_triggered")
 			fields.WithBlocksTriggered(blockEval.BlocksTriggered)
@@ -416,28 +432,12 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			}
 			dl := fields.ToDomain(cycleID, modeStr, cand.Symbol, setupTF, len(candlesForBlocks), "BLOCKED_HARD", blockEval.FirstBlockReason)
 			s.saveDecisionLog(ctx, dl)
-			// Track counterfactual even for blocked candidates
 			s.trackCounterfactual(ctx, dl.DecisionID, cand)
 			continue
 		}
 
-		// Per-cycle call cap check
-		if s.cfg.LLMRouting.MaxCallsPerCycle > 0 && result.LLMCalls >= s.cfg.LLMRouting.MaxCallsPerCycle {
-			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_CALL_CAP_PER_CYCLE"})
-			s.log.Info("candidate skipped: LLM call cap per cycle reached", map[string]any{
-				"symbol":    cand.Symbol,
-				"llm_calls": result.LLMCalls,
-				"max_calls": s.cfg.LLMRouting.MaxCallsPerCycle,
-			})
-			continue
-		}
-
-		// Phase 2: Score-based + ambiguity flag LLM routing
+		// Detect ambiguity flags and route candidate
 		score := cand.CandidateScore
-		var llmDecision domain.LLMDecision
-		var llmErr error
-
-		// Detect ambiguity flags
 		flags := routing.AmbiguityFlags{}
 		tc, tcOk := screenResult.TradeCandidates[cand.Symbol]
 		sr, _ := screenResult.ScoreResults[cand.Symbol]
@@ -448,10 +448,21 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			flags = routing.DetectAmbiguity(snap15m, snap1h, rs, sr, tc)
 		}
 
-		// Route candidate using the routing engine
 		routingEng := routing.DefaultRoutingEngine()
 		maxLLM := s.cfg.LLMRouting.MaxCallsPerCycle
 		routeResult := routingEng.RouteCandidate(score, flags, result.LLMCalls, maxLLM)
+
+		cctx := &candidateCtx{
+			cand:             cand,
+			ctxJSON:          ctxJSON,
+			routeResult:      routeResult,
+			ob:               ob,
+			obErr:            obErr,
+			marketPrice:      marketPrice,
+			priceErr:         priceErr,
+			candlesForBlocks: candlesForBlocks,
+			setupTF:          setupTF,
+		}
 
 		switch routeResult.Route {
 		case routing.RouteRejectPreLLM:
@@ -467,12 +478,13 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 		case routing.RouteSkipLLM:
 			result.LLMSkippedHighScore++
-			decision := "ALLOW_MARKET"
-			if cand.EntryType == domain.EntryTypeLimitRetest {
-				decision = "ALLOW_LIMIT_RETEST"
-			}
-			llmDecision = domain.LLMDecision{
-				Decision:         decision,
+			cctx.llmDecision = domain.LLMDecision{
+				Decision: func() string {
+					if cand.EntryType == domain.EntryTypeLimitRetest {
+						return "ALLOW_LIMIT_RETEST"
+					}
+					return "ALLOW_MARKET"
+				}(),
 				Confidence:       1.0,
 				SizeMultiplier:   1.0,
 				ReasonCodes:      []string{"HIGH_SCORE_SKIP_LLM"},
@@ -484,10 +496,53 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				"flags":  routeResult.FlagCount,
 				"reason": routeResult.Reason,
 			})
+			preLLMPass = append(preLLMPass, cctx)
 
 		default: // LLM_VETO_REQUIRED
+			// Per-cycle call cap: only collect up to MaxCallsPerCycle veto tasks
+			if s.cfg.LLMRouting.MaxCallsPerCycle > 0 && len(vetoTasks) >= s.cfg.LLMRouting.MaxCallsPerCycle {
+				result.RejectedPreLLM++
+				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_CALL_CAP_PER_CYCLE"})
+				s.log.Info("candidate skipped: LLM call cap per cycle reached", map[string]any{
+					"symbol":    cand.Symbol,
+					"llm_calls": len(vetoTasks),
+					"max_calls": s.cfg.LLMRouting.MaxCallsPerCycle,
+				})
+				continue
+			}
 			result.LLMVetoCalled++
-			llmDecision, llmErr = s.llmClient.VetoRequest(ctx, ctxJSON)
+			vetoTasks = append(vetoTasks, cctx)
+			preLLMPass = append(preLLMPass, cctx)
+		}
+	}
+
+	// Phase 2: Parallel LLM veto calls
+	if len(vetoTasks) > 0 {
+		var wg sync.WaitGroup
+		for _, vt := range vetoTasks {
+			wg.Add(1)
+			go func(t *candidateCtx) {
+				defer wg.Done()
+				t.llmDecision, t.llmErr = s.llmClient.VetoRequest(ctx, t.ctxJSON)
+			}(vt)
+		}
+		wg.Wait()
+	}
+
+	// Phase 3: Post-LLM processing — sequential for DB safety
+	monitorStatus := cycleMonitorStatus
+	for _, cctx := range preLLMPass {
+		cand := cctx.cand
+		llmDecision := cctx.llmDecision
+		llmErr := cctx.llmErr
+		ob := cctx.ob
+		obErr := cctx.obErr
+		marketPrice := cctx.marketPrice
+		priceErr := cctx.priceErr
+		candlesForBlocks := cctx.candlesForBlocks
+		setupTF := cctx.setupTF
+
+		if cctx.routeResult.Route == routing.RouteLLMVeto {
 			if llmErr != nil {
 				result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "LLM_ERROR"})
 				continue
@@ -511,7 +566,6 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				"decision": llmDecision.Decision,
 				"reasons":  llmDecision.ReasonCodes,
 			})
-			// Log decision
 			fields := &DecisionLogFields{}
 			fields.WithDataValidationResult("passed")
 			if tc, ok := screenResult.TradeCandidates[cand.Symbol]; ok {
