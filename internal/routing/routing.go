@@ -164,7 +164,7 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// High quality: skip LLM (score >= 85)
+	// High quality: skip LLM (score >= 90)
 	if score >= e.MinScoreSkipLLM {
 		return RouteResult{
 			Route:        RouteSkipLLM,
@@ -190,7 +190,7 @@ func (e *RoutingEngine) RouteCandidate(
 	}
 
 	// Positive maxLLMPerCycle exhausted: reject mid-range scores pre-LLM.
-	// RouteSkipLLM is only for score >= MinScoreSkipLLM (85).
+	// RouteSkipLLM is only for score >= MinScoreSkipLLM (90).
 	return RouteResult{
 		Route:  RouteRejectPreLLM,
 		Score:  score,

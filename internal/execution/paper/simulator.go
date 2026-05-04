@@ -163,10 +163,7 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 		slippagePct := math.Abs(price-plan.EntryPrice) / plan.EntryPrice
 		if slippagePct > 0.005 { // 0.5% threshold
 			riskDist := math.Abs(plan.EntryPrice - plan.StopLoss)
-			tpDist := 0.0
-			if len(plan.TakeProfits) > 0 {
-				tpDist = math.Abs(plan.TakeProfits[0].Price - plan.EntryPrice)
-			}
+			tpDist := math.Abs(tp - plan.EntryPrice)
 			if plan.Side == domain.SideLong {
 				sl = price - riskDist
 				tp = price + tpDist
