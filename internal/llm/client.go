@@ -147,9 +147,9 @@ type chatResponse struct {
 // VetoRequest sends a context to the LLM and returns a parsed decision.
 func (c *openAIClient) VetoRequest(ctx context.Context, contextJSON string) (domain.LLMDecision, error) {
 	// Budget check
-	if c.budget.MaxCostUSDPerDay > 0 && c.dailyCost.Load() >= int64(c.budget.MaxCostUSDPerDay*100_000_000) {
+	if c.budget.MaxCostUSDPerDay > 0 && c.dailyCost.Load() >= int64(c.budget.MaxCostUSDPerDay*10_000_000_000) {
 		c.log.Warn("LLM budget exceeded", map[string]any{
-			"daily_cost": float64(c.dailyCost.Load())/100_000_000,
+			"daily_cost": float64(c.dailyCost.Load())/10_000_000_000,
 			"max":        c.budget.MaxCostUSDPerDay,
 		})
 		return c.fallbackDecision("BLOCK", "LLM_BUDGET_EXCEEDED", ""), nil
@@ -334,7 +334,7 @@ Required JSON format:
 
 	// Budget tracking: DeepSeek Flash pricing per token
 	// Input cache hit: $2.8/M, Input cache miss: $0.14/M, Output: $0.28/M
-	// 1 unit = $1e-8 (100M units = $1)
+	// 1 unit = $1e-10 (10B units = $1)
 	if chatResp.Usage != nil {
 		cached := 0
 		if chatResp.Usage.PromptTokensDetails != nil {
@@ -345,7 +345,7 @@ Required JSON format:
 			cacheMiss = 0
 		}
 		// cache hit: 280 units/token, cache miss: 14000 units/token, output: 28000 units/token
-		cost := int64(cached)*280 + int64(cacheMiss)*14000 + int64(chatResp.Usage.CompletionTokens)*28000
+		cost := int64(cached)*28 + int64(cacheMiss)*1400 + int64(chatResp.Usage.CompletionTokens)*2800
 		c.dailyCost.Add(cost)
 	}
 
@@ -397,5 +397,5 @@ func (c *openAIClient) fallbackDecision(decision, reason, rawResponse string) do
 	}
 }
 
-func (c *openAIClient) DailyCost() float64 { return float64(c.dailyCost.Load()) / 100_000_000 }
+func (c *openAIClient) DailyCost() float64 { return float64(c.dailyCost.Load()) / 10_000_000_000 }
 func (c *openAIClient) ResetDailyCost()    { c.dailyCost.Store(0) }

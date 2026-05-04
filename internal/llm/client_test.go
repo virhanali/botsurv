@@ -285,7 +285,7 @@ func TestOpenRouterClient_BudgetExceededFallsBackToBlock(t *testing.T) {
 	}
 
 	client := NewOpenRouterClient(cfg, newTestLogger())
-	client.dailyCost.Store(500_000_000) // exceed budget (5.0 USD = 500M units)
+	client.dailyCost.Store(50_000_000_000) // exceed budget (5.0 USD = 500M units)
 
 	decision, _ := client.VetoRequest(context.Background(), "{}")
 	if decision.Decision != "BLOCK" {
