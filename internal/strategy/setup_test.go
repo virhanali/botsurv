@@ -338,3 +338,38 @@ func TestDetectSetup_InsufficientData(t *testing.T) {
 		t.Errorf("expected no setup, got %s", result.SetupType)
 	}
 }
+
+func TestQualityStopMultiplier(t *testing.T) {
+	// Default: good quality, no scaling
+	m := QualityStopMultiplier(0.5, 50, 1.5, 1.5)
+	if m != 0.5 {
+		t.Fatalf("good quality expected 0.5, got %.2f", m)
+	}
+
+	// Low trade count + high volatility: should scale up
+	m = QualityStopMultiplier(0.5, 10, 5.0, 1.5)
+	if m < 1.0 {
+		t.Fatalf("poor quality expected >=1.0, got %.2f", m)
+	}
+
+	// Floor at 1.0
+	m = QualityStopMultiplier(0.5, 5, 4.0, 0.5)
+	if m < 1.0 {
+		t.Fatalf("floor expected 1.0, got %.2f", m)
+	}
+
+	// Ceiling at 3.0
+	m = QualityStopMultiplier(0.5, 1, 10.0, 0.1)
+	if m > 3.0 {
+		t.Fatalf("ceiling expected <=3.0, got %.2f", m)
+	}
+}
+
+func TestCountTradeActivity(t *testing.T) {
+	candles := []domain.Candle{
+		{Volume: 100}, {Volume: 0}, {Volume: 50}, {Volume: 0},
+	}
+	if n := CountTradeActivity(candles, 4); n != 2 {
+		t.Fatalf("expected 2 active candles, got %d", n)
+	}
+}

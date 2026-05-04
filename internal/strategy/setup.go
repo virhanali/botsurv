@@ -388,3 +388,43 @@ func computeSetupScore(volumeRatio, bodyRatio float64, regime Regime, extension 
 	}
 	return score
 }
+
+// QualityStopMultiplier computes a dynamic ATR multiplier for stop-loss width
+// based on signal quality indicators: trade activity, volatility, volume.
+// Base multiplier (e.g. 0.5) is scaled up when signal quality is poor.
+// Returns a multiplier in range [base, 3.0].
+func QualityStopMultiplier(baseMultiplier float64, tradeCount int, atrPct, volRatio float64) float64 {
+	m := 1.0
+	if tradeCount < 20 && tradeCount > 0 {
+		m *= 1.5
+	}
+	if atrPct > 3.0 {
+		m *= 1.5
+	}
+	if volRatio < 0.8 && volRatio > 0 {
+		m *= 1.3
+	}
+	result := baseMultiplier * m
+	if result < baseMultiplier {
+		result = baseMultiplier
+	}
+	if result > 3.0 {
+		result = 3.0
+	}
+	return result
+}
+
+// CountTradeActivity counts candles with non-zero volume in the lookback window.
+func CountTradeActivity(candles []domain.Candle, lookback int) int {
+	count := 0
+	start := len(candles) - lookback
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(candles); i++ {
+		if candles[i].Volume > 0 {
+			count++
+		}
+	}
+	return count
+}

@@ -166,15 +166,16 @@ func generateTrendPullbackForSide(in TrendPullbackInput, side domain.Side) (*Tra
 
 	recentSwing := latestSwingByType(in.Snapshot15m.RecentSwings, side)
 	var sl float64
+	stopATR := QualityStopMultiplier(1.5, CountTradeActivity(in.Candles15m, 20), in.Snapshot15m.ATRPct, in.Snapshot15m.VolumeRatio)
 	if side == domain.SideLong {
-		sl = math.Min(recentSwing, entry-1.5*atr)
+		sl = math.Min(recentSwing, entry-stopATR*atr)
 		if sl <= 0 || sl >= entry {
-			sl = entry - 1.5*atr
+			sl = entry - stopATR*atr
 		}
 	} else {
-		sl = math.Max(recentSwing, entry+1.5*atr)
+		sl = math.Max(recentSwing, entry+stopATR*atr)
 		if sl <= entry {
-			sl = entry + 1.5*atr
+			sl = entry + stopATR*atr
 		}
 	}
 

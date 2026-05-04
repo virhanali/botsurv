@@ -104,15 +104,16 @@ func generateBreakoutRetestForSide(in BreakoutRetestInput, side domain.Side) (*T
 	}
 
 	var sl float64
+	stopATR := QualityStopMultiplier(0.5, CountTradeActivity(in.Candles15m, 20), in.Snapshot15m.ATRPct, in.Snapshot15m.VolumeRatio)
 	if side == domain.SideLong {
-		sl = math.Min(retestExtreme, level-0.5*atr)
+		sl = math.Min(retestExtreme, level-stopATR*atr)
 		if sl >= entry {
-			sl = entry - 0.5*atr
+			sl = entry - stopATR*atr
 		}
 	} else {
-		sl = math.Max(retestExtreme, level+0.5*atr)
+		sl = math.Max(retestExtreme, level+stopATR*atr)
 		if sl <= entry {
-			sl = entry + 0.5*atr
+			sl = entry + stopATR*atr
 		}
 	}
 
