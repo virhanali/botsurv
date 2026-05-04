@@ -159,7 +159,7 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 
 	// Recalculate TP/SL if actual fill differs significantly from planned entry
 	sl := plan.StopLoss
-	if plan.EntryPrice > 0 && plan.EntryType == "market" {
+	if plan.EntryPrice > 0 {
 		slippagePct := math.Abs(price-plan.EntryPrice) / plan.EntryPrice
 		if slippagePct > 0.005 { // 0.5% threshold
 			riskDist := math.Abs(plan.EntryPrice - plan.StopLoss)
