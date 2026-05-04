@@ -1289,7 +1289,11 @@ func (s *Scheduler) trackLLMCall(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	if err := s.llmUsageRepo.IncrementCalls(ctx, usageDate, 1); err != nil {
+	cost := 0.0
+	if s.llmClient != nil {
+		cost = s.llmClient.DailyCost()
+	}
+	if err := s.llmUsageRepo.IncrementCalls(ctx, usageDate, 1, cost); err != nil {
 		s.log.Error("failed to persist LLM usage", map[string]any{"error": err.Error()})
 	}
 }

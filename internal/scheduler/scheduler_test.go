@@ -282,7 +282,7 @@ func (m *mockLLMUsageRepo) Get(ctx context.Context, usageDate time.Time) (*domai
 	return &domain.LLMUsageState{UsageDate: usageDate, Calls: m.calls}, nil
 }
 
-func (m *mockLLMUsageRepo) IncrementCalls(ctx context.Context, usageDate time.Time, calls int) error {
+func (m *mockLLMUsageRepo) IncrementCalls(ctx context.Context, usageDate time.Time, calls int, _ float64) error {
 	m.date = usageDate.Format("2006-01-02")
 	m.calls += calls
 	return nil

@@ -663,10 +663,10 @@ func TestPostgresLLMUsageRepository(t *testing.T) {
 	ctx := context.Background()
 	usageDate := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
 
-	if err := repos.LLMUsageRepository.IncrementCalls(ctx, usageDate, 1); err != nil {
+	if err := repos.LLMUsageRepository.IncrementCalls(ctx, usageDate, 1, 0); err != nil {
 		t.Fatalf("increment usage: %v", err)
 	}
-	if err := repos.LLMUsageRepository.IncrementCalls(ctx, usageDate, 2); err != nil {
+	if err := repos.LLMUsageRepository.IncrementCalls(ctx, usageDate, 2, 0); err != nil {
 		t.Fatalf("increment usage second time: %v", err)
 	}
 

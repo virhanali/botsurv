@@ -826,17 +826,18 @@ func (r *postgresLLMUsageRepository) Get(ctx context.Context, usageDate time.Tim
 	return &state, nil
 }
 
-func (r *postgresLLMUsageRepository) IncrementCalls(ctx context.Context, usageDate time.Time, calls int) error {
+func (r *postgresLLMUsageRepository) IncrementCalls(ctx context.Context, usageDate time.Time, calls int, cost float64) error {
 	if calls <= 0 {
 		return nil
 	}
 	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO llm_usage_daily (usage_date, calls, updated_at)
-		 VALUES ($1, $2, NOW())
+		`INSERT INTO llm_usage_daily (usage_date, calls, cost_usd, updated_at)
+		 VALUES ($1, $2, $3, NOW())
 		 ON CONFLICT (usage_date) DO UPDATE SET
 		 calls = llm_usage_daily.calls + EXCLUDED.calls,
+		 cost_usd = EXCLUDED.cost_usd,
 		 updated_at = NOW()`,
-		usageDate.Format("2006-01-02"), calls)
+		usageDate.Format("2006-01-02"), calls, cost)
 	if err != nil {
 		return fmt.Errorf("increment llm usage: %w", err)
 	}

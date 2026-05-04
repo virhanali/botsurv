@@ -81,7 +81,7 @@ type RiskDecisionRepository interface {
 // LLMUsageRepository persists daily LLM usage counters.
 type LLMUsageRepository interface {
 	Get(ctx context.Context, usageDate time.Time) (*domain.LLMUsageState, error)
-	IncrementCalls(ctx context.Context, usageDate time.Time, calls int) error
+	IncrementCalls(ctx context.Context, usageDate time.Time, calls int, cost float64) error
 }
 
 // DecisionLogRepository persists decision log entries.
