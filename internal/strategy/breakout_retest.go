@@ -163,8 +163,8 @@ func generateBreakoutRetestForSide(in BreakoutRetestInput, side domain.Side) (*T
 
 	// Sanity check: TP/SL must be on correct side of entry
 	if side == domain.SideLong {
-		if sl >= entry {
-			rej := BuildRejectedCandidate(StrategyBreakoutRetest, side, in.Symbol, in.Timeframe, fmt.Sprintf("SL %.6f >= entry %.6f for LONG", sl, entry))
+		if sl <= 0 || sl >= entry {
+			rej := BuildRejectedCandidate(StrategyBreakoutRetest, side, in.Symbol, in.Timeframe, fmt.Sprintf("SL %.6f invalid for LONG (sl=%v, entry=%v)", sl, sl <= 0, entry))
 			return nil, &rej
 		}
 		if tp1 <= entry {

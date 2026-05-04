@@ -395,22 +395,18 @@ func computeSetupScore(volumeRatio, bodyRatio float64, regime Regime, extension 
 // Returns a multiplier in range [base, 3.0].
 func QualityStopMultiplier(baseMultiplier float64, tradeCount int, atrPct, volRatio float64) float64 {
 	m := 1.0
-	if tradeCount < 20 && tradeCount > 0 {
+	if tradeCount < 20 {
 		m *= 1.5
 	}
 	if atrPct > 3.0 {
 		m *= 1.5
 	}
-	if volRatio < 0.8 && volRatio > 0 {
+	if volRatio < 0.8 {
 		m *= 1.3
 	}
 	result := baseMultiplier * m
-	if result < baseMultiplier {
-		result = baseMultiplier
-	}
-	if result > 3.0 {
-		result = 3.0
-	}
+	result = max(result, baseMultiplier)
+	result = min(result, 3.0)
 	return result
 }
 

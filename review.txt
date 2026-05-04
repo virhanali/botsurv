@@ -1,0 +1,36 @@
+📋 CODE REVIEW: Commits 2c8013e + 7576c6a
+
+*Verdict: Conditional approval — 2 fixes required before merge*
+
+━━━ CRITICAL ━━━
+1️⃣ QualityStopMultiplier excludes worst-case inputs
+tradeCount > 0 and volRatio > 0 guards mean zero trade activity or zero volume (worst signal quality) do NOT trigger widening. Remove the lower bounds: tradeCount < 20 should fire even at 0, and volRatio < 0.8 should fire even at 0.
+
+2️⃣ breakout_retest.go missing sl<=0 guard
+After fallback sl = entry - stopATR*atr, negative SL is possible for low-priced/high-ATR pairs. trend_pullback.go checks sl <= 0 || sl >= entry — breakout_retest.go only checks sl >= entry. Add the zero guard.
+
+━━━ HIGH ━━━
+3️⃣ simulator.go TP/SL recalculation lacks zero guards
+If plan.StopLoss == 0, riskDist becomes plan.EntryPrice, setting sl ≈ 0 for longs. If tp == 0 (no TPs and no SL), tpDist becomes plan.EntryPrice, placing TP absurdly far. Guard: if plan.StopLoss <= 0 || tp <= 0, skip recalculation.
+
+━━━ MEDIUM ━━━
+4️⃣ CountTradeActivity is misleading & likely dead code
+It checks Volume > 0. In crypto, virtually every 15m candle has volume, so this will almost always return 20/20 and the 1.5x low-activity multiplier never fires. Rename to CountNonZeroVolumeCandles or replace with a meaningful liquidity proxy.
+
+5️⃣ Tests need boundary & exact coverage
+• No test for tradeCount=0, volRatio=0, or atrPct exactly at 3.0 boundary
+• "Floor at 1.0" comment is wrong — floor is baseMultiplier (0.5), not 1.0
+• No exact value assertions (all inequalities)
+• No test for baseMultiplier=1.5 (trend_pullback path)
+
+━━━ RACE CONDITIONS / IDIOMS ━━━
+✅ No race conditions found. sync.RWMutex used correctly.
+⚠️ simulator.go holds mu during DB I/O in persistAccountState — acceptable for single-bot but suboptimal.
+
+━━━ GOOD PARTS ━━━
+✅ Simulator fix (2c8013e) is correct and necessary — extending TP/SL recalc to all entry types fixes the DEXEUSDT structural loss.
+✅ Dynamic stop concept is sound: widens on poor quality, caps at 3.0 ATR, preserves floor.
+✅ Ceiling/floor pattern in QualityStopMultiplier is safe.
+
+━━━ FINAL REC ━━━
+Fix #1 and #2 before merge. Fix #3 strongly recommended. Address #4/#5 in follow-up. Do not deploy without fixing the zero-input guards — they produce the exact opposite of intended behavior.
