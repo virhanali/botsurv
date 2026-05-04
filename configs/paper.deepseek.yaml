@@ -148,7 +148,7 @@ llm_routing:
   mode: dynamic
   min_candidate_score: 50
   max_calls_per_cycle: 0
-  max_calls_per_day: 200
+  max_calls_per_day: 400
   max_cost_usd_per_day: 20.0
   require_execution_ok: false
   require_liquidity_ok: false
@@ -158,7 +158,7 @@ llm:
   enabled: true
   provider: deepseek
   base_url: "https://api.deepseek.com"
-  model: "deepseek-v4-pro"
+  model: "deepseek-v4-flash"
   temperature: 0
   timeout_seconds: 60
   max_tokens: 4096
