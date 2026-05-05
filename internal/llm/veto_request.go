@@ -90,8 +90,8 @@ func ParseVetoResponse(rawJSON string) (domain.LLMDecision, error) {
 
 	d := resp.ApplyToDecision()
 
-	// Confidence >= 0.6 required
-	if d.Confidence < 0.6 {
+	// Confidence >= 0.75 required
+	if d.Confidence < 0.75 {
 		return domain.LLMDecision{
 			Decision:         "BLOCK",
 			Confidence:       d.Confidence,
@@ -99,7 +99,7 @@ func ParseVetoResponse(rawJSON string) (domain.LLMDecision, error) {
 			ReasonCodes:      []string{"LOW_CONFIDENCE"},
 			ValidationStatus: "low_confidence",
 			RawResponse:      rawJSON,
-		}, fmt.Errorf("parse veto response: confidence %.2f below minimum 0.6", d.Confidence)
+		}, fmt.Errorf("parse veto response: confidence %.2f below minimum 0.75", d.Confidence)
 	}
 
 	// Size multiplier must be exactly one of the allowed values

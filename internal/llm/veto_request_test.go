@@ -91,7 +91,7 @@ func TestParseVetoResponse_ConfidenceClamped(t *testing.T) {
 }
 
 func TestParseVetoResponse_ReduceSize(t *testing.T) {
-	raw := `{"schema_version":"2.1","review":{"action":"REDUCE_SIZE","confidence":70,"setup_quality":"average","reason_summary":"low liquidity"},"recommended_adjustment":{"size_multiplier":0.5,"entry_mode":"limit_retest"},"rejection_reason":null}`
+	raw := `{"schema_version":"2.1","review":{"action":"REDUCE_SIZE","confidence":78,"setup_quality":"average","reason_summary":"low liquidity"},"recommended_adjustment":{"size_multiplier":0.5,"entry_mode":"limit_retest"},"rejection_reason":null}`
 	dec, err := ParseVetoResponse(raw)
 	if err != nil {
 		t.Fatalf("ParseVetoResponse: %v", err)
@@ -138,11 +138,11 @@ func TestBuildVetoContext_QuotesInWarnings_ValidJSON(t *testing.T) {
 }
 
 func TestParseVetoResponse_ConfidenceBelowMinReturnsBlock(t *testing.T) {
-	// confidence 0.59 < 0.6 should BLOCK
+	// confidence 0.59 < 0.75 should BLOCK
 	raw := `{"schema_version":"2.1","review":{"action":"APPROVE","confidence":0.59,"setup_quality":"good","reason_summary":"ok"},"recommended_adjustment":{"size_multiplier":1.0},"rejection_reason":null}`
 	dec, err := ParseVetoResponse(raw)
 	if err == nil {
-		t.Fatal("expected error for confidence below 0.6")
+		t.Fatal("expected error for confidence below 0.75")
 	}
 	if dec.Decision != "BLOCK" {
 		t.Errorf("expected BLOCK for low confidence, got %s", dec.Decision)
@@ -176,11 +176,11 @@ func TestParseVetoResponse_ValidResponseStoresRaw(t *testing.T) {
 }
 
 func TestParseVetoResponse_Confidence59In100ScaleReturnsBlock(t *testing.T) {
-	// confidence 59 in 0-100 scale -> 0.59 after conversion -> < 0.6 -> BLOCK
+	// confidence 59 in 0-100 scale -> 0.59 after conversion -> < 0.75 -> BLOCK
 	raw := `{"schema_version":"2.1","review":{"action":"APPROVE","confidence":59,"setup_quality":"good","reason_summary":"ok"},"recommended_adjustment":{"size_multiplier":1.0},"rejection_reason":null}`
 	dec, err := ParseVetoResponse(raw)
 	if err == nil {
-		t.Fatal("expected error for confidence 59 (< 0.6 after conversion)")
+		t.Fatal("expected error for confidence 59 (< 0.75 after conversion)")
 	}
 	if dec.Decision != "BLOCK" {
 		t.Errorf("expected BLOCK for low confidence, got %s", dec.Decision)

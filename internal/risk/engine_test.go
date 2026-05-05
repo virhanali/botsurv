@@ -493,10 +493,10 @@ func TestValidate_RejectsConfidenceBelowThreshold(t *testing.T) {
 func TestValidate_AcceptsConfidenceAtThreshold(t *testing.T) {
 	e := NewEngine(defaultConfig())
 	input := validInput()
-	input.LLMDecision.Confidence = 0.6
+	input.LLMDecision.Confidence = 0.75
 	output := e.Validate(input)
 	if !output.Approved {
-		t.Errorf("expected approved at confidence 0.6, got rejected: %v", output.ReasonCodes)
+		t.Errorf("expected approved at confidence 0.75, got rejected: %v", output.ReasonCodes)
 	}
 }
 

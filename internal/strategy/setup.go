@@ -3,7 +3,6 @@ package strategy
 import (
 	"fmt"
 	"math"
-	"strings"
 
 	"github.com/virhan/botsurv/internal/domain"
 	"github.com/virhan/botsurv/internal/indicator"
@@ -432,7 +431,7 @@ func CountTradeActivity(candles []domain.Candle, lookback int) int {
 // MinATRCheck rejects candidates with extremely low volatility (ATR% < 0.4).
 func MinATRCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf string, strategy StrategyName) *RejectedCandidate {
 	// Skip ATR check for major coins (always liquid, low ATR baseline)
-	if strings.HasPrefix(sym, "BTC") || strings.HasPrefix(sym, "ETH") {
+	if sym == "BTCUSDT" || sym == "ETHUSDT" {
 		return nil
 	}
 	if snap.ATRPct > 0 && snap.ATRPct < 0.4 {
@@ -444,7 +443,7 @@ func MinATRCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf str
 // MinVolumeCheck rejects candidates with very low volume ratio.
 func MinVolumeCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf string, strategy StrategyName) *RejectedCandidate {
 	// Skip volume check for major coins
-	if strings.HasPrefix(sym, "BTC") || strings.HasPrefix(sym, "ETH") {
+	if sym == "BTCUSDT" || sym == "ETHUSDT" {
 		return nil
 	}
 	if snap.VolumeRatio > 0 && snap.VolumeRatio < 0.7 {
