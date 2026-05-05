@@ -123,6 +123,14 @@ func (s *Scanner) ScanAll(ctx context.Context) ([]domain.UniverseSymbol, error) 
 			continue
 		}
 
+		// Penny coin filter: skip coins with price below $1
+		if !forceSet[inst.Symbol] && hasTicker {
+			price, _ := strconv.ParseFloat(ticker.LastPrice, 64)
+			if price < 1.0 {
+				continue
+			}
+		}
+
 		// Compute spread from ticker if available
 		var spreadBps float64
 		if hasTicker {

@@ -625,6 +625,25 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 	entryPrice := roundToTickSize(cand.EntryPrice, input.SymbolInfo.TickSize)
 	slPrice := roundToTickSize(cand.StopLoss, input.SymbolInfo.TickSize)
 
+	// Post-rounding SL validation
+	if cand.Side == domain.SideLong {
+		if slPrice >= entryPrice {
+			reasons = append(reasons, "SL_EQUALS_ENTRY_AFTER_ROUNDING")
+		}
+	} else {
+		if slPrice <= entryPrice {
+			reasons = append(reasons, "SL_EQUALS_ENTRY_AFTER_ROUNDING")
+		}
+	}
+
+	// Minimum SL distance check (0.3% from entry after rounding)
+	if entryPrice > 0 {
+		slDistPct := math.Abs(entryPrice-slPrice) / entryPrice * 100
+		if slDistPct < 0.3 {
+			reasons = append(reasons, "SL_TOO_CLOSE_AFTER_ROUNDING")
+		}
+	}
+
 	// Max open positions
 	openPosCount := 0
 	for _, p := range input.Portfolio.OpenPositions {

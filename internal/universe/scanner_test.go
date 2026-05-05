@@ -161,7 +161,7 @@ func TestScanAll_FiltersByStatusAndQuote(t *testing.T) {
 		},
 		[]bybitTicker{
 			{Symbol: "BTCUSDT", Turnover24h: "500000000", LastPrice: "65000", Bid1Price: "64999", Ask1Price: "65001"},
-			{Symbol: "DOGEUSDT", Turnover24h: "2000000", LastPrice: "0.15", Bid1Price: "0.1499", Ask1Price: "0.1501"},
+			{Symbol: "DOGEUSDT", Turnover24h: "2000000", LastPrice: "1.50", Bid1Price: "1.4999", Ask1Price: "1.5001"},
 		},
 	)
 	defer server.Close()

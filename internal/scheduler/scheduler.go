@@ -751,17 +751,21 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		rs, rsOk := screenResult.RegimeSnapshots[cand.Symbol]
 		var phase4Result risk.RiskValidationResult
 		if tcOk && srOk && rsOk {
-			phase4Result = s.riskEng.ValidateCandidate(risk.CandidateRiskInput{
-				Candidate:      tc,
-				ScoreResult:    sr,
-				RegimeSnapshot: rs,
-				SymbolInfo: domain.SymbolInfo{
+			si, siOk := screenResult.SymbolInfos[cand.Symbol]
+			if !siOk {
+				si = domain.SymbolInfo{
 					Symbol:      cand.Symbol,
 					TickSize:    0.01,
 					LotSize:     0.001,
 					MinNotional: 10,
 					MaxLeverage: 100,
-				},
+				}
+			}
+			phase4Result = s.riskEng.ValidateCandidate(risk.CandidateRiskInput{
+				Candidate:      tc,
+				ScoreResult:    sr,
+				RegimeSnapshot: rs,
+				SymbolInfo:     si,
 				AccountState: item.monitorStatus.AccountState,
 				Portfolio: risk.PortfolioState{
 					OpenPositions:         item.monitorStatus.OpenPositions,

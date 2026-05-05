@@ -139,6 +139,7 @@ type ScreenResult struct {
 	IndicatorSnapshots15m map[string]indicator.IndicatorSnapshot
 	IndicatorSnapshots1h  map[string]indicator.IndicatorSnapshot
 	StrategyRejections []StrategyRejection
+	SymbolInfos      map[string]domain.SymbolInfo
 }
 
 // Screen runs the full screening pipeline:
@@ -158,6 +159,7 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 	tradeCandidates := make(map[string]strategy.TradeCandidate)
 	scoreResults := make(map[string]scoring.ScoreResult)
 	regimeSnapshots := make(map[string]regime.MarketRegimeSnapshot)
+	symbolInfos := make(map[string]domain.SymbolInfo)
 	var strategyRejections []StrategyRejection
 	for _, sym := range qualitySymbols {
 		if sym.Blacklist {
@@ -185,6 +187,7 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 		tradeCandidates[sym.Symbol] = tc
 		scoreResults[sym.Symbol] = sr
 		regimeSnapshots[sym.Symbol] = rs
+		symbolInfos[sym.Symbol] = sym.SymbolInfo
 	}
 
 	// Build indicator snapshots for LLM routing (from cached candle data)
@@ -281,6 +284,7 @@ func (s *Screener) Screen(ctx context.Context, cycleID string) (*ScreenResult, e
 		IndicatorSnapshots15m: snap15mMap,
 		IndicatorSnapshots1h:  snap1hMap,
 		StrategyRejections:    strategyRejections,
+		SymbolInfos:           symbolInfos,
 	}, nil
 }
 

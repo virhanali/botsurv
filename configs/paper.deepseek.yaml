@@ -166,15 +166,28 @@ llm:
     max_cost_usd_per_day: 0
     fallback_decision: BLOCK
 
+risk:
+  base_risk_per_trade_pct: 0.5
+  max_risk_per_trade_pct: 1.0
+  max_leverage: 20
+  preferred_leverage: 20
+  min_rr: 1.15
+  max_open_positions: 8
+  max_correlated_positions: 4
+  daily_max_loss_pct: 5.0
+  weekly_max_loss_pct: 10.0
+  min_risk_per_trade_pct: 0.05
+  risk_config_version: v1.1.0
+
 portfolio_risk:
-  max_open_positions: 5
+  max_open_positions: 8
   max_new_positions_per_cycle: 3
-  max_total_exposure_usd: 500
+  max_total_exposure_usd: 800
   max_total_margin_used_pct: 50
   max_risk_per_trade_pct: 0.5
   max_daily_loss_pct: 5.0
-  max_same_direction_positions: 3
-  max_correlated_alt_positions: 2
+  max_same_direction_positions: 4
+  max_correlated_alt_positions: 4
   max_per_symbol_position: 1
   margin_per_trade_usd: 5
   max_leverage: 20
