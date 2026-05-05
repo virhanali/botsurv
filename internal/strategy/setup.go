@@ -1,9 +1,11 @@
 package strategy
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/virhan/botsurv/internal/domain"
+	"github.com/virhan/botsurv/internal/indicator"
 )
 
 // ATR computes Average True Range over the given period.
@@ -423,4 +425,22 @@ func CountTradeActivity(candles []domain.Candle, lookback int) int {
 		}
 	}
 	return count
+}
+
+
+// MinATRCheck rejects candidates with extremely low volatility (ATR% < 0.4).
+func MinATRCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf string, strategy StrategyName) *RejectedCandidate {
+	if snap.ATRPct > 0 && snap.ATRPct < 0.4 {
+		rej := BuildRejectedCandidate(strategy, side, sym, tf, fmt.Sprintf("ATR%% %.2f < 0.4", snap.ATRPct))
+		return &rej
+	}
+	return nil
+}
+// MinVolumeCheck rejects candidates with very low volume ratio.
+func MinVolumeCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf string, strategy StrategyName) *RejectedCandidate {
+	if snap.VolumeRatio > 0 && snap.VolumeRatio < 0.7 {
+		rej := BuildRejectedCandidate(strategy, side, sym, tf, fmt.Sprintf("volume ratio %.2f < 0.7", snap.VolumeRatio))
+		return &rej
+	}
+	return nil
 }

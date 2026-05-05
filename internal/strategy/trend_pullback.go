@@ -56,6 +56,12 @@ func generateTrendPullbackForSide(in TrendPullbackInput, side domain.Side) (*Tra
 
 	last := in.Candles15m[len(in.Candles15m)-1]
 	atr := in.Snapshot15m.ATR14
+	if rej := MinATRCheck(in.Snapshot15m, side, in.Symbol, in.Timeframe, StrategyTrendPullback); rej != nil {
+		return nil, rej
+	}
+	if rej := MinVolumeCheck(in.Snapshot15m, side, in.Symbol, in.Timeframe, StrategyTrendPullback); rej != nil {
+		return nil, rej
+	}
 
 	// 1) HTF trend supportive (1h alignment OR structure)
 	htfOK := false

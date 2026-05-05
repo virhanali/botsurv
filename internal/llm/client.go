@@ -326,7 +326,7 @@ Required JSON format:
 	}
 
 	// Confidence check
-	minConf := 0.6
+	minConf := 0.75
 	if decision.Confidence < minConf {
 		c.log.Warn("LLM confidence below threshold", map[string]any{"confidence": decision.Confidence, "min": minConf})
 		return c.fallbackDecision("BLOCK", "LOW_CONFIDENCE", rawContent), nil

@@ -104,7 +104,7 @@ func TestOpenRouterClient_ValidReduceSize(t *testing.T) {
 				Message chatMessageResponse `json:"message"`
 			}{
 				{Message: chatMessageResponse{
-					Content: `{"decision":"REDUCE_SIZE","confidence":0.7,"size_multiplier":0.5,"regime":"range","reason_codes":["uncertain"],"risk_flags":[],"notes":"reduce"}`,
+					Content: `{"decision":"REDUCE_SIZE","confidence":0.8,"size_multiplier":0.5,"regime":"range","reason_codes":["uncertain"],"risk_flags":[],"notes":"reduce"}`,
 				}},
 			},
 		}

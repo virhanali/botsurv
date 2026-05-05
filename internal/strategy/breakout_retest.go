@@ -50,6 +50,12 @@ func generateBreakoutRetestForSide(in BreakoutRetestInput, side domain.Side) (*T
 		rej := BuildRejectedCandidate(StrategyBreakoutRetest, side, in.Symbol, in.Timeframe, "ATR14 unavailable")
 		return nil, &rej
 	}
+	if rej := MinATRCheck(in.Snapshot15m, side, in.Symbol, in.Timeframe, StrategyBreakoutRetest); rej != nil {
+		return nil, rej
+	}
+	if rej := MinVolumeCheck(in.Snapshot15m, side, in.Symbol, in.Timeframe, StrategyBreakoutRetest); rej != nil {
+		return nil, rej
+	}
 
 	level, breakoutIdx, priorLevel, found := findBreakout(in.Candles15m, in.Snapshot15m, side, atr)
 	if !found {
