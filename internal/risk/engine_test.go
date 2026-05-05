@@ -80,7 +80,7 @@ func validInput() ValidateInput {
 		},
 		LLMDecision: domain.LLMDecision{
 			Decision:       "ALLOW_MARKET",
-			Confidence:     0.85,
+			Confidence:     0.8,
 			SizeMultiplier: 1.0,
 		},
 		AccountState: domain.AccountState{

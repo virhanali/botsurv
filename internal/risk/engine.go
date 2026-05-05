@@ -160,8 +160,8 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 		}
 	}
 
-	// 7. Max open positions
-	if len(input.Portfolio.OpenPositions) >= e.cfg.PortfolioRisk.MaxOpenPositions {
+	// 7. Max open positions (override for high conviction >= 0.85)
+	if len(input.Portfolio.OpenPositions) >= e.cfg.PortfolioRisk.MaxOpenPositions && input.LLMDecision.Confidence < 0.85 {
 		reasons = append(reasons, "MAX_OPEN_POSITIONS")
 	}
 
@@ -170,13 +170,13 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 		reasons = append(reasons, "MAX_NEW_POSITIONS_PER_CYCLE")
 	}
 
-	// 9. Max total exposure
+	// 9. Max total exposure (override for high conviction >= 0.85)
 	var totalExposure float64
 	for _, pos := range input.Portfolio.OpenPositions {
 		totalExposure += pos.EntryPrice * pos.Size
 	}
 	estimatedNewNotional := e.computeBaseNotional(input)
-	if totalExposure+estimatedNewNotional > e.cfg.PortfolioRisk.MaxTotalExposureUSD {
+	if totalExposure+estimatedNewNotional > e.cfg.PortfolioRisk.MaxTotalExposureUSD && input.LLMDecision.Confidence < 0.85 {
 		reasons = append(reasons, "MAX_TOTAL_EXPOSURE")
 	}
 
@@ -632,12 +632,12 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 			openPosCount++
 		}
 	}
-	if openPosCount >= cfg.MaxOpenPositions {
+	if openPosCount >= cfg.MaxOpenPositions && input.ScoreResult.ScoreTotal < 85 {
 		reasons = append(reasons, "MAX_OPEN_POSITIONS")
 	}
 
-	// Max correlated positions (only 1 alt LONG at a time if BTC-correlated)
-	if cand.Side == domain.SideLong && cand.Symbol != "BTCUSDT" {
+	// Correlated positions (override for high conviction >= 85 score)
+	if cand.Side == domain.SideLong && cand.Symbol != "BTCUSDT" && input.ScoreResult.ScoreTotal < 85 {
 		altLongCount := 0
 		for _, p := range input.Portfolio.OpenPositions {
 			if p.Status == domain.PositionStatusOpen && p.Side == domain.SideLong && p.Symbol != "BTCUSDT" {
