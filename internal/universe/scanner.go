@@ -123,10 +123,10 @@ func (s *Scanner) ScanAll(ctx context.Context) ([]domain.UniverseSymbol, error) 
 			continue
 		}
 
-		// Penny coin filter: skip coins with price below $1
+	// Penny coin filter: skip coins with price below $1
+		// Only filter if we have a valid, positive price
 		if !forceSet[inst.Symbol] && hasTicker {
-			price, _ := strconv.ParseFloat(ticker.LastPrice, 64)
-			if price < 1.0 {
+			if price, err := strconv.ParseFloat(ticker.LastPrice, 64); err == nil && price > 0 && price < 1.0 {
 				continue
 			}
 		}

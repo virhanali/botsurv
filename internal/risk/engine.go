@@ -625,6 +625,14 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 	entryPrice := roundToTickSize(cand.EntryPrice, input.SymbolInfo.TickSize)
 	slPrice := roundToTickSize(cand.StopLoss, input.SymbolInfo.TickSize)
 
+	// Recalculate qty using rounded prices for consistency
+	roundedRiskPerUnit := math.Abs(entryPrice - slPrice)
+	if roundedRiskPerUnit > 0 {
+		qty = roundToLotSize(riskAmount/roundedRiskPerUnit, input.SymbolInfo.LotSize)
+		positionValue = qty * entryPrice
+		marginRequired = positionValue / leverage
+	}
+
 	// Post-rounding SL validation
 	if cand.Side == domain.SideLong {
 		if slPrice >= entryPrice {
