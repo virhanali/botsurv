@@ -28,14 +28,21 @@ type Simulator struct {
 	cfg             app.PaperConfig
 	log             *logger.Logger
 	mu              sync.RWMutex
+	checkMu         sync.Mutex // serializes CheckOpenPositions to prevent double-close race (C1)
 
 	// In-memory account cache
-	startingEquity float64
-	currentEquity  float64
-	totalTrades    int
-	wins           int
-	losses         int
-	realizedPnL    float64
+	startingEquity     float64
+	currentEquity      float64
+	totalTrades        int
+	wins               int
+	losses             int
+	realizedPnL        float64
+	consecutiveLosses int
+
+	// initializedAt tracks when Initialize() was called. Trades opened before
+	// this time are rehydrated positions from a previous session and should not
+	// contribute to wins/losses/totalTrades on close.
+	initializedAt time.Time
 }
 
 // NewSimulator creates a new paper mode simulator.
@@ -51,6 +58,8 @@ func NewSimulator(md MarketDataProvider, paperTradeRepo db.PaperTradeRepository,
 
 // Initialize loads or creates the paper account state.
 func (s *Simulator) Initialize(ctx context.Context) error {
+	s.initializedAt = time.Now()
+
 	if s.accountRepo == nil {
 		s.startingEquity = s.cfg.StartingBalanceUSD
 		s.currentEquity = s.cfg.StartingBalanceUSD
@@ -70,6 +79,7 @@ func (s *Simulator) Initialize(ctx context.Context) error {
 	s.wins = state.Wins
 	s.losses = state.Losses
 	s.realizedPnL = state.RealizedPnL
+	s.consecutiveLosses = state.ConsecutiveLosses
 
 	// Rehydrate open positions count from DB
 	if s.paperTradeRepo != nil {
@@ -78,10 +88,13 @@ func (s *Simulator) Initialize(ctx context.Context) error {
 			s.log.Warn("failed to load open paper trades", map[string]any{"error": err.Error()})
 		}
 		s.log.Info("paper simulator initialized", map[string]any{
-			"starting_equity": s.startingEquity,
-			"current_equity":  s.currentEquity,
-			"open_positions":  len(open),
-			"total_trades":    s.totalTrades,
+			"starting_equity":  s.startingEquity,
+			"current_equity":   s.currentEquity,
+			"open_positions":    len(open),
+			"total_trades":     s.totalTrades,
+			"wins":             s.wins,
+			"losses":           s.losses,
+			"consecutive_losses": s.consecutiveLosses,
 		})
 	}
 	return nil
@@ -99,6 +112,41 @@ func (s *Simulator) AccountState() domain.AccountState {
 	}
 }
 
+// ConsecutiveLosses returns the current consecutive loss count.
+func (s *Simulator) ConsecutiveLosses() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.consecutiveLosses
+}
+
+// SetConsecutiveLosses sets the consecutive loss count (used by scheduler to sync state).
+func (s *Simulator) SetConsecutiveLosses(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.consecutiveLosses = n
+}
+
+// Wins returns the current win count.
+func (s *Simulator) Wins() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.wins
+}
+
+// Losses returns the current loss count.
+func (s *Simulator) Losses() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.losses
+}
+
+// TotalTrades returns the current total trade count.
+func (s *Simulator) TotalTrades() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.totalTrades
+}
+
 // OpenPositionCount returns the number of currently open paper positions.
 func (s *Simulator) OpenPositionCount(ctx context.Context) int {
 	if s.paperTradeRepo == nil {
@@ -113,9 +161,6 @@ func (s *Simulator) OpenPositionCount(ctx context.Context) int {
 
 // SimulateFill simulates opening a position from an order plan.
 func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan risk.OrderPlan) (*domain.PaperTrade, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	price, err := s.md.GetLatestPrice(ctx, plan.Symbol)
 	if err != nil {
 		return nil, fmt.Errorf("get latest price: %w", err)
@@ -188,16 +233,18 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 		FeesPaid:     fee,
 	}
 
+	// Update in-memory state under lock
+	s.mu.Lock()
+	s.currentEquity -= fee
+	s.totalTrades++
+	s.mu.Unlock()
+
+	// DB writes outside lock
 	if s.paperTradeRepo != nil {
 		if err := s.paperTradeRepo.Insert(ctx, trade); err != nil {
 			return nil, fmt.Errorf("insert paper trade: %w", err)
 		}
 	}
-
-	// Deduct fees from equity
-	s.currentEquity -= fee
-	s.totalTrades++
-
 	s.persistAccountState(ctx)
 
 	s.log.Info("paper position opened", map[string]any{
@@ -220,6 +267,12 @@ func (s *Simulator) CheckOpenPositions(ctx context.Context) error {
 	if s.paperTradeRepo == nil {
 		return nil
 	}
+
+	// Serialize position checks to prevent double-close race between the 5s
+	// background ticker and the scheduler cycle (C1).
+	s.checkMu.Lock()
+	defer s.checkMu.Unlock()
+
 	openTrades, err := s.paperTradeRepo.GetOpen(ctx)
 	if err != nil {
 		return fmt.Errorf("get open paper trades: %w", err)
@@ -271,12 +324,9 @@ func (s *Simulator) CheckOpenPositions(ctx context.Context) error {
 }
 
 func (s *Simulator) closeTrade(ctx context.Context, trade domain.PaperTrade, exitPrice float64, reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	now := time.Now()
 
-	// Calculate PnL
+	// Calculate PnL (pure arithmetic, no state mutation)
 	var pnlGross float64
 	if trade.Side == domain.SideLong {
 		pnlGross = (exitPrice - trade.EntryPrice) * trade.Qty
@@ -316,6 +366,28 @@ func (s *Simulator) closeTrade(ctx context.Context, trade domain.PaperTrade, exi
 	trade.RMultiple = &rMultiple
 	trade.ExitReason = reason
 
+	// Determine if this trade was opened before simulator init (rehydrated).
+	// Rehydrated trades should still affect equity/PnL (real financial outcome)
+	// but must NOT increment wins/losses/totalTrades/consecutiveLosses since
+	// those were already counted in a previous session.
+	isRehydrated := !s.initializedAt.IsZero() && trade.OpenedAt.Before(s.initializedAt)
+
+	// Update in-memory state under lock
+	s.mu.Lock()
+	s.currentEquity += pnlNet
+	s.realizedPnL += pnlNet
+	if !isRehydrated {
+		if pnlNet > 0 {
+			s.wins++
+			s.consecutiveLosses = 0
+		} else {
+			s.losses++
+			s.consecutiveLosses++
+		}
+	}
+	s.mu.Unlock()
+
+	// DB writes outside lock
 	if s.paperTradeRepo != nil {
 		if err := s.paperTradeRepo.Update(ctx, trade); err != nil {
 			s.log.Error("failed to update paper trade on close", map[string]any{
@@ -324,15 +396,6 @@ func (s *Simulator) closeTrade(ctx context.Context, trade domain.PaperTrade, exi
 			})
 			return
 		}
-	}
-
-	// Update account
-	s.currentEquity += pnlNet
-	s.realizedPnL += pnlNet
-	if pnlNet > 0 {
-		s.wins++
-	} else {
-		s.losses++
 	}
 
 	s.persistAccountState(ctx)
@@ -345,6 +408,7 @@ func (s *Simulator) closeTrade(ctx context.Context, trade domain.PaperTrade, exi
 		"pnl_gross":      pnlGross,
 		"pnl_net":        pnlNet,
 		"r_multiple":     rMultiple,
+		"rehydrated":     isRehydrated,
 	})
 }
 
@@ -352,16 +416,20 @@ func (s *Simulator) persistAccountState(ctx context.Context) {
 	if s.accountRepo == nil {
 		return
 	}
-	err := s.accountRepo.Update(ctx, domain.PaperAccountState{
-		ID:             1,
-		StartingEquity: s.startingEquity,
-		CurrentEquity:  s.currentEquity,
-		TotalTrades:    s.totalTrades,
-		Wins:           s.wins,
-		Losses:         s.losses,
-		RealizedPnL:    s.realizedPnL,
-	})
-	if err != nil {
+	s.mu.RLock()
+	state := domain.PaperAccountState{
+		ID:                1,
+		StartingEquity:    s.startingEquity,
+		CurrentEquity:      s.currentEquity,
+		TotalTrades:        s.totalTrades,
+		Wins:               s.wins,
+		Losses:             s.losses,
+		RealizedPnL:        s.realizedPnL,
+		ConsecutiveLosses:  s.consecutiveLosses,
+	}
+	s.mu.RUnlock()
+
+	if err := s.accountRepo.Update(ctx, state); err != nil {
 		s.log.Error("failed to persist paper account state", map[string]any{"error": err.Error()})
 	}
 }
@@ -393,11 +461,64 @@ func (s *Simulator) GetOpenPositions(ctx context.Context) ([]domain.Position, er
 	return positions, nil
 }
 
+// GetRecentClosedTrades returns paper trades closed since the given time.
+func (s *Simulator) GetRecentClosedTrades(ctx context.Context, since time.Time) ([]domain.PaperTrade, error) {
+	if s.paperTradeRepo == nil {
+		return nil, nil
+	}
+	all, err := s.paperTradeRepo.GetAll(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	var closed []domain.PaperTrade
+	for _, t := range all {
+		if t.ClosedAt != nil && t.ExitReason != "" {
+			closed = append(closed, t)
+		}
+	}
+	return closed, nil
+}
+
 // GetRealizedPnL returns the total realized paper PnL.
 func (s *Simulator) GetRealizedPnL() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.realizedPnL
+}
+
+// CancelOpenPositions cancels all currently open paper trades.
+// This should be called during a simulator reset to avoid rehydrating stale
+// positions from a previous session whose PnL would distort the reset equity.
+func (s *Simulator) CancelOpenPositions(ctx context.Context) error {
+	if s.paperTradeRepo == nil {
+		return nil
+	}
+	open, err := s.paperTradeRepo.GetOpen(ctx)
+	if err != nil {
+		return fmt.Errorf("get open trades for cancellation: %w", err)
+	}
+	now := time.Now()
+	cancelFee := 0.0
+	for _, trade := range open {
+		trade.ClosedAt = &now
+		trade.ExitReason = "cancelled"
+		trade.PnLGross = &cancelFee
+		trade.PnLNet = &cancelFee
+		rZero := 0.0
+		trade.RMultiple = &rZero
+		if err := s.paperTradeRepo.Update(ctx, trade); err != nil {
+			s.log.Error("failed to cancel open paper trade", map[string]any{
+				"paper_trade_id": trade.PaperTradeID,
+				"error":           err.Error(),
+			})
+			continue
+		}
+		s.log.Info("cancelled stale paper trade on reset", map[string]any{
+			"paper_trade_id": trade.PaperTradeID,
+			"symbol":         trade.Symbol,
+		})
+	}
+	return nil
 }
 
 // Run starts the background position checker.

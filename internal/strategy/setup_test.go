@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"math"
 	"testing"
 
 	"github.com/virhan/botsurv/internal/domain"
@@ -371,5 +372,174 @@ func TestCountTradeActivity(t *testing.T) {
 	}
 	if n := CountTradeActivity(candles, 4); n != 2 {
 		t.Fatalf("expected 2 active candles, got %d", n)
+	}
+}
+
+func TestEnforceMinSLDistance_LongSLWidened(t *testing.T) {
+	entry := 100.0
+	currentSL := 99.85
+	atr := 0.3
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+
+	minByATR := 0.3 * 0.3
+	minByPct := 100.0 * 0.3 / 100
+	expectedMinDist := math.Max(minByATR, minByPct)
+	if minDist != expectedMinDist {
+		t.Fatalf("expected minDist %.4f, got %.4f", expectedMinDist, minDist)
+	}
+
+	expectedSL := entry - expectedMinDist
+	if newSL != expectedSL {
+		t.Fatalf("expected SL %.4f, got %.4f", expectedSL, newSL)
+	}
+}
+
+func TestEnforceMinSLDistance_ShortSLWidened(t *testing.T) {
+	entry := 100.0
+	currentSL := 100.15
+	atr := 0.3
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideShort, 0.3, 0.3)
+
+	minByATR := 0.3 * 0.3
+	minByPct := 100.0 * 0.3 / 100
+	expectedMinDist := math.Max(minByATR, minByPct)
+	expectedSL := entry + expectedMinDist
+	if newSL != expectedSL {
+		t.Fatalf("expected SL %.4f, got %.4f", expectedSL, newSL)
+	}
+	if minDist != expectedMinDist {
+		t.Fatalf("expected minDist %.4f, got %.4f", expectedMinDist, minDist)
+	}
+}
+
+func TestEnforceMinSLDistance_NormalVolatility_Unchanged(t *testing.T) {
+	entry := 100.0
+	currentSL := 98.0
+	atr := 2.0
+
+	newSL, _ := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+	if newSL != currentSL {
+		t.Fatalf("SL should not be widened when distance is sufficient, got %.4f instead of %.4f", newSL, currentSL)
+	}
+}
+
+func TestEnforceMinSLDistance_WidenedSLCausesLowRR_Rejected(t *testing.T) {
+	entry := 100.0
+	atr := 0.3
+	currentSL := 99.85
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 1.5, 0.3)
+
+	tp := 100.5
+	riskDist := math.Abs(entry - newSL)
+	rewardDist := math.Abs(tp - entry)
+	rr := rewardDist / riskDist
+
+	minByATR := 1.5 * 0.3
+	minByPct := 100.0 * 0.3 / 100
+	expectedMin := math.Max(minByATR, minByPct)
+	if newSL != entry-expectedMin {
+		t.Fatalf("SL should be widened to entry-minDist, got SL=%.4f, expected=%.4f", newSL, entry-expectedMin)
+	}
+	if rr >= 1.4 {
+		t.Fatalf("expected RR < 1.4 after widening, got %.2f (SL=%.4f, minDist=%.4f)", rr, newSL, minDist)
+	}
+}
+
+func TestEnforceMinSLDistance_ZeroATR_NoChange(t *testing.T) {
+	entry := 100.0
+	currentSL := 99.8
+	atr := 0.0
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+
+	minByPct := 100.0 * 0.3 / 100
+	if minDist != minByPct {
+		t.Fatalf("expected minDist=%.4f (pct-only fallback), got %.4f", minByPct, minDist)
+	}
+	expectedSL := entry - minByPct
+	if newSL != expectedSL {
+		t.Fatalf("expected SL %.4f, got %.4f", expectedSL, newSL)
+	}
+}
+
+func TestEnforceMinSLDistance_ZeroEntry_NoChange(t *testing.T) {
+	entry := 0.0
+	currentSL := 99.5
+	atr := 1.0
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+
+	if newSL != currentSL {
+		t.Fatalf("SL should be unchanged for zero entry, got %.4f", newSL)
+	}
+	if minDist != 0 {
+		t.Fatalf("minDist should be 0 for zero entry, got %.4f", minDist)
+	}
+}
+
+func TestEnforceMinSLDistance_NegativeATR_NoChange(t *testing.T) {
+	entry := 100.0
+	currentSL := 99.5
+	atr := -1.0
+
+	_, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+
+	minByPct := 100.0 * 0.3 / 100
+	if minDist != minByPct {
+		t.Fatalf("expected minDist=%.4f (negative ATR treated as 0), got %.4f", minByPct, minDist)
+	}
+}
+
+func TestEnforceMinSLDistance_BothThresholdsZero_NoChange(t *testing.T) {
+	entry := 100.0
+	currentSL := 99.99
+	atr := 0.5
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0, 0)
+
+	if newSL != currentSL {
+		t.Fatalf("SL should not change when both thresholds are 0, got %.4f", newSL)
+	}
+	if minDist != 0 {
+		t.Fatalf("minDist should be 0 when both thresholds are 0, got %.4f", minDist)
+	}
+}
+
+func TestEnforceMinSLDistance_ATRThresholdLargerThanPct(t *testing.T) {
+	entry := 50.0
+	currentSL := 49.8
+	atr := 5.0
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+
+	minByATR := 0.3 * 5.0
+	minByPct := 50.0 * 0.3 / 100
+	if minDist != minByATR {
+		t.Fatalf("expected ATR threshold (%.4f) to dominate over pct threshold (%.4f), got %.4f", minByATR, minByPct, minDist)
+	}
+	expectedSL := entry - minByATR
+	if newSL != expectedSL {
+		t.Fatalf("expected SL %.4f, got %.4f", expectedSL, newSL)
+	}
+}
+
+func TestEnforceMinSLDistance_PctThresholdLargerThanATR(t *testing.T) {
+	entry := 1000.0
+	currentSL := 999.0
+	atr := 0.5
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+
+	minByATR := 0.3 * 0.5
+	minByPct := 1000.0 * 0.3 / 100
+	if minDist != minByPct {
+		t.Fatalf("expected pct threshold (%.4f) to dominate over ATR threshold (%.4f), got %.4f", minByPct, minByATR, minDist)
+	}
+	expectedSL := entry - minByPct
+	if newSL != expectedSL {
+		t.Fatalf("expected SL %.4f, got %.4f", expectedSL, newSL)
 	}
 }

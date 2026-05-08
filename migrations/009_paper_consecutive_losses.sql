@@ -1,0 +1,2 @@
+-- Add consecutive_losses column to paper_account_state for persisting loss streaks across restarts.
+ALTER TABLE paper_account_state ADD COLUMN IF NOT EXISTS consecutive_losses INTEGER NOT NULL DEFAULT 0;

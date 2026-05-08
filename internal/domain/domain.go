@@ -385,12 +385,13 @@ type PaperTrade struct {
 
 // PaperAccountState persists paper account state across restarts.
 type PaperAccountState struct {
-	ID            int64
-	StartingEquity float64
-	CurrentEquity  float64
-	TotalTrades    int
-	Wins           int
-	Losses         int
-	RealizedPnL    float64
-	UpdatedAt      time.Time
+	ID                 int64
+	StartingEquity    float64
+	CurrentEquity      float64
+	TotalTrades        int
+	Wins               int
+	Losses             int
+	RealizedPnL        float64
+	ConsecutiveLosses  int
+	UpdatedAt          time.Time
 }

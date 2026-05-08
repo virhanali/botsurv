@@ -11,15 +11,17 @@ import (
 
 // BreakoutRetestInput contains snapshots and candles for breakout-retest evaluation.
 type BreakoutRetestInput struct {
-	Now                  time.Time
-	Symbol               string
-	Timeframe            string
-	TickSize             float64
-	Candles15m           []domain.Candle
-	Snapshot15m          indicator.IndicatorSnapshot
-	Snapshot1h           indicator.IndicatorSnapshot
-	IndicatorSnapshotRef string
-	RegimeSnapshotRef    string
+	Now                          time.Time
+	Symbol                       string
+	Timeframe                    string
+	TickSize                     float64
+	Candles15m                   []domain.Candle
+	Snapshot15m                  indicator.IndicatorSnapshot
+	Snapshot1h                   indicator.IndicatorSnapshot
+	IndicatorSnapshotRef         string
+	RegimeSnapshotRef            string
+	MinSLDistanceATRMultiplier   float64
+	MinSLDistancePct             float64
 }
 
 // GenerateBreakoutRetest evaluates both sides and returns one candidate when valid.
@@ -123,9 +125,11 @@ func generateBreakoutRetestForSide(in BreakoutRetestInput, side domain.Side) (*T
 		}
 	}
 
+	sl, _ = EnforceMinSLDistance(entry, sl, atr, side, in.MinSLDistanceATRMultiplier, in.MinSLDistancePct)
+
 	riskDist := math.Abs(entry - sl)
-	if riskDist <= 0 {
-		rej := BuildRejectedCandidate(StrategyBreakoutRetest, side, in.Symbol, in.Timeframe, "invalid risk distance")
+	if riskDist <= 0 || math.IsNaN(riskDist) || math.IsInf(riskDist, 0) {
+		rej := BuildRejectedCandidate(StrategyBreakoutRetest, side, in.Symbol, in.Timeframe, "invalid_risk_distance")
 		return nil, &rej
 	}
 

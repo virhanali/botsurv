@@ -582,3 +582,41 @@ func TestConfig_RejectLeverageMismatch(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestIndicatorsConfig_WithDefaults(t *testing.T) {
+	cfg := IndicatorsConfig{}
+	def := cfg.WithDefaults()
+	if def.MinSLDistanceATRMultiplier != 0.3 {
+		t.Errorf("expected default MinSLDistanceATRMultiplier=0.3, got %.2f", def.MinSLDistanceATRMultiplier)
+	}
+	if def.MinSLDistancePct != 0.3 {
+		t.Errorf("expected default MinSLDistancePct=0.3, got %.2f", def.MinSLDistancePct)
+	}
+
+	cfg2 := IndicatorsConfig{MinSLDistanceATRMultiplier: 0.5, MinSLDistancePct: 0.5}
+	def2 := cfg2.WithDefaults()
+	if def2.MinSLDistanceATRMultiplier != 0.5 {
+		t.Errorf("expected custom MinSLDistanceATRMultiplier=0.5, got %.2f", def2.MinSLDistanceATRMultiplier)
+	}
+	if def2.MinSLDistancePct != 0.5 {
+		t.Errorf("expected custom MinSLDistancePct=0.5, got %.2f", def2.MinSLDistancePct)
+	}
+}
+
+func TestConfigValidate_NegativeSLDistanceATRMultiplier(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Strategy.Indicators.MinSLDistanceATRMultiplier = -0.1
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative min_sl_distance_atr_multiplier")
+	}
+}
+
+func TestConfigValidate_NegativeSLDistancePct(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Strategy.Indicators.MinSLDistancePct = -0.1
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative min_sl_distance_pct")
+	}
+}

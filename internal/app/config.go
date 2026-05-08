@@ -116,6 +116,10 @@ type MarketRegimeConfig struct {
 	BTCNearLevelATRBuffer float64                `yaml:"btc_near_level_atr_buffer"`
 	BTCDRisingFastPct     float64                `yaml:"btcd_rising_fast_pct"`
 	RelativeStrength      RelativeStrengthConfig `yaml:"relative_strength"`
+	Btc5mStaleness        Btc5mStalenessConfig   `yaml:"btc_5m_staleness"`
+	RangingATRMultiplier       float64 `yaml:"ranging_atr_multiplier"`
+	RangingLookbackCandles     int     `yaml:"ranging_lookback_candles"`
+	ReduceNewPositionsWhenRanging bool `yaml:"reduce_new_positions_when_ranging"`
 }
 
 // RelativeStrengthConfig controls classification thresholds.
@@ -218,6 +222,8 @@ type IndicatorsConfig struct {
 	MaxDistanceFromBreakoutATR float64 `yaml:"max_distance_from_breakout_atr"`
 	MinRR                      float64 `yaml:"min_rr"`
 	ExpectedMoveCostMultiplier float64 `yaml:"expected_move_cost_multiplier"`
+	MinSLDistanceATRMultiplier float64 `yaml:"min_sl_distance_atr_multiplier"`
+	MinSLDistancePct           float64 `yaml:"min_sl_distance_pct"`
 }
 
 // RegimeConfig contains regime detection thresholds.
@@ -273,19 +279,20 @@ type LLMReviewConfig struct {
 
 // PortfolioRiskConfig contains portfolio-level risk limits.
 type PortfolioRiskConfig struct {
-	MaxOpenPositions          int            `yaml:"max_open_positions"`
-	MaxNewPositionsPerCycle   int            `yaml:"max_new_positions_per_cycle"`
-	MaxTotalExposureUSD       float64        `yaml:"max_total_exposure_usd"`
-	MaxTotalMarginUsedPct     float64        `yaml:"max_total_margin_used_pct"`
-	MaxRiskPerTradePct        float64        `yaml:"max_risk_per_trade_pct"`
-	MaxDailyLossPct           float64        `yaml:"max_daily_loss_pct"`
-	MaxSameDirectionPositions int            `yaml:"max_same_direction_positions"`
-	MaxCorrelatedAltPositions int            `yaml:"max_correlated_alt_positions"`
-	MaxPerSymbolPosition      int            `yaml:"max_per_symbol_position"`
-	MarginPerTradeUSD         float64        `yaml:"margin_per_trade_usd"`
-	MaxLeverage               float64        `yaml:"max_leverage"`
-	MinNotionalUSD            float64        `yaml:"min_notional_usd"`
-	CooldownAfterLosses       CooldownConfig `yaml:"cooldown_after_losses"`
+	MaxOpenPositions            int                       `yaml:"max_open_positions"`
+	MaxNewPositionsPerCycle     int                       `yaml:"max_new_positions_per_cycle"`
+	MaxTotalExposureUSD         float64                   `yaml:"max_total_exposure_usd"`
+	MaxTotalMarginUsedPct       float64                   `yaml:"max_total_margin_used_pct"`
+	MaxRiskPerTradePct          float64                   `yaml:"max_risk_per_trade_pct"`
+	MaxDailyLossPct             float64                   `yaml:"max_daily_loss_pct"`
+	MaxSameDirectionPositions   int                       `yaml:"max_same_direction_positions"`
+	MaxCorrelatedAltPositions   int                       `yaml:"max_correlated_alt_positions"`
+	MaxPerSymbolPosition        int                       `yaml:"max_per_symbol_position"`
+	MarginPerTradeUSD           float64                   `yaml:"margin_per_trade_usd"`
+	MaxLeverage                 float64                   `yaml:"max_leverage"`
+	MinNotionalUSD              float64                   `yaml:"min_notional_usd"`
+	CooldownAfterLosses         CooldownConfig            `yaml:"cooldown_after_losses"`
+	PerSymbolSLCooldown          PerSymbolSLCooldownConfig `yaml:"per_symbol_sl_cooldown"`
 }
 
 // CooldownConfig controls post-loss cooldown.
@@ -293,6 +300,18 @@ type CooldownConfig struct {
 	Enabled           bool `yaml:"enabled"`
 	ConsecutiveLosses int  `yaml:"consecutive_losses"`
 	CooldownMinutes   int  `yaml:"cooldown_minutes"`
+}
+
+// PerSymbolSLCooldownConfig controls per-symbol SL cooldown.
+type PerSymbolSLCooldownConfig struct {
+	Enabled        bool `yaml:"enabled"`
+	CooldownMinutes int `yaml:"cooldown_minutes"`
+}
+
+// Btc5mStalenessConfig controls BTC 5m staleness detection.
+type Btc5mStalenessConfig struct {
+	WarnCycles     int `yaml:"warn_cycles"`
+	CriticalCycles int `yaml:"critical_cycles"`
 }
 
 // SizingConfig contains position sizing parameters.
@@ -573,10 +592,28 @@ func (c StrategyConfig) validate() error {
 	if c.Indicators.MinRR <= 0 {
 		return errors.New("strategy.indicators.min_rr must be > 0")
 	}
+	if c.Indicators.MinSLDistanceATRMultiplier < 0 {
+		return errors.New("strategy.indicators.min_sl_distance_atr_multiplier must be >= 0")
+	}
+	if c.Indicators.MinSLDistancePct < 0 {
+		return errors.New("strategy.indicators.min_sl_distance_pct must be >= 0")
+	}
 	if c.LimitRetestTTLMinutes < 0 {
 		return errors.New("strategy.limit_retest_ttl_minutes must be >= 0")
 	}
 	return nil
+}
+
+// WithDefaults returns indicators config with SL distance defaults applied.
+func (c IndicatorsConfig) WithDefaults() IndicatorsConfig {
+	out := c
+	if out.MinSLDistanceATRMultiplier <= 0 {
+		out.MinSLDistanceATRMultiplier = 1.0
+	}
+	if out.MinSLDistancePct <= 0 {
+		out.MinSLDistancePct = 2.0
+	}
+	return out
 }
 
 func (c AlertsConfig) validate() error {
@@ -662,6 +699,18 @@ func (c *MarketRegimeConfig) Validate() error {
 	}
 	if c.BTCDRisingFastPct < 0 {
 		return errors.New("btcd_rising_fast_pct must be >= 0")
+	}
+	if c.Btc5mStaleness.WarnCycles < 0 {
+		return errors.New("btc_5m_staleness.warn_cycles must be >= 0")
+	}
+	if c.Btc5mStaleness.CriticalCycles < 0 {
+		return errors.New("btc_5m_staleness.critical_cycles must be >= 0")
+	}
+	if c.RangingATRMultiplier < 0 {
+		return errors.New("ranging_atr_multiplier must be >= 0")
+	}
+	if c.RangingLookbackCandles < 0 {
+		return errors.New("ranging_lookback_candles must be >= 0")
 	}
 	if err := c.RelativeStrength.Validate(); err != nil {
 		return err
@@ -763,6 +812,9 @@ func (c *PortfolioRiskConfig) Validate() error {
 	}
 	if c.MaxPerSymbolPosition > c.MaxOpenPositions {
 		return errors.New("max_per_symbol_position cannot exceed max_open_positions")
+	}
+	if c.PerSymbolSLCooldown.CooldownMinutes < 0 {
+		return errors.New("per_symbol_sl_cooldown.cooldown_minutes must be >= 0")
 	}
 	return nil
 }
@@ -1074,7 +1126,38 @@ func (c IndicatorEngineConfig) WithDefaults() IndicatorEngineConfig {
 	return out
 }
 
-// WithDefaults returns market-regime config with phase-2 defaults applied.
+// WithDefaults returns cooldown config with defaults applied.
+func (c CooldownConfig) WithDefaults() CooldownConfig {
+	out := c
+	if out.ConsecutiveLosses <= 0 {
+		out.ConsecutiveLosses = 3
+	}
+	if out.CooldownMinutes <= 0 {
+		out.CooldownMinutes = 60
+	}
+	return out
+}
+
+// WithDefaults returns per-symbol SL cooldown config with defaults applied.
+func (c PerSymbolSLCooldownConfig) WithDefaults() PerSymbolSLCooldownConfig {
+	out := c
+	if out.CooldownMinutes <= 0 {
+		out.CooldownMinutes = 60
+	}
+	return out
+}
+
+// WithDefaults returns BTC 5m staleness config with defaults applied.
+func (c Btc5mStalenessConfig) WithDefaults() Btc5mStalenessConfig {
+	out := c
+	if out.WarnCycles <= 0 {
+		out.WarnCycles = 3
+	}
+	if out.CriticalCycles <= 0 {
+		out.CriticalCycles = 10
+	}
+	return out
+}
 func (c MarketRegimeConfig) WithDefaults() MarketRegimeConfig {
 	out := c
 	if out.BTCDumpShortPct == 0 {
@@ -1090,6 +1173,13 @@ func (c MarketRegimeConfig) WithDefaults() MarketRegimeConfig {
 		out.BTCDRisingFastPct = 0.8
 	}
 	out.RelativeStrength = out.RelativeStrength.WithDefaults()
+	out.Btc5mStaleness = out.Btc5mStaleness.WithDefaults()
+	if out.RangingATRMultiplier <= 0 {
+		out.RangingATRMultiplier = 2.5
+	}
+	if out.RangingLookbackCandles <= 0 {
+		out.RangingLookbackCandles = 16
+	}
 	return out
 }
 

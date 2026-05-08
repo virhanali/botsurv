@@ -976,3 +976,91 @@ func TestRoundToLotSize(t *testing.T) {
 		}
 	}
 }
+
+func TestValidate_SymbolSLCooldown(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.PortfolioRisk.PerSymbolSLCooldown = app.PerSymbolSLCooldownConfig{Enabled: true, CooldownMinutes: 60}
+	e := NewEngine(cfg)
+	input := validInput()
+	input.Portfolio.PerSymbolSLCooldown = map[string]time.Time{
+		"BTCUSDT": time.Now().Add(30 * time.Minute),
+	}
+	output := e.Validate(input)
+	if output.Approved {
+		t.Error("expected rejected: symbol in SL cooldown")
+	}
+	assertContainsReason(t, output.ReasonCodes, "SYMBOL_SL_COOLDOWN")
+}
+
+func TestValidate_SymbolSLCooldownExpired(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.PortfolioRisk.PerSymbolSLCooldown = app.PerSymbolSLCooldownConfig{Enabled: true, CooldownMinutes: 60}
+	e := NewEngine(cfg)
+	input := validInput()
+	input.Portfolio.PerSymbolSLCooldown = map[string]time.Time{
+		"BTCUSDT": time.Now().Add(-1 * time.Minute),
+	}
+	output := e.Validate(input)
+	if !output.Approved {
+		t.Errorf("expected approved with expired cooldown, got: %v", output.ReasonCodes)
+	}
+}
+
+func TestValidate_SymbolSLCooldownDisabled(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.PortfolioRisk.PerSymbolSLCooldown = app.PerSymbolSLCooldownConfig{Enabled: false}
+	e := NewEngine(cfg)
+	input := validInput()
+	input.Portfolio.PerSymbolSLCooldown = map[string]time.Time{
+		"BTCUSDT": time.Now().Add(30 * time.Minute),
+	}
+	// When disabled, should NOT block even if cooldown map is set
+	output := e.Validate(input)
+	// SYMBOL_SL_COOLDOWN should NOT appear since the feature is disabled
+	for _, r := range output.ReasonCodes {
+		if r == "SYMBOL_SL_COOLDOWN" {
+			t.Error("expected no SYMBOL_SL_COOLDOWN when feature disabled")
+		}
+	}
+}
+
+func TestValidateCandidate_SymbolSLCooldown(t *testing.T) {
+	cfg := phase4Config()
+	cfg.PortfolioRisk.PerSymbolSLCooldown = app.PerSymbolSLCooldownConfig{Enabled: true, CooldownMinutes: 60}
+	e := NewEngine(cfg)
+	input := phase4Input()
+	input.Portfolio.PerSymbolSLCooldown = map[string]time.Time{
+		"BTCUSDT": time.Now().Add(30 * time.Minute),
+	}
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for symbol in SL cooldown")
+	}
+	assertContainsReason(t, result.RejectionReasons, "SYMBOL_SL_COOLDOWN")
+}
+
+func TestValidateCandidate_ConsecutiveLossesCooldown(t *testing.T) {
+	cfg := phase4Config()
+	cfg.PortfolioRisk.CooldownAfterLosses = app.CooldownConfig{Enabled: true, ConsecutiveLosses: 3, CooldownMinutes: 60}
+	e := NewEngine(cfg)
+	input := phase4Input()
+	input.Portfolio.ConsecutiveLosses = 3
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for consecutive losses cooldown")
+	}
+	assertContainsReason(t, result.RejectionReasons, "CONSECUTIVE_LOSSES_COOLDOWN")
+}
+
+func TestValidateCandidate_PortfolioCooldown(t *testing.T) {
+	cfg := phase4Config()
+	e := NewEngine(cfg)
+	input := phase4Input()
+	future := time.Now().Add(30 * time.Minute)
+	input.Portfolio.CooldownUntil = &future
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for portfolio cooldown")
+	}
+	assertContainsReason(t, result.RejectionReasons, "IN_COOLDOWN")
+}

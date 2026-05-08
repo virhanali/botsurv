@@ -12,16 +12,18 @@ import (
 
 // TrendPullbackInput contains snapshots and candles for trend-pullback evaluation.
 type TrendPullbackInput struct {
-	Now                  time.Time
-	Symbol               string
-	Timeframe            string
-	TickSize             float64
-	Candles15m           []domain.Candle
-	Snapshot15m          indicator.IndicatorSnapshot
-	Snapshot1h           indicator.IndicatorSnapshot
-	Snapshot4h           indicator.IndicatorSnapshot
-	IndicatorSnapshotRef string
-	RegimeSnapshotRef    string
+	Now                          time.Time
+	Symbol                       string
+	Timeframe                    string
+	TickSize                     float64
+	Candles15m                   []domain.Candle
+	Snapshot15m                  indicator.IndicatorSnapshot
+	Snapshot1h                   indicator.IndicatorSnapshot
+	Snapshot4h                   indicator.IndicatorSnapshot
+	IndicatorSnapshotRef         string
+	RegimeSnapshotRef            string
+	MinSLDistanceATRMultiplier   float64
+	MinSLDistancePct             float64
 }
 
 // GenerateTrendPullback evaluates long/short and returns the first valid candidate.
@@ -185,9 +187,11 @@ func generateTrendPullbackForSide(in TrendPullbackInput, side domain.Side) (*Tra
 		}
 	}
 
+	sl, _ = EnforceMinSLDistance(entry, sl, atr, side, in.MinSLDistanceATRMultiplier, in.MinSLDistancePct)
+
 	riskDist := math.Abs(entry - sl)
-	if riskDist <= 0 {
-		rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, "invalid risk distance")
+	if riskDist <= 0 || math.IsNaN(riskDist) || math.IsInf(riskDist, 0) {
+		rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, "invalid_risk_distance")
 		return nil, &rej
 	}
 

@@ -251,3 +251,34 @@ func BlockIfPositionMismatch(localState, exchangeState []PositionState) (bool, s
 	}
 	return false, ""
 }
+
+// BlockIfSymbolInSLCooldown blocks when a symbol is in per-SL cooldown.
+func BlockIfSymbolInSLCooldown(symbol string, cooldownMap map[string]time.Time) (bool, string) {
+	if cooldownMap == nil {
+		return false, ""
+	}
+	until, ok := cooldownMap[symbol]
+	if !ok {
+		return false, ""
+	}
+	if time.Now().Before(until) {
+		remaining := time.Until(until).Truncate(time.Second)
+		return true, fmt.Sprintf("symbol %s in SL cooldown until %s (%s remaining)", symbol, until.Format(time.RFC3339), remaining)
+	}
+	return false, ""
+}
+
+// CleanExpiredSLCooldowns removes expired entries from per-symbol cooldown map.
+func CleanExpiredSLCooldowns(cooldownMap map[string]time.Time) map[string]time.Time {
+	if cooldownMap == nil {
+		return nil
+	}
+	now := time.Now()
+	cleaned := make(map[string]time.Time, len(cooldownMap))
+	for sym, until := range cooldownMap {
+		if now.Before(until) {
+			cleaned[sym] = until
+		}
+	}
+	return cleaned
+}

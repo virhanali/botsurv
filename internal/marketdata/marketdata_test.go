@@ -3,6 +3,7 @@ package marketdata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
+
 	"github.com/virhan/botsurv/internal/app"
 	"github.com/virhan/botsurv/internal/domain"
 )
@@ -2463,4 +2466,309 @@ func TestStart_GoroutineUsesCapturedStartContext(t *testing.T) {
 	svc.running = false
 	svc.cancel()
 	svc.mu.Unlock()
+}
+
+// --- Rate Limiter / Retry Tests ---
+
+func TestBackfillRateLimiter_WaitsBeforeRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode": 0,
+			"retMsg": "OK",
+			"result": {
+				"list": [
+					["1672324800000", "100", "110", "90", "105", "10", "1000"]
+				]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	// Set a restrictive limiter to verify Wait is called.
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1), 1)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	candles, err := backfillCandles(context.Background(), server.Client(), server.URL, "BTCUSDT", "15m", 1, nil)
+	if err != nil {
+		t.Fatalf("backfill error: %v", err)
+	}
+	if len(candles) != 1 {
+		t.Errorf("expected 1 candle, got %d", len(candles))
+	}
+}
+
+func TestBackfillRateLimiter_RespectsContextCancellation(t *testing.T) {
+	// Fully drain the limiter's token bucket.
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(0.01), 0) // essentially blocked forever
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // immediate cancellation
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"list":[]}}`))
+	}))
+	defer server.Close()
+
+	_, err := backfillCandles(ctx, server.Client(), server.URL, "BTCUSDT", "15m", 1, nil)
+	if err == nil {
+		t.Fatal("expected error from cancelled context during rate limit wait")
+	}
+	if !strings.Contains(err.Error(), "rate limiter") {
+		t.Errorf("expected rate limiter error, got: %v", err)
+	}
+}
+
+func TestBackfillRetry_RateLimitError_Retries(t *testing.T) {
+	attemptCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		w.Header().Set("Content-Type", "application/json")
+		if attemptCount <= 2 {
+			// Return JSON rate limit error (HTTP 200 but retCode=10006)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"retCode":10006,"retMsg":"Too many visits. Exceeded the API Rate Limit"}`))
+			return
+		}
+		// Succeed on 3rd attempt
+		w.Write([]byte(`{
+			"retCode": 0,
+			"retMsg": "OK",
+			"result": {
+				"list": [
+					["1672324800000", "100", "110", "90", "105", "10", "1000"]
+				]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1000), 1000)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	candles, err := backfillCandles(context.Background(), server.Client(), server.URL, "BTCUSDT", "15m", 1, nil)
+	if err != nil {
+		t.Fatalf("backfill should succeed after retry: %v", err)
+	}
+	if len(candles) != 1 {
+		t.Errorf("expected 1 candle, got %d", len(candles))
+	}
+	if attemptCount != 3 {
+		t.Errorf("expected 3 attempts (2 rate limit + 1 success), got %d", attemptCount)
+	}
+}
+
+func TestBackfillRetry_RateLimitError_ExhaustedRetries(t *testing.T) {
+	attemptCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"retCode":10006,"retMsg":"Too many visits. Exceeded the API Rate Limit"}`))
+	}))
+	defer server.Close()
+
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1000), 1000)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	_, err := backfillCandles(context.Background(), server.Client(), server.URL, "BTCUSDT", "15m", 1, nil)
+	if err == nil {
+		t.Fatal("expected error after retries exhausted")
+	}
+	if !strings.Contains(err.Error(), "bybit error 10006") {
+		t.Errorf("expected rate limit error, got: %v", err)
+	}
+	// maxBackfillRetries=3 means attempts 0,1,2,3 = 4 total
+	if attemptCount != 4 {
+		t.Errorf("expected 4 attempts, got %d", attemptCount)
+	}
+}
+
+func TestBackfillRetry_RateLimitError_HTTPStatus(t *testing.T) {
+	// Bybit may return a non-200 HTTP status with "10006" in body.
+	attemptCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"retCode":10006,"retMsg":"Too many visits"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode": 0,
+			"retMsg": "OK",
+			"result": {
+				"list": [
+					["1672324800000", "100", "110", "90", "105", "10", "1000"]
+				]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1000), 1000)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	candles, err := backfillCandles(context.Background(), server.Client(), server.URL, "BTCUSDT", "15m", 1, nil)
+	if err != nil {
+		t.Fatalf("backfill should succeed after retry: %v", err)
+	}
+	if len(candles) != 1 || attemptCount != 2 {
+		t.Errorf("expected 1 candle on attempt 2, got %d candles %d attempts", len(candles), attemptCount)
+	}
+}
+
+func TestBackfillRetry_NetworkError_Retries(t *testing.T) {
+	attemptCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount <= 2 {
+			// Sleep long enough that the client times out.
+			time.Sleep(200 * time.Millisecond)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"retCode": 0,
+			"retMsg": "OK",
+			"result": {
+				"list": [
+					["1672324800000", "100", "110", "90", "105", "10", "1000"]
+				]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1000), 1000)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	// Use a client with a short timeout to trigger network timeouts.
+	client := &http.Client{Timeout: 50 * time.Millisecond}
+
+	candles, err := backfillCandles(context.Background(), client, server.URL, "BTCUSDT", "15m", 1, nil)
+	if err != nil {
+		t.Fatalf("backfill should succeed after network retry: %v", err)
+	}
+	if len(candles) != 1 {
+		t.Errorf("expected 1 candle, got %d", len(candles))
+	}
+	if attemptCount != 3 {
+		t.Errorf("expected 3 attempts (2 network timeouts + 1 success), got %d", attemptCount)
+	}
+}
+
+func TestBackfillRetry_NetworkError_ExhaustedRetries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Always sleep to cause client timeout.
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1000), 1000)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	client := &http.Client{Timeout: 50 * time.Millisecond}
+
+	_, err := backfillCandles(context.Background(), client, server.URL, "BTCUSDT", "15m", 1, nil)
+	if err == nil {
+		t.Fatal("expected error after network retries exhausted")
+	}
+	if !strings.Contains(err.Error(), "backfill request") {
+		t.Errorf("expected network error, got: %v", err)
+	}
+}
+
+func TestBackfillRetry_ContextCancelledDuringBackoff(t *testing.T) {
+	attemptCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"retCode":10006,"retMsg":"Too many visits"}`))
+	}))
+	defer server.Close()
+
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1000), 1000)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := backfillCandles(ctx, server.Client(), server.URL, "BTCUSDT", "15m", 1, nil)
+	if err == nil {
+		t.Fatal("expected context error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context error, got: %v", err)
+	}
+}
+
+func TestIsRateLimitError(t *testing.T) {
+	if isRateLimitError(nil) {
+		t.Error("nil error should not be rate limit error")
+	}
+	if isRateLimitError(errors.New("something else")) {
+		t.Error("unrelated error should not be rate limit error")
+	}
+	if !isRateLimitError(errors.New("bybit error 10006: Too many visits. Exceeded the API Rate Limit")) {
+		t.Error("rate limit error not detected")
+	}
+}
+
+func TestIsNetworkError(t *testing.T) {
+	if isNetworkError(nil) {
+		t.Error("nil error should not be network error")
+	}
+	if isNetworkError(errors.New("something else")) {
+		t.Error("unrelated error should not be network error")
+	}
+	if !isNetworkError(errors.New("connection refused")) {
+		t.Error("connection refused not detected as network error")
+	}
+	if !isNetworkError(errors.New("connection reset")) {
+		t.Error("connection reset not detected as network error")
+	}
+	if !isNetworkError(errors.New("no such host")) {
+		t.Error("no such host not detected as network error")
+	}
+	if isNetworkError(errors.New("EOF")) {
+		t.Error("bare EOF string should not be detected as network error")
+	}
+}
+
+func TestBackfillRetry_DoesNotRetryOnNonRetryableError(t *testing.T) {
+	// error 10001 (invalid symbol) should NOT be retried
+	attemptCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"retCode":10001,"retMsg":"invalid symbol"}`))
+	}))
+	defer server.Close()
+
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(1000), 1000)
+	defer func() { bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1) }()
+
+	_, err := backfillCandles(context.Background(), server.Client(), server.URL, "BTCUSDT", "15m", 1, nil)
+	if err == nil {
+		t.Fatal("expected error for non-retryable code")
+	}
+	if attemptCount != 1 {
+		t.Errorf("expected 1 attempt (no retry), got %d", attemptCount)
+	}
+}
+
+func TestBackfill_ZeroLimitReturnsNil(t *testing.T) {
+	candles, err := backfillCandles(context.Background(), nil, "", "BTCUSDT", "15m", 0, nil)
+	if err != nil {
+		t.Fatalf("expected no error for zero limit: %v", err)
+	}
+	if candles != nil {
+		t.Errorf("expected nil candles for zero limit, got %v", candles)
+	}
 }

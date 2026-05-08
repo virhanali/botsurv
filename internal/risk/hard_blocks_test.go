@@ -150,3 +150,67 @@ func TestBlockIfPositionMismatch(t *testing.T) {
 		t.Fatal("expected side mismatch to block")
 	}
 }
+
+func TestBlockIfSymbolInSLCooldown(t *testing.T) {
+	// Nil map should not block.
+	if blocked, _ := BlockIfSymbolInSLCooldown("BTCUSDT", nil); blocked {
+		t.Fatal("expected nil cooldown map to pass")
+	}
+
+	// Empty map should not block.
+	if blocked, _ := BlockIfSymbolInSLCooldown("BTCUSDT", map[string]time.Time{}); blocked {
+		t.Fatal("expected empty cooldown map to pass")
+	}
+
+	// Symbol not in cooldown map should pass.
+	cooldowns := map[string]time.Time{"ETHUSDT": time.Now().Add(30 * time.Minute)}
+	if blocked, _ := BlockIfSymbolInSLCooldown("BTCUSDT", cooldowns); blocked {
+		t.Fatal("expected symbol not in cooldown to pass")
+	}
+
+	// Symbol in active cooldown should block.
+	future := time.Now().Add(30 * time.Minute)
+	cooldowns = map[string]time.Time{"BTCUSDT": future}
+	blocked, reason := BlockIfSymbolInSLCooldown("BTCUSDT", cooldowns)
+	if !blocked {
+		t.Fatal("expected symbol in cooldown to block")
+	}
+	if reason == "" {
+		t.Fatal("expected non-empty block reason")
+	}
+
+	// Expired cooldown should pass.
+	past := time.Now().Add(-1 * time.Minute)
+	cooldowns = map[string]time.Time{"BTCUSDT": past}
+	if blocked, _ := BlockIfSymbolInSLCooldown("BTCUSDT", cooldowns); blocked {
+		t.Fatal("expected expired cooldown to pass")
+	}
+}
+
+func TestCleanExpiredSLCooldowns(t *testing.T) {
+	now := time.Now()
+	cooldowns := map[string]time.Time{
+		"BTCUSDT": now.Add(30 * time.Minute), // active
+		"ETHUSDT": now.Add(-1 * time.Minute),  // expired
+		"SOLUSDT": now.Add(1 * time.Hour),     // active
+	}
+
+	cleaned := CleanExpiredSLCooldowns(cooldowns)
+	if len(cleaned) != 2 {
+		t.Fatalf("expected 2 active cooldowns, got %d", len(cleaned))
+	}
+	if _, ok := cleaned["BTCUSDT"]; !ok {
+		t.Fatal("expected BTCUSDT to remain in cooldown map")
+	}
+	if _, ok := cleaned["SOLUSDT"]; !ok {
+		t.Fatal("expected SOLUSDT to remain in cooldown map")
+	}
+	if _, ok := cleaned["ETHUSDT"]; ok {
+		t.Fatal("expected ETHUSDT to be removed from cooldown map")
+	}
+
+	// Nil map returns nil.
+	if result := CleanExpiredSLCooldowns(nil); result != nil {
+		t.Fatal("expected nil for nil input")
+	}
+}

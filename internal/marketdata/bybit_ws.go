@@ -78,7 +78,7 @@ func NewBybitWSMarketDataService(
 		log = logger.Default()
 	}
 	stale := time.Duration(config.StaleDataThresholdSeconds) * time.Second
-	startTimeout := 60 * time.Second
+	startTimeout := 900 * time.Second
 	if config.StartTimeoutSeconds > 0 {
 		startTimeout = time.Duration(config.StartTimeoutSeconds) * time.Second
 	}
@@ -134,27 +134,62 @@ func (s *BybitWSMarketDataService) Start(ctx context.Context) error {
 	go func() {
 		defer s.wg.Done()
 
-		backfillOK := 0
-		backfillTotal := 0
+		const backfillWorkers = 5
+		type backfillJob struct {
+			symbol    string
+			timeframe string
+		}
+
+		var (
+			backfillOK    int
+			backfillTotal int
+			bfMu          sync.Mutex
+			bfWg          sync.WaitGroup
+		)
 
 		// Backfill first so that older REST data does not overwrite live WS updates.
 		if s.config.BackfillCandles > 0 {
-			for _, symbol := range s.symbols() {
-				for _, tf := range s.config.Timeframes {
-					backfillTotal++
-					backfillCtx, cancel := context.WithTimeout(startCtx, 30*time.Second)
-					if err := s.backfillAndWarm(backfillCtx, symbol, tf, s.config.BackfillCandles); err != nil {
-						s.logger.Warn("backfill failed", map[string]any{
-							"symbol":    symbol,
-							"timeframe": tf,
-							"error":     err.Error(),
-						})
-					} else {
-						backfillOK++
+			symbols := s.symbols()
+			timeframes := s.config.Timeframes
+			backfillTotal = len(symbols) * len(timeframes)
+
+			workCh := make(chan backfillJob)
+
+			for i := 0; i < backfillWorkers; i++ {
+				bfWg.Add(1)
+				go func() {
+					defer bfWg.Done()
+					for job := range workCh {
+						backfillCtx, cancel := context.WithTimeout(startCtx, 30*time.Second)
+						err := s.backfillAndWarm(backfillCtx, job.symbol, job.timeframe, s.config.BackfillCandles)
+						cancel()
+						if err != nil {
+							s.logger.Warn("backfill failed", map[string]any{
+								"symbol":    job.symbol,
+								"timeframe": job.timeframe,
+								"error":     err.Error(),
+							})
+						} else {
+							bfMu.Lock()
+							backfillOK++
+							bfMu.Unlock()
+						}
 					}
-					cancel()
+				}()
+			}
+
+		jobLoop:
+			for _, symbol := range symbols {
+				for _, tf := range timeframes {
+					select {
+					case workCh <- backfillJob{symbol: symbol, timeframe: tf}:
+					case <-startCtx.Done():
+						break jobLoop
+					}
 				}
 			}
+			close(workCh)
+			bfWg.Wait()
 		}
 
 		// Fail closed if every backfill failed and we expected some data.

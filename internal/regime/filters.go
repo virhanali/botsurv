@@ -123,6 +123,80 @@ func BTCDominanceFalling(btcd1h, btcd4h *indicator.IndicatorSnapshot) FilterOutc
 	return FilterOutcome{Triggered: false, Severity: "info", Detail: "btcd not trending down on both 1h/4h"}
 }
 
+// RangingResult holds the outcome of BTC ranging detection.
+type RangingResult struct {
+	IsRanging      bool
+	BandWidth      float64
+	ATR            float64
+	RangeOverATR   float64
+	Detail         string
+}
+
+// ComputeBTCRanging checks whether BTC 15m candles are consolidating
+// within an ATR-based band. If (max_high - min_low) over the lookback
+// window is ≤ ATR(15m) × multiplier, BTC is considered ranging.
+func ComputeBTCRanging(btc15mCandles []domain.Candle, atrMultiplier float64, lookbackCandles int) RangingResult {
+	if atrMultiplier <= 0 {
+		atrMultiplier = 2.5
+	}
+	if lookbackCandles <= 0 {
+		lookbackCandles = 16
+	}
+
+	if len(btc15mCandles) < 2 {
+		return RangingResult{Detail: "insufficient 15m candles for ranging detection"}
+	}
+
+	start := len(btc15mCandles) - lookbackCandles
+	if start < 0 {
+		start = 0
+	}
+	window := btc15mCandles[start:]
+
+	minLow := window[0].Low
+	maxHigh := window[0].High
+	for _, c := range window[1:] {
+		if c.Low < minLow {
+			minLow = c.Low
+		}
+		if c.High > maxHigh {
+			maxHigh = c.High
+		}
+	}
+
+	priceRange := maxHigh - minLow
+
+	atrResult, err := indicator.ComputeATR(btc15mCandles, 14)
+	if err != nil {
+		return RangingResult{Detail: fmt.Sprintf("atr computation failed: %v", err)}
+	}
+	atr := atrResult.Value
+
+	if atr <= 0 || math.IsNaN(atr) || math.IsInf(atr, 0) {
+		return RangingResult{Detail: "atr is zero or invalid"}
+	}
+
+	bandWidth := atr * atrMultiplier
+	rangeOverATR := priceRange / atr
+
+	isRanging := priceRange <= bandWidth
+
+	var detail string
+	if isRanging {
+		detail = fmt.Sprintf("btc ranging: range=%.2f atr=%.2f band=%.2f ratio=%.2f", priceRange, atr, bandWidth, rangeOverATR)
+	} else {
+		detail = fmt.Sprintf("btc trending: range=%.2f atr=%.2f band=%.2f ratio=%.2f", priceRange, atr, bandWidth, rangeOverATR)
+	}
+
+	return RangingResult{
+		IsRanging:    isRanging,
+		BandWidth:    bandWidth,
+		ATR:          atr,
+		RangeOverATR: rangeOverATR,
+		Detail:       detail,
+	}
+}
+
 func returnPct(candles []domain.Candle) (float64, bool) {
 	if len(candles) < 2 {
 		return 0, false

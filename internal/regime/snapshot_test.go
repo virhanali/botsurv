@@ -129,3 +129,102 @@ func TestBuildSnapshot_ErrorsWhenBTCUnavailable(t *testing.T) {
 		t.Fatal("expected error when btc data unavailable")
 	}
 }
+
+func TestStalenessTracker_RecordFailure(t *testing.T) {
+	tracker := NewStalenessTracker(Btc5mStalenessConfig{WarnCycles: 3, CriticalCycles: 10})
+
+	if tracker.Counter() != 0 {
+		t.Fatalf("expected counter 0, got %d", tracker.Counter())
+	}
+	tracker.RecordFailure()
+	if tracker.Counter() != 1 {
+		t.Fatalf("expected counter 1, got %d", tracker.Counter())
+	}
+	tracker.RecordFailure()
+	tracker.RecordFailure()
+	if tracker.Counter() != 3 {
+		t.Fatalf("expected counter 3, got %d", tracker.Counter())
+	}
+}
+
+func TestStalenessTracker_RecordSuccess(t *testing.T) {
+	tracker := NewStalenessTracker(Btc5mStalenessConfig{WarnCycles: 3, CriticalCycles: 10})
+	tracker.RecordFailure()
+	tracker.RecordFailure()
+	if tracker.Counter() != 2 {
+		t.Fatalf("expected counter 2, got %d", tracker.Counter())
+	}
+	tracker.RecordSuccess()
+	if tracker.Counter() != 0 {
+		t.Fatalf("expected counter 0 after success, got %d", tracker.Counter())
+	}
+}
+
+func TestStalenessTracker_ShouldWarn(t *testing.T) {
+	tracker := NewStalenessTracker(Btc5mStalenessConfig{WarnCycles: 3, CriticalCycles: 10})
+	if tracker.ShouldWarn() {
+		t.Fatal("expected no warn at 0")
+	}
+	tracker.RecordFailure()
+	tracker.RecordFailure()
+	if tracker.ShouldWarn() {
+		t.Fatal("expected no warn at 2")
+	}
+	tracker.RecordFailure()
+	if !tracker.ShouldWarn() {
+		t.Fatal("expected warn at 3")
+	}
+}
+
+func TestStalenessTracker_ShouldCritical(t *testing.T) {
+	tracker := NewStalenessTracker(Btc5mStalenessConfig{WarnCycles: 3, CriticalCycles: 5})
+	for i := 0; i < 4; i++ {
+		tracker.RecordFailure()
+	}
+	if tracker.ShouldCritical() {
+		t.Fatal("expected no critical at 4")
+	}
+	tracker.RecordFailure()
+	if !tracker.ShouldCritical() {
+		t.Fatal("expected critical at 5")
+	}
+}
+
+func TestStalenessTracker_InjectWarning(t *testing.T) {
+	tracker := NewStalenessTracker(Btc5mStalenessConfig{WarnCycles: 2, CriticalCycles: 5})
+
+	snap := &MarketRegimeSnapshot{}
+	tracker.RecordFailure()
+	tracker.InjectWarning(snap)
+	if snap.Btc5mStaleCounter != 1 {
+		t.Fatalf("expected stale counter 1, got %d", snap.Btc5mStaleCounter)
+	}
+	if len(snap.Warnings) != 0 {
+		t.Fatalf("expected no warnings below warn threshold, got %v", snap.Warnings)
+	}
+
+	tracker.RecordFailure()
+	tracker.InjectWarning(snap)
+	if len(snap.Warnings) != 1 || !strings.Contains(snap.Warnings[0], "stale") {
+		t.Fatalf("expected stale warning, got %v", snap.Warnings)
+	}
+
+	for i := 0; i < 4; i++ {
+		tracker.RecordFailure()
+	}
+	snap.Warnings = nil
+	tracker.InjectWarning(snap)
+	if len(snap.Warnings) != 1 || !strings.Contains(snap.Warnings[0], "CRITICAL") {
+		t.Fatalf("expected CRITICAL warning, got %v", snap.Warnings)
+	}
+}
+
+func TestStalenessTracker_Defaults(t *testing.T) {
+	tracker := NewStalenessTracker(Btc5mStalenessConfig{})
+	if tracker.cfg.WarnCycles != 3 {
+		t.Fatalf("expected default warn cycles 3, got %d", tracker.cfg.WarnCycles)
+	}
+	if tracker.cfg.CriticalCycles != 10 {
+		t.Fatalf("expected default critical cycles 10, got %d", tracker.cfg.CriticalCycles)
+	}
+}

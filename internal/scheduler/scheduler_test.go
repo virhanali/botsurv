@@ -1245,12 +1245,24 @@ func (m *mockPaperTradeRepo) CountByExitReason(ctx context.Context, reason strin
 	return 0, nil
 }
 
-type mockPaperAccountRepo struct{}
+type mockPaperAccountRepo struct {
+	state domain.PaperAccountState
+}
 
 func (m *mockPaperAccountRepo) Get(ctx context.Context) (*domain.PaperAccountState, error) {
-	return &domain.PaperAccountState{StartingEquity: 10000, CurrentEquity: 10000}, nil
+	return &domain.PaperAccountState{
+		ID:                m.state.ID,
+		StartingEquity:    m.state.StartingEquity,
+		CurrentEquity:      m.state.CurrentEquity,
+		TotalTrades:        m.state.TotalTrades,
+		Wins:               m.state.Wins,
+		Losses:             m.state.Losses,
+		RealizedPnL:        m.state.RealizedPnL,
+		ConsecutiveLosses:  m.state.ConsecutiveLosses,
+	}, nil
 }
 func (m *mockPaperAccountRepo) Update(ctx context.Context, s domain.PaperAccountState) error {
+	m.state = s
 	return nil
 }
 
@@ -1261,4 +1273,246 @@ func skipContains(skips []SkipReason, reason string) bool {
 		}
 	}
 	return false
+}
+
+// --- updatePostTradeState tests ---
+
+func TestUpdatePostTradeState_NoSimulator(t *testing.T) {
+	sched := &Scheduler{log: logger.New(nil, logger.LevelDebug)}
+	sched.updatePostTradeState(context.Background())
+	if sched.consecutiveLosses != 0 {
+		t.Errorf("expected consecutiveLosses 0 when no simulator, got %d", sched.consecutiveLosses)
+	}
+}
+
+func TestUpdatePostTradeState_NoTrades(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	cfg := app.PaperConfig{StartingBalanceUSD: 10000}
+	md := &mockMarketData{price: 100.0}
+	tradeRepo := &mockPaperTradeRepo{}
+	acctRepo := &mockPaperAccountRepo{
+		state: domain.PaperAccountState{ID: 1, StartingEquity: 10000, CurrentEquity: 10000},
+	}
+	paperSim := paperexec.NewSimulator(md, tradeRepo, acctRepo, cfg, log)
+	_ = paperSim.Initialize(context.Background())
+
+	sched := &Scheduler{
+		log:               log,
+		paperSim:          paperSim,
+		perSymbolSLCooldown: make(map[string]time.Time),
+		cfg: app.UserConfig{
+			PortfolioRisk: app.PortfolioRiskConfig{
+				CooldownAfterLosses: app.CooldownConfig{Enabled: true, ConsecutiveLosses: 3, CooldownMinutes: 30},
+				PerSymbolSLCooldown:  app.PerSymbolSLCooldownConfig{Enabled: true, CooldownMinutes: 10},
+			},
+		},
+	}
+
+	sched.updatePostTradeState(context.Background())
+
+	if sched.consecutiveLosses != 0 {
+		t.Errorf("expected consecutiveLosses 0, got %d", sched.consecutiveLosses)
+	}
+	if sched.cooldownUntil != nil {
+		t.Errorf("expected no cooldown with 0 losses, got %v", sched.cooldownUntil)
+	}
+}
+
+func TestUpdatePostTradeState_SLHit_CooldownTriggered(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	cfg := app.PaperConfig{StartingBalanceUSD: 10000, FeeTakerBps: 0, SlippageBps: 0}
+	md := &mockMarketData{price: 100.0}
+	tradeRepo := &mockPaperTradeRepo{}
+	acctRepo := &mockPaperAccountRepo{
+		state: domain.PaperAccountState{ID: 1, StartingEquity: 10000, CurrentEquity: 10000},
+	}
+	paperSim := paperexec.NewSimulator(md, tradeRepo, acctRepo, cfg, log)
+	_ = paperSim.Initialize(context.Background())
+
+	sched := &Scheduler{
+		log:                 log,
+		paperSim:            paperSim,
+		perSymbolSLCooldown: make(map[string]time.Time),
+		cfg: app.UserConfig{
+			PortfolioRisk: app.PortfolioRiskConfig{
+				CooldownAfterLosses: app.CooldownConfig{Enabled: true, ConsecutiveLosses: 3, CooldownMinutes: 30},
+				PerSymbolSLCooldown:  app.PerSymbolSLCooldownConfig{Enabled: true, CooldownMinutes: 10},
+			},
+		},
+	}
+
+	// Open and close 3 losing trades
+	for i := 0; i < 3; i++ {
+		plan := risk.OrderPlan{
+			Symbol:      "BTCUSDT",
+			Side:        domain.SideLong,
+			Qty:         1.0,
+			EntryPrice:  100.0,
+			StopLoss:    95.0,
+			TakeProfits: []risk.TakeProfitPlan{{Price: 110.0, Qty: 1.0}},
+			Leverage:    5,
+		}
+		md.price = 100.0
+		_, err := paperSim.SimulateFill(context.Background(), "decision-loss-"+string(rune('0'+i)), plan)
+		if err != nil {
+			t.Fatalf("unexpected error opening trade: %v", err)
+		}
+
+		// Close via SL
+		md.price = 94.0
+		err = paperSim.CheckOpenPositions(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error checking positions: %v", err)
+		}
+	}
+
+	sched.updatePostTradeState(context.Background())
+
+	if sched.consecutiveLosses != 3 {
+		t.Errorf("expected consecutiveLosses 3, got %d", sched.consecutiveLosses)
+	}
+	if sched.cooldownUntil == nil {
+		t.Error("expected cooldown to be triggered after 3 consecutive losses")
+	}
+
+	// Check per-symbol SL cooldown
+	if sched.perSymbolSLCooldown == nil {
+		t.Fatal("expected per-symbol cooldown map to be initialized")
+	}
+	symbolCooldown, ok := sched.perSymbolSLCooldown["BTCUSDT"]
+	if !ok {
+		t.Error("expected BTCUSDT to have per-symbol SL cooldown")
+	} else if time.Now().After(symbolCooldown) {
+		t.Errorf("expected BTCUSDT cooldown to be in the future, got %v", symbolCooldown)
+	}
+}
+
+func TestUpdatePostTradeState_TPHit_ResetsConsecutiveLosses(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	cfg := app.PaperConfig{StartingBalanceUSD: 10000, FeeTakerBps: 0, SlippageBps: 0}
+	md := &mockMarketData{price: 100.0}
+	tradeRepo := &mockPaperTradeRepo{}
+	acctRepo := &mockPaperAccountRepo{
+		state: domain.PaperAccountState{ID: 1, StartingEquity: 10000, CurrentEquity: 10000},
+	}
+	paperSim := paperexec.NewSimulator(md, tradeRepo, acctRepo, cfg, log)
+	_ = paperSim.Initialize(context.Background())
+
+	sched := &Scheduler{
+		log:                 log,
+		paperSim:            paperSim,
+		perSymbolSLCooldown: make(map[string]time.Time),
+		cfg: app.UserConfig{
+			PortfolioRisk: app.PortfolioRiskConfig{
+				CooldownAfterLosses: app.CooldownConfig{Enabled: true, ConsecutiveLosses: 3, CooldownMinutes: 30},
+				PerSymbolSLCooldown:  app.PerSymbolSLCooldownConfig{Enabled: true, CooldownMinutes: 10},
+			},
+		},
+	}
+
+	// Set up: 2 consecutive losses first
+	for i := 0; i < 2; i++ {
+		plan := risk.OrderPlan{
+			Symbol:      "BTCUSDT",
+			Side:        domain.SideLong,
+			Qty:         1.0,
+			EntryPrice:  100.0,
+			StopLoss:    95.0,
+			TakeProfits: []risk.TakeProfitPlan{{Price: 110.0, Qty: 1.0}},
+			Leverage:    5,
+		}
+		md.price = 100.0
+		_, _ = paperSim.SimulateFill(context.Background(), "decision-loss-"+string(rune('0'+i)), plan)
+		md.price = 94.0
+		_ = paperSim.CheckOpenPositions(context.Background())
+	}
+
+	sched.updatePostTradeState(context.Background())
+	if sched.consecutiveLosses != 2 {
+		t.Errorf("expected 2 consecutive losses, got %d", sched.consecutiveLosses)
+	}
+
+	// Now close a winning trade — consecutive losses should reset
+	plan := risk.OrderPlan{
+		Symbol:      "BTCUSDT",
+		Side:        domain.SideLong,
+		Qty:         1.0,
+		EntryPrice:  100.0,
+		StopLoss:    95.0,
+		TakeProfits: []risk.TakeProfitPlan{{Price: 110.0, Qty: 1.0}},
+		Leverage:    5,
+	}
+	md.price = 100.0
+	_, _ = paperSim.SimulateFill(context.Background(), "decision-win-1", plan)
+	md.price = 111.0
+	_ = paperSim.CheckOpenPositions(context.Background())
+
+	sched.updatePostTradeState(context.Background())
+	if sched.consecutiveLosses != 0 {
+		t.Errorf("expected 0 consecutive losses after TP hit, got %d", sched.consecutiveLosses)
+	}
+	if sched.cooldownUntil != nil {
+		t.Errorf("expected cooldown to be cleared after consecutive losses reset, got %v", sched.cooldownUntil)
+	}
+}
+
+func TestUpdatePostTradeState_ConsecutiveLossTracking(t *testing.T) {
+	log := logger.New(nil, logger.LevelDebug)
+	cfg := app.PaperConfig{StartingBalanceUSD: 10000, FeeTakerBps: 0, SlippageBps: 0}
+	md := &mockMarketData{price: 100.0}
+	tradeRepo := &mockPaperTradeRepo{}
+	acctRepo := &mockPaperAccountRepo{
+		state: domain.PaperAccountState{ID: 1, StartingEquity: 10000, CurrentEquity: 10000},
+	}
+	paperSim := paperexec.NewSimulator(md, tradeRepo, acctRepo, cfg, log)
+	_ = paperSim.Initialize(context.Background())
+
+	sched := &Scheduler{
+		log:                 log,
+		paperSim:            paperSim,
+		perSymbolSLCooldown: make(map[string]time.Time),
+		cfg: app.UserConfig{
+			PortfolioRisk: app.PortfolioRiskConfig{
+				CooldownAfterLosses: app.CooldownConfig{Enabled: true, ConsecutiveLosses: 2, CooldownMinutes: 15},
+				PerSymbolSLCooldown:  app.PerSymbolSLCooldownConfig{Enabled: false},
+			},
+		},
+	}
+
+	// 1st loss
+	plan := risk.OrderPlan{
+		Symbol:      "BTCUSDT",
+		Side:        domain.SideLong,
+		Qty:         1.0,
+		EntryPrice:  100.0,
+		StopLoss:    95.0,
+		TakeProfits: []risk.TakeProfitPlan{{Price: 110.0, Qty: 1.0}},
+		Leverage:    5,
+	}
+	md.price = 100.0
+	_, _ = paperSim.SimulateFill(context.Background(), "decision-1", plan)
+	md.price = 94.0
+	_ = paperSim.CheckOpenPositions(context.Background())
+
+	sched.updatePostTradeState(context.Background())
+	if sched.consecutiveLosses != 1 {
+		t.Errorf("expected 1 consecutive loss, got %d", sched.consecutiveLosses)
+	}
+	if sched.cooldownUntil != nil {
+		t.Error("expected no cooldown after 1 loss (threshold is 2)")
+	}
+
+	// 2nd loss — should trigger cooldown
+	md.price = 100.0
+	_, _ = paperSim.SimulateFill(context.Background(), "decision-2", plan)
+	md.price = 94.0
+	_ = paperSim.CheckOpenPositions(context.Background())
+
+	sched.updatePostTradeState(context.Background())
+	if sched.consecutiveLosses != 2 {
+		t.Errorf("expected 2 consecutive losses, got %d", sched.consecutiveLosses)
+	}
+	if sched.cooldownUntil == nil {
+		t.Error("expected cooldown to be triggered after 2 consecutive losses")
+	}
 }

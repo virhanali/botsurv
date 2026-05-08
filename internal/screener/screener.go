@@ -512,27 +512,30 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		targetRSCandles = btc1H.Candles
 	}
 	regimeSnap, err := regime.BuildSnapshot(regime.SnapshotInput{
-		Now:             time.Now().UTC(),
-		BTC5mCandles:    btc5m.Candles,
-		BTC15mCandles:   btc15m.Candles,
-		BTC1hCandles:    btc1H.Candles,
-		BTC1hSnapshot:   btc1HSnap,
-		BTC4hSnapshot:   btc4HSnap,
-		Target1hCandles: targetRSCandles,
-		BTCD1hCandles:   btcd1hCandles,
-		BTCD1hSnapshot:  btcd1hSnap,
-		BTCD4hSnapshot:  btcd4hSnap,
+		Now:               time.Now().UTC(),
+		BTC5mCandles:      btc5m.Candles,
+		BTC15mCandles:     btc15m.Candles,
+		BTC1hCandles:      btc1H.Candles,
+		BTC1hSnapshot:     btc1HSnap,
+		BTC4hSnapshot:      btc4HSnap,
+		Target1hCandles:   targetRSCandles,
+		BTCD1hCandles:     btcd1hCandles,
+		BTCD1hSnapshot:    btcd1hSnap,
+		BTCD4hSnapshot:     btcd4hSnap,
 		Config: regime.Config{
-			BTCDumpShortThresholdPct:   regimeCfg.BTCDumpShortPct,
-			BTCDumpMediumThresholdPct:  regimeCfg.BTCDumpMediumPct,
-			BTCNearLevelATRBuffer:      regimeCfg.BTCNearLevelATRBuffer,
-			BTCDRisingFastThresholdPct: regimeCfg.BTCDRisingFastPct,
+			BTCDumpShortThresholdPct:      regimeCfg.BTCDumpShortPct,
+			BTCDumpMediumThresholdPct:     regimeCfg.BTCDumpMediumPct,
+			BTCNearLevelATRBuffer:         regimeCfg.BTCNearLevelATRBuffer,
+			BTCDRisingFastThresholdPct:   regimeCfg.BTCDRisingFastPct,
 			RelativeStrength: regime.RelativeStrengthConfig{
 				StrongOutperformPct:   rsCfg.StrongOutperformPct,
 				StrongUnderperformPct: rsCfg.StrongUnderperformPct,
 				NeutralBandPct:        rsCfg.NeutralBandPct,
 				SmoothedEMAPeriod:     rsCfg.SmoothedEMAPeriod,
 			},
+			RangingATRMultiplier:           regimeCfg.RangingATRMultiplier,
+			RangingLookbackCandles:         regimeCfg.RangingLookbackCandles,
+			ReduceNewPositionsWhenRanging:  regimeCfg.ReduceNewPositionsWhenRanging,
 		},
 	})
 	if err != nil {
@@ -547,16 +550,18 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	regimeRef := fmt.Sprintf("%s:%d", sym.Symbol, regimeSnap.Timestamp.Unix())
 
 	trendCand, trendReject := strategy.GenerateTrendPullback(strategy.TrendPullbackInput{
-		Now:                  time.Now().UTC(),
-		Symbol:               sym.Symbol,
-		Timeframe:            setupTF,
-		TickSize:             sym.TickSize,
-		Candles15m:           validatedSetup.Candles,
-		Snapshot15m:          setupSnap,
-		Snapshot1h:           snap1H,
-		Snapshot4h:           snap4H,
-		IndicatorSnapshotRef: indicatorRef,
-		RegimeSnapshotRef:    regimeRef,
+		Now:                        time.Now().UTC(),
+		Symbol:                     sym.Symbol,
+		Timeframe:                  setupTF,
+		TickSize:                   sym.TickSize,
+		Candles15m:                 validatedSetup.Candles,
+		Snapshot15m:                setupSnap,
+		Snapshot1h:                 snap1H,
+		Snapshot4h:                 snap4H,
+		IndicatorSnapshotRef:       indicatorRef,
+		RegimeSnapshotRef:          regimeRef,
+		MinSLDistanceATRMultiplier: s.cfg.Strategy.Indicators.WithDefaults().MinSLDistanceATRMultiplier,
+		MinSLDistancePct:           s.cfg.Strategy.Indicators.WithDefaults().MinSLDistancePct,
 	})
 	var rejections []StrategyRejection
 	if trendReject != nil {
@@ -574,15 +579,17 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		})
 	}
 	breakoutCand, breakoutReject := strategy.GenerateBreakoutRetest(strategy.BreakoutRetestInput{
-		Now:                  time.Now().UTC(),
-		Symbol:               sym.Symbol,
-		Timeframe:            setupTF,
-		TickSize:             sym.TickSize,
-		Candles15m:           validatedSetup.Candles,
-		Snapshot15m:          setupSnap,
-		Snapshot1h:           snap1H,
-		IndicatorSnapshotRef: indicatorRef,
-		RegimeSnapshotRef:    regimeRef,
+		Now:                        time.Now().UTC(),
+		Symbol:                     sym.Symbol,
+		Timeframe:                  setupTF,
+		TickSize:                   sym.TickSize,
+		Candles15m:                 validatedSetup.Candles,
+		Snapshot15m:                setupSnap,
+		Snapshot1h:                 snap1H,
+		IndicatorSnapshotRef:       indicatorRef,
+		RegimeSnapshotRef:          regimeRef,
+		MinSLDistanceATRMultiplier: s.cfg.Strategy.Indicators.WithDefaults().MinSLDistanceATRMultiplier,
+		MinSLDistancePct:           s.cfg.Strategy.Indicators.WithDefaults().MinSLDistancePct,
 	})
 	if breakoutReject != nil {
 		s.log.Info("rejected_candidate", map[string]any{

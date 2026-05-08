@@ -3,16 +3,55 @@ package marketdata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/virhan/botsurv/internal/domain"
 )
+
+// bybitRestLimiter limits Bybit REST API calls to 10 requests per second.
+var bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1)
+
+const (
+	maxBackfillRetries = 3
+)
+
+// resetBybitRestLimiter replaces the global rate limiter with a fresh one.
+// Exported for test use only.
+func ResetBybitRestLimiter() {
+	bybitRestLimiter = rate.NewLimiter(rate.Limit(10), 1)
+}
+
+// isRateLimitError checks if an error is a Bybit rate-limit error (code 10006).
+func isRateLimitError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "bybit error 10006")
+}
+
+// isNetworkError checks if an error is a transient network error.
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "no such host")
+}
 
 // CandleInserter is the minimal interface needed for backfill insertion.
 type CandleInserter interface {
@@ -25,6 +64,9 @@ type CandleInserter interface {
 func backfillCandles(ctx context.Context, httpClient *http.Client, restURL, symbol, timeframe string, limit int, repo CandleInserter) ([]domain.Candle, error) {
 	if limit <= 0 {
 		return nil, nil
+	}
+	if httpClient == nil {
+		return nil, fmt.Errorf("backfill: httpClient must not be nil")
 	}
 
 	endpoint, err := url.JoinPath(restURL, "/v5/market/kline")
@@ -41,54 +83,105 @@ func backfillCandles(ctx context.Context, httpClient *http.Client, restURL, symb
 	q.Set("interval", mapTimeframeToBybit(timeframe))
 	q.Set("limit", strconv.Itoa(limit))
 	u.RawQuery = q.Encode()
+	urlStr := u.String()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("create backfill request: %w", err)
-	}
+	var lastErr error
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("backfill request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("backfill status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read backfill response: %w", err)
-	}
-
-	candles, err := parseKlineRESTResponse(symbol, timeframe, body)
-	if err != nil {
-		return nil, fmt.Errorf("parse backfill response: %w", err)
-	}
-
-	interval, err := timeframeDuration(timeframe)
-	if err != nil {
-		return nil, fmt.Errorf("backfill timeframe %s: %w", timeframe, err)
-	}
-	nowMillis := time.Now().UTC().UnixMilli()
-	var closed []domain.Candle
-	// Small slack to avoid off-by-one with clock drift.
-	slackMillis := int64(500)
-	for i := range candles {
-		if candles[i].OpenTime+interval.Milliseconds() > nowMillis+slackMillis {
-			continue
-		}
-		candles[i].Confirmed = true
-		closed = append(closed, candles[i])
-		if repo != nil {
-			if _, err := repo.Insert(ctx, candles[i]); err != nil {
-				return nil, fmt.Errorf("insert backfill candle: %w", err)
+	for attempt := 0; attempt <= maxBackfillRetries; attempt++ {
+		if attempt > 0 {
+			base := time.Duration(1<<uint(attempt-1)) * time.Second
+			jitter := time.Duration(rand.Int63n(int64(base) / 2))
+			if attempt%2 == 0 {
+				backoff := base + jitter
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(backoff):
+				}
+			} else {
+				backoff := base - jitter
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(backoff):
+				}
 			}
 		}
+
+		if err := bybitRestLimiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("rate limiter: %w", err)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create backfill request: %w", err)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if isNetworkError(err) && attempt < maxBackfillRetries {
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("backfill request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			bodyStr := string(bodyBytes)
+			if strings.Contains(bodyStr, "10006") && attempt < maxBackfillRetries {
+				lastErr = fmt.Errorf("backfill status %d: %s", resp.StatusCode, bodyStr)
+				continue
+			}
+			return nil, fmt.Errorf("backfill status %d: %s", resp.StatusCode, bodyStr)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			if isNetworkError(readErr) && attempt < maxBackfillRetries {
+				lastErr = readErr
+				continue
+			}
+			return nil, fmt.Errorf("read backfill response: %w", readErr)
+		}
+
+		candles, parseErr := parseKlineRESTResponse(symbol, timeframe, body)
+		if parseErr != nil {
+			if isRateLimitError(parseErr) && attempt < maxBackfillRetries {
+				lastErr = parseErr
+				continue
+			}
+			return nil, fmt.Errorf("parse backfill response: %w", parseErr)
+		}
+
+		interval, durErr := timeframeDuration(timeframe)
+		if durErr != nil {
+			return nil, fmt.Errorf("backfill timeframe %s: %w", timeframe, durErr)
+		}
+		nowMillis := time.Now().UTC().UnixMilli()
+		var closed []domain.Candle
+		slackMillis := int64(500)
+		for i := range candles {
+			if candles[i].OpenTime+interval.Milliseconds() > nowMillis+slackMillis {
+				continue
+			}
+			candles[i].Confirmed = true
+			closed = append(closed, candles[i])
+			if repo != nil {
+				if _, err := repo.Insert(ctx, candles[i]); err != nil {
+					return nil, fmt.Errorf("insert backfill candle: %w", err)
+				}
+			}
+		}
+		return closed, nil
 	}
-	return closed, nil
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("backfill failed after %d retries: %w", maxBackfillRetries, lastErr)
+	}
+	return nil, fmt.Errorf("backfill failed after %d retries: %s %s", maxBackfillRetries, symbol, timeframe)
 }
 
 // parseKlineRESTResponse parses Bybit v5 /v5/market/kline JSON response.

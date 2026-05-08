@@ -3,6 +3,7 @@ package routing
 import (
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/virhan/botsurv/internal/indicator"
 	"github.com/virhan/botsurv/internal/regime"
@@ -49,6 +50,7 @@ type RoutingEngine struct {
 	MinScoreLLM         float64
 	MinScoreSkipLLM     float64
 	MaxLLMCallsPerCycle int
+	ReduceNewPositions   int
 }
 
 // DefaultRoutingEngine returns an engine with sensible defaults.
@@ -137,13 +139,16 @@ func DetectAmbiguity(
 	return f
 }
 
-// Route candidate determines what to do based on score + ambiguity flags.
+// RouteCandidate determines what to do based on score + ambiguity flags.
+// When marketIsRanging or btcDataStale is true, ALL candidates are forced through LLM veto.
 // maxLLMPerCycle <= 0 means unlimited per-cycle count.
 func (e *RoutingEngine) RouteCandidate(
 	score float64,
 	flags AmbiguityFlags,
 	llmCallsThisCycle int,
 	maxLLMPerCycle int,
+	marketIsRanging bool,
+	btcDataStale bool,
 ) RouteResult {
 	flagCount := countFlags(flags)
 
@@ -155,7 +160,6 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// Hard reject below minimum
 	if score < e.MinScoreLLM {
 		return RouteResult{
 			Route:  RouteRejectPreLLM,
@@ -164,7 +168,24 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// High quality: skip LLM (score >= 90)
+	if (marketIsRanging || btcDataStale) && score >= e.MinScoreLLM {
+		if maxLLMPerCycle <= 0 || llmCallsThisCycle < maxLLMPerCycle {
+			return RouteResult{
+				Route:        RouteLLMVeto,
+				Flags:        flags,
+				Score:        score,
+				FlagCount:    flagCount,
+				Reason:       "forced LLM veto: " + rangingStaleReason(marketIsRanging, btcDataStale),
+				LLMCandidate: true,
+			}
+		}
+		return RouteResult{
+			Route:  RouteRejectPreLLM,
+			Score:  score,
+			Reason: "LLM budget exhausted (forced ranging/stale route)",
+		}
+	}
+
 	if score >= e.MinScoreSkipLLM {
 		return RouteResult{
 			Route:        RouteSkipLLM,
@@ -176,8 +197,6 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// Score 58-84: send to LLM if budget available.
-	// maxLLMPerCycle <= 0 means unlimited.
 	if maxLLMPerCycle <= 0 || llmCallsThisCycle < maxLLMPerCycle {
 		return RouteResult{
 			Route:        RouteLLMVeto,
@@ -189,13 +208,25 @@ func (e *RoutingEngine) RouteCandidate(
 		}
 	}
 
-	// Positive maxLLMPerCycle exhausted: reject mid-range scores pre-LLM.
-	// RouteSkipLLM is only for score >= MinScoreSkipLLM (90).
 	return RouteResult{
 		Route:  RouteRejectPreLLM,
 		Score:  score,
 		Reason: "LLM budget exhausted",
 	}
+}
+
+func rangingStaleReason(ranging, stale bool) string {
+	parts := make([]string, 0, 2)
+	if ranging {
+		parts = append(parts, "market_ranging")
+	}
+	if stale {
+		parts = append(parts, "btc_data_stale")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, ",")
 }
 
 // PrioritizeCandidates sorts candidates by priority for LLM calls.
@@ -247,4 +278,17 @@ func countFlags(f AmbiguityFlags) int {
 		n++
 	}
 	return n
+}
+
+// ComputeReduceNewPositions reduces the max new positions by the configured
+// amount when the market is ranging. It never goes below 1.
+func ComputeReduceNewPositions(maxNewPositions int, reduceBy int, isRanging bool, reduceEnabled bool) int {
+	if !isRanging || !reduceEnabled {
+		return maxNewPositions
+	}
+	result := maxNewPositions - reduceBy
+	if result < 1 {
+		return 1
+	}
+	return result
 }

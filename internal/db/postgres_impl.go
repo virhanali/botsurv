@@ -1319,10 +1319,10 @@ type postgresPaperAccountStateRepository struct {
 
 func (r *postgresPaperAccountStateRepository) Get(ctx context.Context) (*domain.PaperAccountState, error) {
 	row := r.db.QueryRowContext(ctx,
-		`SELECT id, starting_equity, current_equity, total_trades, wins, losses, realized_pnl, updated_at
+		`SELECT id, starting_equity, current_equity, total_trades, wins, losses, realized_pnl, consecutive_losses, updated_at
 		FROM paper_account_state WHERE id = 1`)
 	var s domain.PaperAccountState
-	err := row.Scan(&s.ID, &s.StartingEquity, &s.CurrentEquity, &s.TotalTrades, &s.Wins, &s.Losses, &s.RealizedPnL, &s.UpdatedAt)
+	err := row.Scan(&s.ID, &s.StartingEquity, &s.CurrentEquity, &s.TotalTrades, &s.Wins, &s.Losses, &s.RealizedPnL, &s.ConsecutiveLosses, &s.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return &domain.PaperAccountState{ID: 1}, nil
 	}
@@ -1336,9 +1336,9 @@ func (r *postgresPaperAccountStateRepository) Update(ctx context.Context, s doma
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE paper_account_state SET
 			starting_equity = $2, current_equity = $3, total_trades = $4,
-			wins = $5, losses = $6, realized_pnl = $7, updated_at = NOW()
+			wins = $5, losses = $6, realized_pnl = $7, consecutive_losses = $8, updated_at = NOW()
 		WHERE id = $1`,
-		s.ID, s.StartingEquity, s.CurrentEquity, s.TotalTrades, s.Wins, s.Losses, s.RealizedPnL,
+		s.ID, s.StartingEquity, s.CurrentEquity, s.TotalTrades, s.Wins, s.Losses, s.RealizedPnL, s.ConsecutiveLosses,
 	)
 	if err != nil {
 		return fmt.Errorf("update paper_account_state: %w", err)

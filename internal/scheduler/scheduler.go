@@ -64,6 +64,14 @@ type Scheduler struct {
 
 	// Daily reset tracking.
 	lastDailyResetDay string // YYYY-MM-DD
+
+	// BTC 5m staleness tracker.
+	btc5mStalenessTracker *regime.StalenessTracker
+
+	// Loss tracking state.
+	consecutiveLosses   int
+	cooldownUntil       *time.Time
+	perSymbolSLCooldown map[string]time.Time
 }
 
 // NewScheduler creates a new Scheduler.
@@ -78,21 +86,41 @@ func NewScheduler(
 	md screener.MarketDataProvider,
 	log *logger.Logger,
 ) *Scheduler {
+	stalenessCfg := regime.Btc5mStalenessConfig{
+		WarnCycles:     cfg.MarketRegime.Btc5mStaleness.WarnCycles,
+		CriticalCycles: cfg.MarketRegime.Btc5mStaleness.CriticalCycles,
+	}
 	return &Scheduler{
-		cfg:       cfg,
-		screener:  screener,
-		llmClient: llmClient,
-		riskEng:   riskEng,
-		executor:  executor,
-		safetyEng: safetyEng,
-		monitor:   monitor,
-		md:        md,
-		log:       log,
+		cfg:                    cfg,
+		screener:               screener,
+		llmClient:              llmClient,
+		riskEng:                riskEng,
+		executor:               executor,
+		safetyEng:              safetyEng,
+		monitor:                monitor,
+		md:                     md,
+		log:                    log,
+		btc5mStalenessTracker:  regime.NewStalenessTracker(stalenessCfg),
 	}
 }
 
 // SetMode sets the operational mode.
 func (s *Scheduler) SetMode(mode app.BotMode) { s.mode = mode }
+
+// effectiveLeverage returns the configured leverage for the reviewer.
+func (s *Scheduler) effectiveLeverage(out risk.ValidateOutput) float64 {
+	cfgLev := s.cfg.Sizing.MaxLeverage
+	if cfgLev <= 0 {
+		cfgLev = s.cfg.PortfolioRisk.MaxLeverage
+	}
+	if cfgLev <= 0 {
+		cfgLev = s.cfg.Broker.Paper.DefaultLeverage
+	}
+	if cfgLev <= 0 {
+		cfgLev = 3.0
+	}
+	return cfgLev
+}
 
 // SetAlertService sets the alert service for sending notifications.
 func (s *Scheduler) SetAlertService(svc alert.Service) { s.alertSvc = svc }
@@ -230,6 +258,28 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		return result, screenErr
 	}
 
+	// Inject BTC 5m staleness warning into regime snapshots.
+	if s.btc5mStalenessTracker != nil && s.btc5mStalenessTracker.ShouldCritical() {
+		s.log.Error("BTC 5m data CRITICAL: stale for too many cycles — halting new positions", map[string]any{
+			"stale_counter": s.btc5mStalenessTracker.Counter(),
+		})
+		result.ReasonCodes = append(result.ReasonCodes, "BTC_STALE_CRITICAL")
+		result.EndedAt = time.Now()
+		return result, nil
+	}
+	for sym, rs := range screenResult.RegimeSnapshots {
+		if s.btc5mStalenessTracker != nil {
+			s.btc5mStalenessTracker.InjectWarning(&rs)
+			if s.btc5mStalenessTracker.Counter() > 0 {
+				rs.BTCDataStale = true
+				if !containsString(rs.Warnings, "BTC_DATA_STALE") {
+					rs.Warnings = append(rs.Warnings, "BTC_DATA_STALE")
+				}
+			}
+			screenResult.RegimeSnapshots[sym] = rs
+		}
+	}
+
 	result.Candidates = len(screenResult.Candidates)
 
 	// Log decisions for non-eligible candidates
@@ -254,7 +304,11 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 	}
 
 	// Check existing positions for SL/TP before new entries.
-	s.monitor.CheckAllPositions(ctx)
+	// In paper mode, the simulator is the sole closer for paper positions;
+	// skip the broker-level monitor check to avoid double-close races (C1).
+	if !s.mode.IsPaper() {
+		s.monitor.CheckAllPositions(ctx)
+	}
 
 	// Persist all generated candidates and track DB IDs for LLM decisions.
 	candidateIDs := s.persistCandidates(ctx, screenResult.Candidates, screenResult.NonEligible, cycleID)
@@ -282,6 +336,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 	// Paper mode: check open positions
 	if s.mode.IsPaper() && s.paperSim != nil {
 		s.paperSim.CheckOpenPositions(ctx)
+		s.updatePostTradeState(ctx)
 	}
 
 	// 4. Apply LLM call caps.
@@ -308,6 +363,18 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 		}
 		if len(paperPositions) > 0 {
 			cycleMonitorStatus.OpenPositions = append(cycleMonitorStatus.OpenPositions, paperPositions...)
+		}
+	}
+
+	// In paper mode, override the account equity with paper simulator equity
+	// so risk sizing uses paper capital, not broker equity.
+	if s.mode.IsPaper() && s.paperSim != nil {
+		paperAccState := s.paperSim.AccountState()
+		cycleMonitorStatus.AccountState.Equity = paperAccState.Equity
+		cycleMonitorStatus.AccountState.Balance = paperAccState.Balance
+		cycleMonitorStatus.AccountState.RealizedPnL = paperAccState.RealizedPnL
+		if cycleMonitorStatus.AccountState.AvailableBalance <= 0 {
+			cycleMonitorStatus.AccountState.AvailableBalance = paperAccState.Equity - paperAccState.UsedMargin
 		}
 	}
 
@@ -411,6 +478,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 			LocalPositions:     localPositions,
 			ExchangePositions:  localPositions, // exchange state not available in phase 1.
 			MaxDataAge:         time.Duration(s.cfg.DataValidation.MaxDataAgeSecondsFor(setupTF)) * time.Second,
+			PerSymbolSLCooldown: s.perSymbolSLCooldown,
 		})
 		if blockEval.Blocked {
 			result.Skips = append(result.Skips, SkipReason{Symbol: cand.Symbol, Reason: "HARD_BLOCK"})
@@ -450,7 +518,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 
 		routingEng := routing.DefaultRoutingEngine()
 		maxLLM := s.cfg.LLMRouting.MaxCallsPerCycle
-		routeResult := routingEng.RouteCandidate(score, flags, result.LLMCalls, maxLLM)
+		marketIsRanging := rs.IsRanging
+		btcDataStale := rs.BTCDataStale
+		routeResult := routingEng.RouteCandidate(score, flags, result.LLMCalls, maxLLM, marketIsRanging, btcDataStale)
 
 		cctx := &candidateCtx{
 			cand:             cand,
@@ -644,6 +714,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 				OpenPositions:         monitorStatus.OpenPositions,
 				OpenOrders:            monitorStatus.OpenOrders,
 				NewPositionsThisCycle: result.Executions,
+				ConsecutiveLosses:     s.consecutiveLosses,
+				CooldownUntil:        s.cooldownUntil,
+				PerSymbolSLCooldown:   s.perSymbolSLCooldown,
 			},
 			BotState: domain.BotState{Running: true},
 		}
@@ -717,6 +790,17 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 	if maxNew <= 0 {
 		maxNew = len(approvedForPortfolio)
 	}
+	anyRanging := false
+	for _, rs := range screenResult.RegimeSnapshots {
+		if rs.IsRanging {
+			anyRanging = true
+			break
+		}
+	}
+	if anyRanging {
+		regimeCfg := s.cfg.MarketRegime.WithDefaults()
+		maxNew = routing.ComputeReduceNewPositions(maxNew, 1, anyRanging, regimeCfg.ReduceNewPositionsWhenRanging)
+	}
 	remainingNew := maxNew - result.Executions
 	if remainingNew < 0 {
 		remainingNew = 0
@@ -771,6 +855,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) (result *CycleResult, err error
 					OpenPositions:         item.monitorStatus.OpenPositions,
 					OpenOrders:            item.monitorStatus.OpenOrders,
 					NewPositionsThisCycle: result.Executions,
+					ConsecutiveLosses:     s.consecutiveLosses,
+					CooldownUntil:        s.cooldownUntil,
+					PerSymbolSLCooldown:   s.perSymbolSLCooldown,
 				},
 				BotState: domain.BotState{Running: true},
 			})
@@ -962,7 +1049,16 @@ func timeframeDuration(timeframe string) (time.Duration, error) {
 func (s *Scheduler) computeBTC5mReturn(ctx context.Context) float64 {
 	candles, err := s.md.GetCandles(ctx, "BTCUSDT", "5m", 2)
 	if err != nil || len(candles) < 2 {
+		if s.btc5mStalenessTracker != nil {
+			s.btc5mStalenessTracker.RecordFailure()
+		}
+		s.log.Warn("btc 5m data staleness: failure", map[string]any{
+			"stale_counter": s.btc5mStalenessCounter(),
+		})
 		return 0
+	}
+	if s.btc5mStalenessTracker != nil {
+		s.btc5mStalenessTracker.RecordSuccess()
 	}
 	prev := candles[len(candles)-2].Close
 	last := candles[len(candles)-1].Close
@@ -970,6 +1066,13 @@ func (s *Scheduler) computeBTC5mReturn(ctx context.Context) float64 {
 		return 0
 	}
 	return ((last - prev) / prev) * 100
+}
+
+func (s *Scheduler) btc5mStalenessCounter() int {
+	if s.btc5mStalenessTracker == nil {
+		return 0
+	}
+	return s.btc5mStalenessTracker.Counter()
 }
 
 func toPositionState(positions []domain.Position) []risk.PositionState {
@@ -982,6 +1085,68 @@ func toPositionState(positions []domain.Position) []risk.PositionState {
 		})
 	}
 	return out
+}
+
+// updatePostTradeState syncs post-trade state (consecutive losses, cooldown,
+// per-symbol blackout) from the paper simulator and recent trade events.
+func (s *Scheduler) updatePostTradeState(ctx context.Context) {
+	if s.paperSim == nil {
+		return
+	}
+
+	slCooldownCfg := s.cfg.PortfolioRisk.PerSymbolSLCooldown
+	lossCooldownCfg := s.cfg.PortfolioRisk.CooldownAfterLosses
+
+	// Read consecutive losses from simulator (single source of truth, DB-persisted).
+	s.consecutiveLosses = s.paperSim.ConsecutiveLosses()
+
+	// Check cooldown thresholds based on current count.
+	if lossCooldownCfg.Enabled && s.consecutiveLosses >= lossCooldownCfg.ConsecutiveLosses && s.cooldownUntil == nil {
+		cooldownDur := time.Duration(lossCooldownCfg.CooldownMinutes) * time.Minute
+		until := time.Now().Add(cooldownDur)
+		s.cooldownUntil = &until
+		s.log.Info("consecutive loss cooldown activated", map[string]any{
+			"consecutive_losses": s.consecutiveLosses,
+			"cooldown_until":     until.Format(time.RFC3339),
+		})
+	}
+	if s.consecutiveLosses == 0 {
+		s.cooldownUntil = nil
+	}
+
+	// Per-symbol SL blackout from recent closed trades.
+	if slCooldownCfg.Enabled {
+		recentTrades, err := s.paperSim.GetRecentClosedTrades(ctx, time.Now().Add(-1*time.Hour))
+		if err != nil {
+			s.log.Warn("failed to query recent trades for symbol cooldown", map[string]any{"error": err.Error()})
+			return
+		}
+		cooldownDur := time.Duration(slCooldownCfg.CooldownMinutes) * time.Minute
+		if s.perSymbolSLCooldown == nil {
+			s.perSymbolSLCooldown = make(map[string]time.Time)
+		}
+		for _, trade := range recentTrades {
+			if trade.ExitReason != "sl" || trade.ClosedAt == nil {
+				continue
+			}
+			// Only set if not already covered.
+			if until, ok := s.perSymbolSLCooldown[trade.Symbol]; !ok || time.Now().After(until) {
+				s.perSymbolSLCooldown[trade.Symbol] = time.Now().Add(cooldownDur)
+				s.log.Info("per-symbol SL cooldown set", map[string]any{
+					"symbol":         trade.Symbol,
+					"cooldown_until": s.perSymbolSLCooldown[trade.Symbol].Format(time.RFC3339),
+				})
+			}
+		}
+	}
+
+	// Clean expired per-symbol cooldown entries.
+	now := time.Now()
+	for sym, until := range s.perSymbolSLCooldown {
+		if !now.Before(until) {
+			delete(s.perSymbolSLCooldown, sym)
+		}
+	}
 }
 
 // Run starts the main loop with time-based scheduling.
@@ -1136,6 +1301,15 @@ func containsAny(haystack []string, needles []string) bool {
 			if h == n {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func containsString(slice []string, target string) bool {
+	for _, s := range slice {
+		if s == target {
+			return true
 		}
 	}
 	return false
@@ -1403,7 +1577,7 @@ func (s *Scheduler) runLLMReview(
 		RRRatio:          cand.RR,
 		ModifiersApplied: riskOutput.ReasonCodes,
 		Qty:              riskOutput.FinalPositionNotional / cand.ProposedEntry,
-		Leverage:         3,
+		Leverage:         s.effectiveLeverage(riskOutput),
 		RiskAmountUSD:    riskOutput.EstimatedLoss,
 		RiskPct:          0.5,
 	}

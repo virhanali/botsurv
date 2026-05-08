@@ -221,6 +221,8 @@ type SetupConfig struct {
 	ExpectedMoveCostMultiplier float64
 	MinBodyRatio               float64
 	AtrPeriod                  int
+	MinSLDistanceATRMultiplier  float64
+	MinSLDistancePct            float64
 }
 
 func checkBreakoutLong(
@@ -268,15 +270,17 @@ func checkBreakoutLong(
 		return SetupResult{SetupType: SetupNone, ReasonCodes: []string{"invalid_sl"}}
 	}
 
+	result.StopLoss, _ = EnforceMinSLDistance(result.ProposedEntry, result.StopLoss, atr, domain.SideLong, cfg.MinSLDistanceATRMultiplier, cfg.MinSLDistancePct)
+
 	// TP: 2x the risk distance
 	riskDist := result.ProposedEntry - result.StopLoss
+	if riskDist <= 0 || math.IsNaN(riskDist) || math.IsInf(riskDist, 0) {
+		return SetupResult{SetupType: SetupNone, ReasonCodes: []string{"invalid_risk_distance"}}
+	}
 	result.TakeProfit = result.ProposedEntry + riskDist*2
 
-	// RR
-	if riskDist > 0 {
-		tpDist := result.TakeProfit - result.ProposedEntry
-		result.RR = tpDist / riskDist
-	}
+	tpDist := result.TakeProfit - result.ProposedEntry
+	result.RR = tpDist / riskDist
 
 	// Expected move (simplified: ATR * 2)
 	expectedMove := atr * 2
@@ -332,13 +336,16 @@ func checkBreakoutShort(
 
 	result.StopLoss = breakoutLevel + atr*0.5
 
+	result.StopLoss, _ = EnforceMinSLDistance(result.ProposedEntry, result.StopLoss, atr, domain.SideShort, cfg.MinSLDistanceATRMultiplier, cfg.MinSLDistancePct)
+
 	riskDist := result.StopLoss - result.ProposedEntry
+	if riskDist <= 0 || math.IsNaN(riskDist) || math.IsInf(riskDist, 0) {
+		return SetupResult{SetupType: SetupNone, ReasonCodes: []string{"invalid_risk_distance"}}
+	}
 	result.TakeProfit = result.ProposedEntry - riskDist*2
 
-	if riskDist > 0 {
-		tpDist := result.ProposedEntry - result.TakeProfit
-		result.RR = tpDist / riskDist
-	}
+	tpDist := result.ProposedEntry - result.TakeProfit
+	result.RR = tpDist / riskDist
 
 	expectedMove := atr * 2
 	estCost := result.ProposedEntry * 0.001
@@ -440,6 +447,56 @@ func MinATRCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf str
 	}
 	return nil
 }
+// EnforceMinSLDistance widens the stop-loss if it is too close to the entry price.
+// It computes two minimum distance thresholds—one as a multiplier of ATR and one
+// as a percentage of the entry price—and takes the larger. If the current SL
+// distance is below this floor, the SL is pushed out. Returns the (possibly
+// adjusted) SL and the enforced minimum distance. A zero or negative
+// minATRMultiplier/minPct means that threshold is skipped; if both are zero the
+// original SL is returned unchanged.
+func EnforceMinSLDistance(entry, currentSL, atr float64, side domain.Side, minATRMultiplier, minPct float64) (newSL, minDistance float64) {
+	if entry <= 0 || math.IsNaN(entry) || math.IsInf(entry, 0) {
+		return currentSL, 0
+	}
+	if math.IsNaN(currentSL) || math.IsInf(currentSL, 0) {
+		return currentSL, 0
+	}
+	if math.IsNaN(atr) || math.IsInf(atr, 0) {
+		return currentSL, 0
+	}
+	if atr < 0 {
+		atr = 0
+	}
+	if math.IsNaN(minATRMultiplier) || math.IsInf(minATRMultiplier, 0) {
+		return currentSL, 0
+	}
+	if math.IsNaN(minPct) || math.IsInf(minPct, 0) {
+		return currentSL, 0
+	}
+	minByATR := minATRMultiplier * atr
+	minByPct := entry * minPct / 100
+	minDistance = math.Max(minByATR, minByPct)
+
+	if minDistance <= 0 {
+		return currentSL, 0
+	}
+
+	currentDistance := math.Abs(entry - currentSL)
+	if currentDistance >= minDistance {
+		return currentSL, minDistance
+	}
+
+	if side == domain.SideLong {
+		newSL = entry - minDistance
+	} else {
+		newSL = entry + minDistance
+	}
+	if math.IsNaN(newSL) || math.IsInf(newSL, 0) {
+		return currentSL, 0
+	}
+	return newSL, minDistance
+}
+
 // MinVolumeCheck rejects candidates with very low volume ratio.
 func MinVolumeCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf string, strategy StrategyName) *RejectedCandidate {
 	// Skip volume check for major coins

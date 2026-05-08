@@ -32,6 +32,7 @@ type BlockEvaluationInput struct {
 	LocalPositions       []PositionState
 	ExchangePositions    []PositionState
 	MaxDataAge           time.Duration
+	PerSymbolSLCooldown  map[string]time.Time
 }
 
 // BlockEvaluationResult is the structured output from hard-block evaluation.
@@ -106,6 +107,9 @@ func EvaluateHardBlocks(in BlockEvaluationInput) BlockEvaluationResult {
 
 	blocked, reason = BlockIfPositionMismatch(in.LocalPositions, in.ExchangePositions)
 	record("BlockIfPositionMismatch", blocked, reason)
+
+	blocked, reason = BlockIfSymbolInSLCooldown(in.Symbol, in.PerSymbolSLCooldown)
+	record("BlockIfSymbolInSLCooldown", blocked, reason)
 
 	return result
 }

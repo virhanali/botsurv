@@ -29,6 +29,7 @@ type PortfolioState struct {
 	DailyLoss             float64
 	ConsecutiveLosses     int
 	CooldownUntil         *time.Time
+	PerSymbolSLCooldown   map[string]time.Time
 }
 
 // Engine is the deterministic risk authority.
@@ -223,6 +224,16 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 		reasons = append(reasons, "CONSECUTIVE_LOSSES_COOLDOWN")
 	}
 
+	// 14b. Per-symbol SL cooldown
+	slCooldownCfg := e.cfg.PortfolioRisk.PerSymbolSLCooldown
+	if slCooldownCfg.Enabled && input.Portfolio.PerSymbolSLCooldown != nil {
+		if until, ok := input.Portfolio.PerSymbolSLCooldown[input.ProposedTrade.Symbol]; ok {
+			if time.Now().Before(until) {
+				reasons = append(reasons, "SYMBOL_SL_COOLDOWN")
+			}
+		}
+	}
+
 	// 15. SL correct side
 	if input.ProposedTrade.ProposedStopLoss > 0 {
 		if input.ProposedTrade.Side == domain.SideLong && input.ProposedTrade.ProposedStopLoss >= input.ProposedTrade.ProposedEntry {
@@ -261,7 +272,10 @@ func (e *Engine) Validate(input ValidateInput) ValidateOutput {
 	if minRR <= 0 {
 		minRR = 2.0
 	}
-	if input.ProposedTrade.RR < minRR {
+	rr := input.ProposedTrade.RR
+	if math.IsNaN(rr) || math.IsInf(rr, 0) || rr <= 0 {
+		reasons = append(reasons, "INVALID_RR")
+	} else if rr < minRR {
 		reasons = append(reasons, "RR_BELOW_MIN")
 	}
 
@@ -466,6 +480,7 @@ func GetRejectionReason(code string) string {
 		"TOO_MANY_SAME_DIRECTION":     "Too many positions in same direction",
 		"IN_COOLDOWN":                 "In cooldown period",
 		"CONSECUTIVE_LOSSES_COOLDOWN": "Consecutive losses cooldown active",
+		"SYMBOL_SL_COOLDOWN":           "Symbol is in SL cooldown",
 		"SL_WRONG_SIDE":               "Stop loss on wrong side",
 		"SL_MISSING":                  "Stop loss is missing",
 		"TP_WRONG_SIDE":               "Take profit on wrong side",
@@ -475,6 +490,7 @@ func GetRejectionReason(code string) string {
 		"BELOW_MIN_NOTIONAL":          "Position below minimum notional",
 		"LEVERAGE_EXCEEDS_MAX":        "Leverage exceeds maximum",
 		"PORTFOLIO_RISK_LIMIT":        "Portfolio risk limit reached",
+		"INVALID_RR":                "Risk-reward ratio is invalid (zero, negative, NaN, or infinite)",
 		"RISK_TOO_SMALL":              "Risk amount too small after modifiers",
 		"MAX_CORRELATED_ALT_POSITIONS": "Maximum correlated alt LONG positions reached",
 		"INVALID_QTY":                 "Invalid quantity after lot size rounding",
@@ -555,6 +571,15 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 
 	riskAmount := acc.Equity * riskPct / 100
 	riskPerUnit := math.Abs(cand.EntryPrice - cand.StopLoss)
+	if riskPerUnit <= 0 || math.IsNaN(riskPerUnit) || math.IsInf(riskPerUnit, 0) {
+		return RiskValidationResult{
+			CandidateID:       cand.CandidateID,
+			Approved:          false,
+			RejectionReasons: []string{"invalid_risk_distance"},
+			ModifiersApplied:  modifiers,
+			RiskConfigVersion: cfg.RiskConfigVersion,
+		}
+	}
 	qtyRaw := riskAmount / riskPerUnit
 	qty := roundToLotSize(qtyRaw, input.SymbolInfo.LotSize)
 	positionValue := qty * cand.EntryPrice
@@ -588,7 +613,9 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 	// RR >= min_rr (against TP1)
 	if len(cand.TakeProfits) > 0 {
 		rr := cand.RiskRewardRatio
-		if rr < cfg.MinRR {
+		if math.IsNaN(rr) || math.IsInf(rr, 0) || rr <= 0 {
+			reasons = append(reasons, "INVALID_RR")
+		} else if rr < cfg.MinRR {
 			reasons = append(reasons, "RR_BELOW_MIN")
 		}
 	}
@@ -679,6 +706,27 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 	// Bot state
 	if input.BotState.Halted {
 		reasons = append(reasons, "BOT_HALTED")
+	}
+
+	// Per-symbol SL cooldown
+	slCooldownCfg := e.cfg.PortfolioRisk.PerSymbolSLCooldown
+	if slCooldownCfg.Enabled && input.Portfolio.PerSymbolSLCooldown != nil {
+		if until, ok := input.Portfolio.PerSymbolSLCooldown[cand.Symbol]; ok {
+			if time.Now().Before(until) {
+				reasons = append(reasons, "SYMBOL_SL_COOLDOWN")
+			}
+		}
+	}
+
+	// Consecutive losses cooldown
+	lossCooldownCfg := e.cfg.PortfolioRisk.CooldownAfterLosses
+	if lossCooldownCfg.Enabled && input.Portfolio.ConsecutiveLosses >= lossCooldownCfg.ConsecutiveLosses {
+		reasons = append(reasons, "CONSECUTIVE_LOSSES_COOLDOWN")
+	}
+
+	// Portfolio-level cooldown
+	if input.Portfolio.CooldownUntil != nil && time.Now().Before(*input.Portfolio.CooldownUntil) {
+		reasons = append(reasons, "IN_COOLDOWN")
 	}
 
 	// Build order plan
