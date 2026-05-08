@@ -237,7 +237,7 @@ func periodStart(period string) time.Time {
 	now := time.Now()
 	switch period {
 	case "today":
-		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	case "week":
 		return now.AddDate(0, 0, -7)
 	default:

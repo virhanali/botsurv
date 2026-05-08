@@ -263,7 +263,9 @@ func buildComponents(cfg *app.UserConfig, mode app.BotMode) (*components, func()
 	}
 
 	cleanup := func() {
-		mdSvc.Stop(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		mdSvc.Stop(ctx)
 		database.Close()
 	}
 

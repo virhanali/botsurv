@@ -32,6 +32,12 @@ func CheckLiveReadiness(ctx context.Context, decisionLogRepo db.DecisionLogRepos
 		})
 	}
 
+	// Fail if no repos are provided (M12)
+	if decisionLogRepo == nil && candidateOutcomeRepo == nil && paperTradeRepo == nil {
+		addCheck("Repos_Provided", false, "no repositories provided for live readiness checks")
+		return false, checks
+	}
+
 	// 1. No NaN/Inf reaching strategy layer (decision_logs with REJECTED_RISK for INVALID_ENTRY/INVALID_STOP_LOSS)
 	if decisionLogRepo != nil {
 		invalidCount, err := decisionLogRepo.CountByAction(ctx, "REJECTED_RISK", since30d)

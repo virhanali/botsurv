@@ -190,6 +190,12 @@ func generateTrendPullbackForSide(in TrendPullbackInput, side domain.Side) (*Tra
 
 	sl, _ = EnforceMinSLDistance(entry, sl, atr, side, in.MinSLDistanceATRMultiplier, in.MinSLDistancePct)
 
+	// Guard TP=SL edge case: entry and SL must be separated by at least one tick (M11)
+	if math.Abs(entry-sl) < in.TickSize {
+		rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, "entry_sl_too_close")
+		return nil, &rej
+	}
+
 	riskDist := math.Abs(entry - sl)
 	if riskDist <= 0 || math.IsNaN(riskDist) || math.IsInf(riskDist, 0) {
 		rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, "invalid_risk_distance")
