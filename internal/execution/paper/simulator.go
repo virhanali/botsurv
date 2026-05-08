@@ -175,13 +175,13 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 		slippageBps = 5
 	}
 	if plan.Side == domain.SideLong {
-		price = price * (1 + slippageBps/10000)
+		price = roundToPrecision(price*(1+slippageBps/10000), 8)
 	} else {
-		price = price * (1 - slippageBps/10000)
+		price = roundToPrecision(price*(1-slippageBps/10000), 8)
 	}
 
 	// Calculate fees (taker)
-	fee := plan.Qty * price * (s.cfg.FeeTakerBps / 10000)
+	fee := roundToPrecision(plan.Qty*price*(s.cfg.FeeTakerBps/10000), 8)
 	if fee < 0 {
 		fee = 0
 	}
@@ -210,11 +210,11 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 			riskDist := math.Abs(plan.EntryPrice - plan.StopLoss)
 			tpDist := math.Abs(tp - plan.EntryPrice)
 			if plan.Side == domain.SideLong {
-				sl = price - riskDist
-				tp = price + tpDist
+				sl = roundToPrecision(price-riskDist, 8)
+				tp = roundToPrecision(price+tpDist, 8)
 			} else {
-				sl = price + riskDist
-				tp = price - tpDist
+				sl = roundToPrecision(price+riskDist, 8)
+				tp = roundToPrecision(price-tpDist, 8)
 			}
 		}
 	}
@@ -235,7 +235,7 @@ func (s *Simulator) SimulateFill(ctx context.Context, decisionID string, plan ri
 
 	// Update in-memory state under lock
 	s.mu.Lock()
-	s.currentEquity -= fee
+	s.currentEquity = roundToPrecision(s.currentEquity-fee, 8)
 	s.totalTrades++
 	s.mu.Unlock()
 
@@ -329,18 +329,18 @@ func (s *Simulator) closeTrade(ctx context.Context, trade domain.PaperTrade, exi
 	// Calculate PnL (pure arithmetic, no state mutation)
 	var pnlGross float64
 	if trade.Side == domain.SideLong {
-		pnlGross = (exitPrice - trade.EntryPrice) * trade.Qty
+		pnlGross = roundToPrecision((exitPrice-trade.EntryPrice)*trade.Qty, 8)
 	} else {
-		pnlGross = (trade.EntryPrice - exitPrice) * trade.Qty
+		pnlGross = roundToPrecision((trade.EntryPrice-exitPrice)*trade.Qty, 8)
 	}
 
 	// Exit fee (taker)
-	exitFee := trade.Qty * exitPrice * (s.cfg.FeeTakerBps / 10000)
+	exitFee := roundToPrecision(trade.Qty*exitPrice*(s.cfg.FeeTakerBps/10000), 8)
 	if exitFee < 0 {
 		exitFee = 0
 	}
 
-	pnlNet := pnlGross - exitFee
+	pnlNet := roundToPrecision(pnlGross-exitFee, 8)
 
 	// Calculate R-multiple
 	var rMultiple float64
@@ -351,12 +351,12 @@ func (s *Simulator) closeTrade(ctx context.Context, trade domain.PaperTrade, exi
 			if reason == "sl" {
 				rMultiple = -1.0
 			} else {
-				rMultiple = resultPerUnit / riskPerUnit
+				rMultiple = roundToPrecision(resultPerUnit/riskPerUnit, 8)
 			}
 		}
 	}
 
-	totalFees := trade.FeesPaid + exitFee
+	totalFees := roundToPrecision(trade.FeesPaid+exitFee, 8)
 
 	trade.ClosedAt = &now
 	trade.ExitPrice = &exitPrice
@@ -374,8 +374,8 @@ func (s *Simulator) closeTrade(ctx context.Context, trade domain.PaperTrade, exi
 
 	// Update in-memory state under lock
 	s.mu.Lock()
-	s.currentEquity += pnlNet
-	s.realizedPnL += pnlNet
+	s.currentEquity = roundToPrecision(s.currentEquity+pnlNet, 8)
+	s.realizedPnL = roundToPrecision(s.realizedPnL+pnlNet, 8)
 	if !isRehydrated {
 		if pnlNet > 0 {
 			s.wins++
@@ -542,4 +542,14 @@ func (s *Simulator) Run(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
+}
+
+// roundToPrecision rounds a float64 to the given number of decimal places.
+// Used for all financial calculations to prevent float drift on penny coins (C3).
+func roundToPrecision(val float64, prec int) float64 {
+	if prec <= 0 {
+		return math.Round(val)
+	}
+	p := math.Pow10(prec)
+	return math.Round(val*p) / p
 }
