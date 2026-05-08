@@ -580,7 +580,13 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 			RiskConfigVersion: cfg.RiskConfigVersion,
 		}
 	}
-	qtyRaw := riskAmount / riskPerUnit
+
+	// Fee-aware sizing: adjust risk-per-unit to include expected fees so that
+	// net loss at SL (including entry+exit fees) matches the target riskAmount.
+	feeRate := e.cfg.Broker.Paper.FeeTakerBps / 10000.0
+	feePerUnit := cand.EntryPrice * feeRate * 2 // entry + exit fee per unit
+	effectiveRiskPerUnit := riskPerUnit + feePerUnit
+	qtyRaw := riskAmount / effectiveRiskPerUnit
 	qty := roundToLotSize(qtyRaw, input.SymbolInfo.LotSize)
 	positionValue := qty * cand.EntryPrice
 	marginRequired := positionValue / leverage
@@ -652,10 +658,11 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 	entryPrice := roundToTickSize(cand.EntryPrice, input.SymbolInfo.TickSize)
 	slPrice := roundToTickSize(cand.StopLoss, input.SymbolInfo.TickSize)
 
-	// Recalculate qty using rounded prices for consistency
+	// Recalculate qty using rounded prices for consistency (fee-aware)
 	roundedRiskPerUnit := math.Abs(entryPrice - slPrice)
 	if roundedRiskPerUnit > 0 {
-		qty = roundToLotSize(riskAmount/roundedRiskPerUnit, input.SymbolInfo.LotSize)
+		roundedFeePerUnit := entryPrice * feeRate * 2
+		qty = roundToLotSize(riskAmount/(roundedRiskPerUnit+roundedFeePerUnit), input.SymbolInfo.LotSize)
 		positionValue = qty * entryPrice
 		marginRequired = positionValue / leverage
 	}
@@ -671,10 +678,19 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 		}
 	}
 
-	// Minimum SL distance check (0.3% from entry after rounding)
+	// Minimum SL distance check (price-aware: wider for low-price coins)
 	if entryPrice > 0 {
 		slDistPct := math.Abs(entryPrice-slPrice) / entryPrice * 100
-		if slDistPct < 0.3 {
+		minPct := 0.3
+		switch {
+		case entryPrice < 1.0:
+			minPct = 1.5
+		case entryPrice < 10.0:
+			minPct = 1.0
+		case entryPrice < 100.0:
+			minPct = 0.5
+		}
+		if slDistPct < minPct {
 			reasons = append(reasons, "SL_TOO_CLOSE_AFTER_ROUNDING")
 		}
 	}
@@ -739,7 +755,6 @@ func (e *Engine) ValidateCandidate(input CandidateRiskInput) RiskValidationResul
 	}
 
 	// Estimate fees (taker fee for entry + taker fee for exit)
-	feeRate := e.cfg.Broker.Paper.FeeTakerBps / 10000.0
 	estimatedFees := positionValue * feeRate * 2 // entry + exit
 
 	plan := &OrderPlan{

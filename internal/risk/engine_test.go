@@ -587,10 +587,10 @@ func TestValidateCandidate_ApproveValidTrade(t *testing.T) {
 	}
 	// risk_amount = 10000 * 0.5 / 100 = 50
 	// risk_per_unit = 50000 - 49000 = 1000
-	// qty_raw = 50 / 1000 = 0.05 -> round to lot 0.001 -> 0.05
-	// position_value = 0.05 * 50000 = 2500
-	// margin = 2500 / 3 = 833.33
-	expectedQty := 0.05
+	// fee_rate = 5.5/10000 = 0.00055, fee_per_unit = 50000*0.00055*2 = 55
+	// effective_risk_per_unit = 1000 + 55 = 1055
+	// qty_raw = 50 / 1055 = 0.047393... → round to lot 0.001 → 0.047
+	expectedQty := 0.047
 	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
 		t.Errorf("expected qty %.4f, got %.4f", expectedQty, result.OrderPlan.Qty)
 	}
@@ -614,16 +614,18 @@ func TestValidateCandidate_SizingKnownValues(t *testing.T) {
 	input.AccountState.Equity = 20000
 	// risk_amount = 20000 * 0.5 / 100 = 100
 	// risk_per_unit = 1000
-	// qty_raw = 0.1 -> round to lot 0.001 -> 0.1
+	// fee_rate=0.00055, fee_per_unit=100000*0.00055*2=110
+	// effective_risk_per_unit = 1000+110=1110
+	// qty_raw = 100 / 1110 = 0.09009... → round to lot 0.001 → 0.09
 	result := e.ValidateCandidate(input)
 	if !result.Approved {
 		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
 	}
-	expectedQty := 0.1
+	expectedQty := 0.09
 	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
 		t.Errorf("expected qty %.4f, got %.4f", expectedQty, result.OrderPlan.Qty)
 	}
-	expectedMargin := (0.1 * 100000) / 3
+	expectedMargin := (0.09 * 100000) / 3
 	if math.Abs(result.OrderPlan.MarginRequired-expectedMargin) > 1e-6 {
 		t.Errorf("expected margin %.2f, got %.2f", expectedMargin, result.OrderPlan.MarginRequired)
 	}
@@ -646,8 +648,8 @@ func TestValidateCandidate_ModifierReduceSize(t *testing.T) {
 	if !found {
 		t.Errorf("expected reduce_size modifier, got %v", result.ModifiersApplied)
 	}
-	// Base qty without modifier = 0.05, with 0.5x risk -> 0.025
-	expectedQty := 0.025
+	// Base qty without modifier = 0.047, with 0.5x risk -> 0.024
+	expectedQty := 0.024
 	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
 		t.Errorf("expected qty %.4f after reduce, got %.4f", expectedQty, result.OrderPlan.Qty)
 	}
@@ -1063,4 +1065,54 @@ func TestValidateCandidate_PortfolioCooldown(t *testing.T) {
 		t.Fatal("expected rejection for portfolio cooldown")
 	}
 	assertContainsReason(t, result.RejectionReasons, "IN_COOLDOWN")
+}
+
+func TestValidateCandidate_FeeAwareSizing_ReducesQty(t *testing.T) {
+	cfg := phase4Config()
+	cfg.Broker.Paper.FeeTakerBps = 10 // 10 bps
+	e := NewEngine(cfg)
+	input := phase4Input()
+	// With 5.5 bps expected qty=0.047, with 10 bps should be even smaller
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	// fee_per_unit = 50000 * 0.001 * 2 = 100
+	// effective_risk_per_unit = 1000+100 = 1100
+	// qty = 50 / 1100 = 0.0454... → 0.045
+	expectedQty := 0.045
+	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
+		t.Errorf("expected qty %.4f with 10bps fees, got %.4f", expectedQty, result.OrderPlan.Qty)
+	}
+}
+
+func TestValidateCandidate_FeeAwareSizing_ZeroFees(t *testing.T) {
+	cfg := phase4Config()
+	cfg.Broker.Paper.FeeTakerBps = 0 // zero fees
+	e := NewEngine(cfg)
+	input := phase4Input()
+	result := e.ValidateCandidate(input)
+	if !result.Approved {
+		t.Fatalf("expected approved, got: %v", result.RejectionReasons)
+	}
+	// With zero fees, should match old behavior: qty = 0.05
+	expectedQty := 0.05
+	if math.Abs(result.OrderPlan.Qty-expectedQty) > 1e-9 {
+		t.Errorf("expected qty %.4f with zero fees, got %.4f", expectedQty, result.OrderPlan.Qty)
+	}
+}
+
+func TestValidateCandidate_SLTooCloseAfterRounding_LowPrice(t *testing.T) {
+	cfg := phase4Config()
+	e := NewEngine(cfg)
+	input := phase4Input()
+	input.Candidate.EntryPrice = 0.10
+	input.Candidate.StopLoss = 0.0995 // 0.5% away (< 1.0% minimum for <$1)
+	input.Candidate.TakeProfits = []strategy.TakeProfitTarget{{Price: 0.12, SizePct: 100}}
+	input.SymbolInfo = domain.SymbolInfo{TickSize: 0.0001, LotSize: 0.1, MinNotional: 1, MaxLeverage: 100}
+	result := e.ValidateCandidate(input)
+	if result.Approved {
+		t.Fatal("expected rejection for SL too close on low-price coin")
+	}
+	assertContainsReason(t, result.RejectionReasons, "SL_TOO_CLOSE_AFTER_ROUNDING")
 }
