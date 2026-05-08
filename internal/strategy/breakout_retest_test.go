@@ -132,6 +132,7 @@ func baseBreakoutLongInput() BreakoutRetestInput {
 		Symbol:     "SOLUSDT",
 		Timeframe:  "15m",
 		TickSize:   0.01,
+		MinRR:      1.4,
 		Candles15m: candles,
 		Snapshot15m: indicator.IndicatorSnapshot{
 			ATR14:            0.8,

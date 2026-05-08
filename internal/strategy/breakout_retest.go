@@ -22,6 +22,7 @@ type BreakoutRetestInput struct {
 	RegimeSnapshotRef            string
 	MinSLDistanceATRMultiplier   float64
 	MinSLDistancePct             float64
+	MinRR                        float64
 }
 
 // GenerateBreakoutRetest evaluates both sides and returns one candidate when valid.
@@ -192,9 +193,13 @@ func generateBreakoutRetestForSide(in BreakoutRetestInput, side domain.Side) (*T
 		}
 	}
 
+	minRR := in.MinRR
+	if minRR <= 0 {
+		minRR = 1.4
+	}
 	rr := math.Abs(tp1-entry) / riskDist
-	if rr < 1.4 {
-		rej := BuildRejectedCandidate(StrategyBreakoutRetest, side, in.Symbol, in.Timeframe, fmt.Sprintf("RR %.2f < 1.4", rr))
+	if rr < minRR {
+		rej := BuildRejectedCandidate(StrategyBreakoutRetest, side, in.Symbol, in.Timeframe, fmt.Sprintf("RR %.2f < %.2f", rr, minRR))
 		return nil, &rej
 	}
 

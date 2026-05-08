@@ -24,6 +24,7 @@ type TrendPullbackInput struct {
 	RegimeSnapshotRef            string
 	MinSLDistanceATRMultiplier   float64
 	MinSLDistancePct             float64
+	MinRR                        float64
 }
 
 // GenerateTrendPullback evaluates long/short and returns the first valid candidate.
@@ -239,8 +240,13 @@ func generateTrendPullbackForSide(in TrendPullbackInput, side domain.Side) (*Tra
 		}
 	}
 
+	minRR := in.MinRR
+	if minRR <= 0 {
+		minRR = 1.4
+	}
+
 	rr := math.Abs(tp1-entry) / riskDist
-	if rr < 1.4 {
+	if rr < minRR {
 		// If nearest level is too close, fall back to the 1.5R target.
 		tp1 = tp1Fallback
 		if side == domain.SideLong && tp2 <= tp1 {
@@ -251,8 +257,8 @@ func generateTrendPullbackForSide(in TrendPullbackInput, side domain.Side) (*Tra
 		}
 		rr = math.Abs(tp1-entry) / riskDist
 	}
-	if rr < 1.4 {
-		rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, fmt.Sprintf("RR %.2f < 1.4", rr))
+	if rr < minRR {
+		rej := BuildRejectedCandidate(StrategyTrendPullback, side, in.Symbol, in.Timeframe, fmt.Sprintf("RR %.2f < %.2f", rr, minRR))
 		return nil, &rej
 	}
 

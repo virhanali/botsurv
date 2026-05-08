@@ -147,6 +147,7 @@ func baseTrendLongInput() TrendPullbackInput {
 		Symbol:     "ORDIUSDT",
 		Timeframe:  "15m",
 		TickSize:   0.01,
+		MinRR:      1.4,
 		Candles15m: candles,
 		Snapshot15m: indicator.IndicatorSnapshot{
 			EMA20:            candles[len(candles)-1].Close - 0.2,

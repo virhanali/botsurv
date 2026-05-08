@@ -549,6 +549,11 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 	indicatorRef := fmt.Sprintf("%s:%s:%d", sym.Symbol, setupTF, setupSnap.LastCloseTime.Unix())
 	regimeRef := fmt.Sprintf("%s:%d", sym.Symbol, regimeSnap.Timestamp.Unix())
 
+	minRR := s.cfg.Risk.MinRR
+	if minRR <= 0 {
+		minRR = 1.4
+	}
+
 	trendCand, trendReject := strategy.GenerateTrendPullback(strategy.TrendPullbackInput{
 		Now:                        time.Now().UTC(),
 		Symbol:                     sym.Symbol,
@@ -562,6 +567,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		RegimeSnapshotRef:          regimeRef,
 		MinSLDistanceATRMultiplier: s.cfg.Strategy.Indicators.WithDefaults().MinSLDistanceATRMultiplier,
 		MinSLDistancePct:           s.cfg.Strategy.Indicators.WithDefaults().MinSLDistancePct,
+		MinRR:                      minRR,
 	})
 	var rejections []StrategyRejection
 	if trendReject != nil {
@@ -590,6 +596,7 @@ func (s *Screener) evaluateSymbol(ctx context.Context, sym domain.UniverseSymbol
 		RegimeSnapshotRef:          regimeRef,
 		MinSLDistanceATRMultiplier: s.cfg.Strategy.Indicators.WithDefaults().MinSLDistanceATRMultiplier,
 		MinSLDistancePct:           s.cfg.Strategy.Indicators.WithDefaults().MinSLDistancePct,
+		MinRR:                      minRR,
 	})
 	if breakoutReject != nil {
 		s.log.Info("rejected_candidate", map[string]any{
