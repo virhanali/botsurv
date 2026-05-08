@@ -1176,7 +1176,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			// Add buffer to avoid racing with candle close
-			time.Sleep(buffer)
+			select {
+			case <-ctx.Done():
+				s.log.Info("scheduler stopped", nil)
+				return nil
+			case <-time.After(buffer):
+			}
 			if _, err := s.RunOnce(ctx); err != nil {
 				s.log.Error("cycle failed", map[string]any{"error": err.Error()})
 			}
