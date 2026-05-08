@@ -165,17 +165,17 @@ func ComputePaperMetrics(ctx context.Context, paperTradeRepo db.PaperTradeReposi
 	}
 	metrics.TradeFreqPerDay = float64(len(trades)) / daysBetween
 
-	// By side aggregation
+	// By side aggregation (use R-multiples for consistent R-based metrics)
 	metrics.BySide = make(map[string]SubMetrics)
 	bySide := make(map[string][]float64)
 	for _, t := range trades {
 		side := string(t.Side)
-		if t.PnLNet != nil {
-			bySide[side] = append(bySide[side], *t.PnLNet)
+		if t.RMultiple != nil {
+			bySide[side] = append(bySide[side], *t.RMultiple)
 		}
 	}
-	for side, pnls := range bySide {
-		metrics.BySide[side] = computeSubMetrics(pnls)
+	for side, rMultiples := range bySide {
+		metrics.BySide[side] = computeSubMetrics(rMultiples)
 	}
 
 	// Counterfactual analysis
@@ -208,9 +208,13 @@ func computeSubMetrics(pnls []float64) SubMetrics {
 		if p > 0 {
 			wins++
 			grossWins += p
+			totalWinR += p
+			winRCount++
 		} else {
 			losses++
 			grossLosses += math.Abs(p)
+			totalLossR += p
+			lossRCount++
 		}
 	}
 	m.WinRate = float64(wins) / float64(len(pnls)) * 100
