@@ -447,11 +447,40 @@ func MinATRCheck(snap indicator.IndicatorSnapshot, side domain.Side, sym, tf str
 	}
 	return nil
 }
+// priceAwareMinSLPct returns a minimum SL percentage that scales inversely with
+// price. Low-price coins need wider SL percentages to avoid fees consuming the
+// trade. The configured minPct acts as a floor — the effective minimum will
+// never go below minPct.
+//
+//	Tiers: < $1 → 1.5%,  $1–$10 → 1.0%, $10–$100 → 0.5%, > $100 → minPct
+func priceAwareMinSLPct(entryPrice, minPct float64) float64 {
+	if entryPrice <= 0 {
+		return minPct
+	}
+	if minPct <= 0 {
+		return 0
+	}
+	tierPct := minPct
+	switch {
+	case entryPrice < 1.0:
+		tierPct = 1.5
+	case entryPrice < 10.0:
+		tierPct = 1.0
+	case entryPrice < 100.0:
+		tierPct = 0.5
+	}
+	if tierPct < minPct {
+		tierPct = minPct
+	}
+	return tierPct
+}
+
 // EnforceMinSLDistance widens the stop-loss if it is too close to the entry price.
 // It computes two minimum distance thresholds—one as a multiplier of ATR and one
-// as a percentage of the entry price—and takes the larger. If the current SL
-// distance is below this floor, the SL is pushed out. Returns the (possibly
-// adjusted) SL and the enforced minimum distance. A zero or negative
+// as a percentage of the entry price—and takes the larger. For low-price coins,
+// the percentage threshold is scaled up automatically (price-aware guard). If the
+// current SL distance is below this floor, the SL is pushed out. Returns the
+// (possibly adjusted) SL and the enforced minimum distance. A zero or negative
 // minATRMultiplier/minPct means that threshold is skipped; if both are zero the
 // original SL is returned unchanged.
 func EnforceMinSLDistance(entry, currentSL, atr float64, side domain.Side, minATRMultiplier, minPct float64) (newSL, minDistance float64) {
@@ -473,8 +502,9 @@ func EnforceMinSLDistance(entry, currentSL, atr float64, side domain.Side, minAT
 	if math.IsNaN(minPct) || math.IsInf(minPct, 0) {
 		return currentSL, 0
 	}
+	effectiveMinPct := priceAwareMinSLPct(entry, minPct)
 	minByATR := minATRMultiplier * atr
-	minByPct := entry * minPct / 100
+	minByPct := entry * effectiveMinPct / 100
 	minDistance = math.Max(minByATR, minByPct)
 
 	if minDistance <= 0 {

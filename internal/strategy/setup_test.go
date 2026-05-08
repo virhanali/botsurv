@@ -543,3 +543,45 @@ func TestEnforceMinSLDistance_PctThresholdLargerThanATR(t *testing.T) {
 		t.Fatalf("expected SL %.4f, got %.4f", expectedSL, newSL)
 	}
 }
+
+func TestPriceAwareMinSLPct_Tiers(t *testing.T) {
+	cases := []struct {
+		entry  float64
+		minPct float64
+		want   float64
+	}{
+		{0.10, 0.3, 1.5},  // sub-dollar
+		{0.99, 0.3, 1.5},  // below $1
+		{5.0, 0.3, 1.0},   // $1-$10
+		{50.0, 0.3, 0.5},  // $10-$100
+		{500.0, 0.3, 0.3}, // above $100, keep configured
+		{500.0, 0.8, 0.8}, // above $100, custom minPct > tier
+		{0.10, 0.0, 0.0},  // zero minPct, skip
+		{0.0, 0.3, 0.3},   // zero entry
+	}
+	for _, c := range cases {
+		got := priceAwareMinSLPct(c.entry, c.minPct)
+		if math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("priceAwareMinSLPct(%f, %f) = %f, want %f", c.entry, c.minPct, got, c.want)
+		}
+	}
+}
+
+func TestEnforceMinSLDistance_LowPriceCoin_Widened(t *testing.T) {
+	entry := 0.10
+	currentSL := 0.0995 // 0.5% away
+	atr := 0.001
+
+	newSL, minDist := EnforceMinSLDistance(entry, currentSL, atr, domain.SideLong, 0.3, 0.3)
+
+	minByATR := 0.3 * 0.001
+	minByPct := 0.10 * 1.5 / 100 // price-aware tier for <$1
+	expectedMin := math.Max(minByATR, minByPct)
+	if math.Abs(minDist-expectedMin) > 1e-9 {
+		t.Fatalf("expected minDist=%.6f (price-aware), got %.6f", expectedMin, minDist)
+	}
+	expectedSL := entry - expectedMin
+	if math.Abs(newSL-expectedSL) > 1e-9 {
+		t.Fatalf("expected SL %.6f, got %.6f", expectedSL, newSL)
+	}
+}
