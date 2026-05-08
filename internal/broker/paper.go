@@ -1196,32 +1196,38 @@ func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, s
 		return fmt.Errorf("SL price must be > 0 (no position without SL)")
 	}
 
-	// Cancel existing protective orders to avoid duplicates.
+	// Cancel existing protective orders and snapshot position data under lock
+	// to prevent TOCTOU race where the position is closed/modified between
+	// cancel and re-link (C2).
 	pb.mu.Lock()
 	if pos, ok := pb.openPositions[symbol]; ok {
 		pb.cancelSiblingOrders(pos)
 	}
+	pos, ok := pb.openPositions[symbol]
+	var posCopy domain.Position
+	if ok {
+		posCopy = *pos
+	}
 	pb.mu.Unlock()
 
-	pos, ok := pb.GetPosition(symbol)
 	if !ok {
 		return fmt.Errorf("no open position for %s", symbol)
 	}
 
-	// Validate SL is on correct side
-	if pos.Side == domain.SideLong && slPrice >= pos.EntryPrice {
+	// Validate SL is on correct side using copied data
+	if posCopy.Side == domain.SideLong && slPrice >= posCopy.EntryPrice {
 		return fmt.Errorf("LONG SL must be below entry price")
 	}
-	if pos.Side == domain.SideShort && slPrice <= pos.EntryPrice {
+	if posCopy.Side == domain.SideShort && slPrice <= posCopy.EntryPrice {
 		return fmt.Errorf("SHORT SL must be above entry price")
 	}
 
 	// Validate TP is on correct side (if provided)
 	if tpPrice > 0 {
-		if pos.Side == domain.SideLong && tpPrice <= pos.EntryPrice {
+		if posCopy.Side == domain.SideLong && tpPrice <= posCopy.EntryPrice {
 			return fmt.Errorf("LONG TP must be above entry price")
 		}
-		if pos.Side == domain.SideShort && tpPrice >= pos.EntryPrice {
+		if posCopy.Side == domain.SideShort && tpPrice >= posCopy.EntryPrice {
 			return fmt.Errorf("SHORT TP must be below entry price")
 		}
 	}
@@ -1231,10 +1237,10 @@ func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, s
 		Symbol:    symbol,
 		Side:      domain.OrderSideSell, // SL for long = sell, for short = buy
 		OrderType: domain.OrderTypeStopMarket,
-		Qty:       pos.Size,
+		Qty:       posCopy.Size,
 		StopPrice: &slPrice,
 	}
-	if pos.Side == domain.SideShort {
+	if posCopy.Side == domain.SideShort {
 		slReq.Side = domain.OrderSideBuy
 	}
 
@@ -1249,10 +1255,10 @@ func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, s
 			Symbol:    symbol,
 			Side:      domain.OrderSideSell,
 			OrderType: domain.OrderTypeTakeProfitMarket,
-			Qty:       pos.Size,
+			Qty:       posCopy.Size,
 			StopPrice: &tpPrice,
 		}
-		if pos.Side == domain.SideShort {
+		if posCopy.Side == domain.SideShort {
 			tpReq.Side = domain.OrderSideBuy
 		}
 
@@ -1265,9 +1271,9 @@ func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, s
 			})
 			_ = tpOrder
 		} else {
-			// Link orders to position
+			// Link orders to position only if it still exists with the same ID.
 			pb.mu.Lock()
-			if p, ok := pb.openPositions[symbol]; ok {
+			if p, ok := pb.openPositions[symbol]; ok && p.ID == posCopy.ID {
 				p.SLOrderID = &slOrder.ID
 				p.TPOrderID = &tpOrder.ID
 				p.StopLoss = slPrice
@@ -1278,7 +1284,7 @@ func (pb *PaperBroker) SetProtectiveOrders(ctx context.Context, symbol string, s
 		}
 	} else {
 		pb.mu.Lock()
-		if p, ok := pb.openPositions[symbol]; ok {
+		if p, ok := pb.openPositions[symbol]; ok && p.ID == posCopy.ID {
 			p.SLOrderID = &slOrder.ID
 			p.StopLoss = slPrice
 			pb.updatePositionInDB(p)
