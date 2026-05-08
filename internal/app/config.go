@@ -609,10 +609,10 @@ func (c StrategyConfig) validate() error {
 func (c IndicatorsConfig) WithDefaults() IndicatorsConfig {
 	out := c
 	if out.MinSLDistanceATRMultiplier <= 0 {
-		out.MinSLDistanceATRMultiplier = 1.0
+		out.MinSLDistanceATRMultiplier = 0.3
 	}
 	if out.MinSLDistancePct <= 0 {
-		out.MinSLDistancePct = 2.0
+		out.MinSLDistancePct = 0.3
 	}
 	return out
 }
