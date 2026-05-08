@@ -492,6 +492,7 @@ func (c *UserConfig) Validate() error {
 	if err := c.LLM.Validate(); err != nil {
 		return fmt.Errorf("llm: %w", err)
 	}
+	c.LLMReview = c.LLMReview.WithDefaults()
 	if err := c.LLMReview.Validate(); err != nil {
 		return fmt.Errorf("llm_review: %w", err)
 	}
@@ -931,10 +932,11 @@ func (c *LLMConfig) Validate() error {
 }
 
 // Validate checks LLM review config.
-func (c *LLMReviewConfig) Validate() error {
+// Callers should invoke WithDefaults() first to populate missing fields.
+func (c LLMReviewConfig) Validate() error {
 	validModes := map[string]bool{"off": true, "audit_only": true, "veto": true, "review": true}
 	if c.Mode == "" {
-		c.Mode = "off"
+		return errors.New("mode is required")
 	}
 	if !validModes[c.Mode] {
 		return fmt.Errorf("mode must be one of: off, audit_only, veto, review")
@@ -952,10 +954,10 @@ func (c *LLMReviewConfig) Validate() error {
 		return errors.New("timeout_seconds must be > 0")
 	}
 	if c.MaxInputTokens <= 0 {
-		c.MaxInputTokens = 2000
+		return errors.New("max_input_tokens must be > 0")
 	}
 	if c.MaxOutputTokens <= 0 {
-		c.MaxOutputTokens = 500
+		return errors.New("max_output_tokens must be > 0")
 	}
 	if c.DailyCostCapUSD < 0 {
 		return errors.New("daily_cost_cap_usd must be >= 0")
