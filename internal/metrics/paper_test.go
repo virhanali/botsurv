@@ -180,3 +180,41 @@ func (m *mockPaperTradeRepo) GetAll(ctx context.Context, since time.Time) ([]dom
 func (m *mockPaperTradeRepo) CountByExitReason(ctx context.Context, reason string, since time.Time) (int, error) {
 	return 0, nil
 }
+
+func TestPaperMetrics_ExplicitWinsLosses(t *testing.T) {
+	now := time.Now()
+	pnl1 := 50.0
+	pnl2 := -25.0
+	pnl3 := 75.0
+	pnl4 := -30.0
+	rMult := 1.0
+
+	mockTrades := []domain.PaperTrade{
+		{PaperTradeID: "t1", Symbol: "A", Side: domain.SideLong, PnLNet: &pnl1, RMultiple: &rMult, ClosedAt: &now, ExitReason: "tp"},
+		{PaperTradeID: "t2", Symbol: "B", Side: domain.SideLong, PnLNet: &pnl2, RMultiple: &rMult, ClosedAt: &now, ExitReason: "sl"},
+		{PaperTradeID: "t3", Symbol: "C", Side: domain.SideLong, PnLNet: &pnl3, RMultiple: &rMult, ClosedAt: &now, ExitReason: "tp"},
+		{PaperTradeID: "t4", Symbol: "D", Side: domain.SideLong, PnLNet: &pnl4, RMultiple: &rMult, ClosedAt: &now, ExitReason: "sl"},
+	}
+
+	mockRepo := &mockPaperTradeRepo{trades: mockTrades}
+	metrics, err := ComputePaperMetrics(context.Background(), mockRepo, nil, "all_time")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if metrics.Wins != 2 {
+		t.Errorf("expected 2 wins, got %d", metrics.Wins)
+	}
+	if metrics.Losses != 2 {
+		t.Errorf("expected 2 losses, got %d", metrics.Losses)
+	}
+	if metrics.GetWins() != 2 {
+		t.Errorf("GetWins() expected 2, got %d", metrics.GetWins())
+	}
+	if metrics.GetLosses() != 2 {
+		t.Errorf("GetLosses() expected 2, got %d", metrics.GetLosses())
+	}
+	if metrics.Wins+metrics.Losses != metrics.TotalTrades {
+		t.Errorf("wins(%d)+losses(%d) != total(%d)", metrics.Wins, metrics.Losses, metrics.TotalTrades)
+	}
+}

@@ -14,6 +14,8 @@ import (
 type PaperMetrics struct {
 	Period        string  `json:"period"`
 	TotalTrades   int     `json:"total_trades"`
+	Wins          int     `json:"wins"`
+	Losses        int     `json:"losses"`
 	WinRate       float64 `json:"win_rate"`
 	ProfitFactor  float64 `json:"profit_factor"`
 	Expectancy    float64 `json:"expectancy_per_trade"`
@@ -34,6 +36,8 @@ type PaperMetrics struct {
 // SubMetrics holds per-strategy or per-side metrics.
 type SubMetrics struct {
 	TotalTrades   int     `json:"total_trades"`
+	Wins          int     `json:"wins"`
+	Losses        int     `json:"losses"`
 	WinRate       float64 `json:"win_rate"`
 	ProfitFactor  float64 `json:"profit_factor"`
 	Expectancy    float64 `json:"expectancy_per_trade"`
@@ -124,6 +128,8 @@ func ComputePaperMetrics(ctx context.Context, paperTradeRepo db.PaperTradeReposi
 	if wins+losses > 0 {
 		metrics.WinRate = float64(wins) / float64(wins+losses) * 100
 	}
+	metrics.Wins = wins
+	metrics.Losses = losses
 
 	if grossLosses > 0 {
 		metrics.ProfitFactor = grossWins / grossLosses
@@ -217,6 +223,8 @@ func computeSubMetrics(pnls []float64) SubMetrics {
 			lossRCount++
 		}
 	}
+	m.Wins = wins
+	m.Losses = losses
 	m.WinRate = float64(wins) / float64(len(pnls)) * 100
 	if grossLosses > 0 {
 		m.ProfitFactor = grossWins / grossLosses
@@ -245,13 +253,8 @@ func periodStart(period string) time.Time {
 	}
 }
 
-// GetWins returns number of winning trades (deduced from win rate and total).
-func (m *PaperMetrics) GetWins() int {
-	if m.WinRate > 0 && m.TotalTrades > 0 {
-		return int(float64(m.TotalTrades) * m.WinRate / 100.0)
-	}
-	return 0
-}
+// GetWins returns number of winning trades.
+func (m *PaperMetrics) GetWins() int { return m.Wins }
 
 // GetLosses returns number of losing trades.
-func (m *PaperMetrics) GetLosses() int { return m.TotalTrades - m.GetWins() }
+func (m *PaperMetrics) GetLosses() int { return m.Losses }
