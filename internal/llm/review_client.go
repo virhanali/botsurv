@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/virhan/botsurv/internal/app"
@@ -26,7 +27,7 @@ type reviewHTTPClient struct {
 	cfg       app.LLMReviewConfig
 	log       *logger.Logger
 	http      *http.Client
-	dailyCost float64
+	dailyCost atomic.Int64 // scaled by 10_000_000_000 to avoid float races (H4)
 	provider  string
 }
 
@@ -49,9 +50,9 @@ func (c *reviewHTTPClient) Review(ctx context.Context, req ReviewRequest) (*Revi
 	result := &ReviewResult{Called: true}
 
 	// Budget check
-	if c.cfg.DailyCostCapUSD > 0 && c.dailyCost >= c.cfg.DailyCostCapUSD {
+	if c.cfg.DailyCostCapUSD > 0 && float64(c.dailyCost.Load())/10_000_000_000 >= c.cfg.DailyCostCapUSD {
 		c.log.Warn("LLM review daily cost cap reached", map[string]any{
-			"daily_cost": c.dailyCost,
+			"daily_cost": float64(c.dailyCost.Load()) / 10_000_000_000,
 			"cap":        c.cfg.DailyCostCapUSD,
 		})
 		result.Called = false
@@ -143,7 +144,11 @@ func (c *reviewHTTPClient) Review(ctx context.Context, req ReviewRequest) (*Revi
 			case <-time.After(backoff):
 			}
 		}
-		retryReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(httpBody))
+		retryReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(httpBody))
+		if err != nil {
+			lastErr = err
+			continue
+		}
 		retryReq.Header = httpReq.Header.Clone()
 		resp, lastErr = c.http.Do(retryReq)
 		if lastErr != nil {
@@ -212,7 +217,7 @@ func (c *reviewHTTPClient) Review(ctx context.Context, req ReviewRequest) (*Revi
 		result.TokensIn = chatResp.Usage.TotalTokens / 2
 		result.TokensOut = chatResp.Usage.TotalTokens / 2
 		result.CostUSD = float64(chatResp.Usage.TotalTokens) * 0.00001
-		c.dailyCost += result.CostUSD
+		c.dailyCost.Add(int64(result.CostUSD * 10_000_000_000))
 	}
 
 	// Parse the response
@@ -240,5 +245,5 @@ func (c *reviewHTTPClient) getAPIKey() string {
 	}
 }
 
-func (c *reviewHTTPClient) DailyCost() float64    { return c.dailyCost }
-func (c *reviewHTTPClient) ResetDailyCost()         { c.dailyCost = 0 }
+func (c *reviewHTTPClient) DailyCost() float64 { return float64(c.dailyCost.Load()) / 10_000_000_000 }
+func (c *reviewHTTPClient) ResetDailyCost()    { c.dailyCost.Store(0) }
