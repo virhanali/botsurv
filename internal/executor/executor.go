@@ -91,6 +91,18 @@ func (e *Executor) Execute(ctx context.Context, cand domain.Candidate, decision 
 		return result
 	}
 
+	// Guard: reject LIMIT_RETEST candidate with ALLOW_MARKET decision.
+	// TP/SL were calculated for the limit entry price, not market (H2).
+	if cand.EntryType == domain.EntryTypeLimitRetest && decision.Decision == "ALLOW_MARKET" {
+		result.Error = "entry type mismatch: LIMIT_RETEST candidate with ALLOW_MARKET decision"
+		e.log.Error("execution rejected: entry type mismatch", map[string]any{
+			"symbol":    cand.Symbol,
+			"entry_type": cand.EntryType,
+			"decision":  decision.Decision,
+		})
+		return result
+	}
+
 	// Push WS ticker price into broker cache so PlaceOrder can fill the market order.
 	if marketPrice > 0 {
 		e.broker.SetSymbolPrice(cand.Symbol, marketPrice)
