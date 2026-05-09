@@ -1334,10 +1334,17 @@ func (r *postgresPaperAccountStateRepository) Get(ctx context.Context) (*domain.
 
 func (r *postgresPaperAccountStateRepository) Update(ctx context.Context, s domain.PaperAccountState) error {
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE paper_account_state SET
-			starting_equity = $2, current_equity = $3, total_trades = $4,
-			wins = $5, losses = $6, realized_pnl = $7, consecutive_losses = $8, updated_at = NOW()
-		WHERE id = $1`,
+		`INSERT INTO paper_account_state (id, starting_equity, current_equity, total_trades, wins, losses, realized_pnl, consecutive_losses, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		 ON CONFLICT (id) DO UPDATE SET
+			starting_equity = EXCLUDED.starting_equity,
+			current_equity = EXCLUDED.current_equity,
+			total_trades = EXCLUDED.total_trades,
+			wins = EXCLUDED.wins,
+			losses = EXCLUDED.losses,
+			realized_pnl = EXCLUDED.realized_pnl,
+			consecutive_losses = EXCLUDED.consecutive_losses,
+			updated_at = NOW()`,
 		s.ID, s.StartingEquity, s.CurrentEquity, s.TotalTrades, s.Wins, s.Losses, s.RealizedPnL, s.ConsecutiveLosses,
 	)
 	if err != nil {

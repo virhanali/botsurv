@@ -81,6 +81,9 @@ func (s *Simulator) Initialize(ctx context.Context) error {
 	s.realizedPnL = state.RealizedPnL
 	s.consecutiveLosses = state.ConsecutiveLosses
 
+	// Ensure row exists in DB (first-ever init or migration didn't create it)
+	s.persistAccountState(ctx)
+
 	// Rehydrate open positions count from DB
 	if s.paperTradeRepo != nil {
 		open, err := s.paperTradeRepo.GetOpen(ctx)
